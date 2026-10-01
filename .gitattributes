@@ -1,0 +1,10 @@
+# 统一换行符：仓库内存 LF，检出时不转换。
+# 原因：本项目在 Windows 编辑、在 Linux（GitHub Actions / WSL）构建与运行。
+# 若检出时转成 CRLF，shell 脚本会因 shebang 后的 \r 报 "bad interpreter"，
+# 且每次跨平台 diff 都会产生整文件噪音。
+* text=auto eol=lf
+
+# 二进制文件不做换行转换
+*.png binary
+*.ico binary
+*.fpk binary
