@@ -1,0 +1,43 @@
+2026-10-01 20:30:17 - Starting Hermes dashboard (gateway + loopback port) ...
+2026-10-01 20:30:17 - PY=/vol1/@appcenter/hermes/runtime/python/bin/python3  APP_DIR=/vol1/@appcenter/hermes  HOME=/vol1/@appdata/hermes  WS=/vol1/@appshare/hermes/workspace  PORT=9119  SOCK=/vol1/@appcenter/hermes/hermes.sock
+[gateway] 2026-10-01T20:30:18 listening unix:/vol1/@appcenter/hermes/hermes.sock → http://127.0.0.1:9119 (prefix=/app/hermes)
+→ Skipping web UI build (--skip-build); using dist at /vol1/@appcenter/hermes/runtime/web_dist
+HERMES_DASHBOARD_READY port=9119
+  Hermes Web UI → http://127.0.0.1:9119
+2026-10-01 20:30:29 - started, port 9119 + socket /vol1/@appcenter/hermes/hermes.sock (PID=230273)
+2026-10-01 21:22:40 - Stopping process ...
+2026-10-01 21:22:40 - send TERM signal to PID:230273 ...
+2026-10-01 21:22:41 - 清理残留进程 (/vol1/@appcenter/hermes/runtime / /vol1/@appcenter/hermes/gateway-proxy.py)
+[gateway] 2026-10-01T21:22:41 shutting down
+2026-10-01 21:22:42 - process stopped
+2026-10-01 21:32:52 - Starting Hermes dashboard (gateway + loopback port) ...
+2026-10-01 21:32:52 - PY=/vol1/@appcenter/hermes/runtime/python/bin/python3  APP_DIR=/vol1/@appcenter/hermes  HOME=/vol1/@appdata/hermes  WS=/vol1/@appshare/hermes/workspace  PORT=9119  SOCK=/vol1/@appcenter/hermes/hermes.sock
+[gateway] 2026-10-01T21:32:53 listening unix:/vol1/@appcenter/hermes/hermes.sock → http://127.0.0.1:9119 (prefix=/app/hermes)
+→ Skipping web UI build (--skip-build); using dist at /vol1/@appcenter/hermes/runtime/web_dist
+2026-10-01 21:33:05 - started, port 9119 + socket /vol1/@appcenter/hermes/hermes.sock (PID=361850)
+HERMES_DASHBOARD_READY port=9119
+  Hermes Web UI → http://127.0.0.1:9119
+2026-10-01 21:55:44 - Stopping process ...
+2026-10-01 21:55:44 - send TERM signal to PID:361850 ...
+2026-10-01 21:55:46 - 清理残留进程 (/vol1/@appcenter/hermes/runtime / /vol1/@appcenter/hermes/gateway-proxy.py)
+[gateway] 2026-10-01T21:55:46 shutting down
+2026-10-01 21:55:47 - process stopped
+2026-10-01 21:59:57 - Starting Hermes dashboard (gateway + loopback port) ...
+2026-10-01 21:59:57 - PY=/vol1/@appcenter/hermes/runtime/python/bin/python3  APP_DIR=/vol1/@appcenter/hermes  HOME=/vol1/@appdata/hermes  WS=/vol1/@appshare/hermes/workspace  PORT=9119  SOCK=/vol1/@appcenter/hermes/hermes.sock
+[gateway] 2026-10-01T21:59:58 listening unix:/vol1/@appcenter/hermes/hermes.sock → http://127.0.0.1:9119 (prefix=/app/hermes)
+→ Skipping web UI build (--skip-build); using dist at /vol1/@appcenter/hermes/runtime/web_dist
+HERMES_DASHBOARD_READY port=9119
+  Hermes Web UI → http://127.0.0.1:9119
+2026-10-01 22:00:07 - started, port 9119 + socket /vol1/@appcenter/hermes/hermes.sock (PID=409536)
+2026-10-01 22:12:09 - Stopping process ...
+2026-10-01 22:12:09 - send TERM signal to PID:409536 ...
+2026-10-01 22:12:11 - 清理残留进程 (/vol1/@appcenter/hermes/runtime / /vol1/@appcenter/hermes/gateway-proxy.py)
+[gateway] 2026-10-01T22:12:11 shutting down
+2026-10-01 22:12:12 - process stopped
+2026-10-01 22:15:02 - Starting Hermes dashboard (gateway + loopback port) ...
+2026-10-01 22:15:02 - PY=/vol1/@appcenter/hermes/runtime/python/bin/python3  APP_DIR=/vol1/@appcenter/hermes  HOME=/vol1/@appdata/hermes  WS=/vol1/@appshare/hermes/workspace  PORT=9119  SOCK=/vol1/@appcenter/hermes/hermes.sock
+[gateway] 2026-10-01T22:15:03 listening unix:/vol1/@appcenter/hermes/hermes.sock → http://127.0.0.1:9119 (prefix=/app/hermes)
+→ Skipping web UI build (--skip-build); using dist at /vol1/@appcenter/hermes/runtime/web_dist
+HERMES_DASHBOARD_READY port=9119
+  Hermes Web UI → http://127.0.0.1:9119
+2026-10-01 22:15:11 - started, port 9119 + socket /vol1/@appcenter/hermes/hermes.sock (PID=435812)
