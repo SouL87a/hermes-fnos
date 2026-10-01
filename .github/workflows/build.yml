@@ -77,10 +77,14 @@ jobs:
 
       - name: Build fpk
         env:
-          # 只取预编译 wheel：保证产物在 fnOS（Debian 12 / glibc 2.36）上可移植。
-          # runner 是 ubuntu-24.04（glibc 2.39），本地编译的 .so 会因符号版本过高而不可用。
-          HERMES_PIP_INDEX: "https://pypi.tuna.tsinghua.edu.cn/simple"
-          HERMES_NPM_REGISTRY: "https://registry.npmmirror.com"
+          # 注意：**不设**国内镜像 —— Actions runner 在海外，PyPI/GitHub 直连最快；
+          # 清华/淘宝源反而拖慢甚至超时。（本地/国内构建时才设
+          # HERMES_PIP_INDEX / HERMES_NPM_REGISTRY。）
+          #
+          # 构建机 ubuntu-24.04（glibc 2.39）→ 目标 fnOS Debian 12（glibc 2.36）。
+          # build.sh 默认强制 --only-binary=:all:，只取 manylinux 预编译 wheel，
+          # 避免本地编译出链接到新 glibc 符号的 .so（装到 NAS 上会 GLIBC not found）。
+          HERMES_ALLOW_SOURCE_BUILD: "0"
         run: |
           set -e
           bash packaging/fnOS/scripts/build.sh
