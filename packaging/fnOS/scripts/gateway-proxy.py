@@ -473,10 +473,17 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
                 saw_host = True
                 out_lines.append(f"Host: {UP_HOST}:{UP_PORT}")
                 continue
+            # ⚠ 剔除客户端原有的 X-Forwarded-*：飞牛网关会带自己的
+            #   X-Forwarded-Prefix（可能是 "/" 或空），若原样转发再追加我们的，
+            #   上游会收到重复头并取**第一个**（客户端那个）→ 前缀失效 →
+            #   index.html 的 /assets/ 不被改写 → 资源 404 → 页面黑屏。
+            #   前缀只能由本代理权威给出，见下方统一追加。
+            if lk in ("x-forwarded-prefix", "x-forwarded-host", "x-forwarded-proto"):
+                continue
             out_lines.append(f"{k}: {v}")
         if not saw_host:
             out_lines.append(f"Host: {UP_HOST}:{UP_PORT}")
-        # 关键：告诉 Hermes 它挂在 /app/hermes 下
+        # 关键：告诉 Hermes 它挂在 /app/hermes 下（唯一权威来源）
         if PREFIX:
             out_lines.append(f"X-Forwarded-Prefix: {PREFIX}")
         if not is_upgrade:
