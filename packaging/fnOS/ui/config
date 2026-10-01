@@ -1,0 +1,14 @@
+{
+    ".url": {
+        "hermes.Application": {
+            "title": "Hermes Agent",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/hermes",
+            "gatewaySocket": "hermes.sock",
+            "url": "/app/hermes",
+            "allUsers": true
+        }
+    }
+}

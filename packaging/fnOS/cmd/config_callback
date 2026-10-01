@@ -1,0 +1,12 @@
+#!/bin/bash
+# 应用设置页保存后回调。当前无设置项需要落盘（配置在 dashboard 内完成），
+# 仅确保数据目录权限正确，供重启后使用。
+set -e
+
+APP="hermes"
+if [ -z "${TRIM_PKGVAR}" ] && [ -d "/var/apps/${APP}/var" ]; then
+    TRIM_PKGVAR="$(readlink -f "/var/apps/${APP}/var")"
+fi
+mkdir -p "${TRIM_PKGVAR}/log" "${TRIM_PKGVAR}/workspace" "${TRIM_PKGVAR}/state" 2>/dev/null || true
+chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+exit 0

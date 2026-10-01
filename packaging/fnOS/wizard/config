@@ -1,0 +1,11 @@
+[
+  {
+    "stepTitle": "Hermes Agent",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "模型、API Key、工具与会话等配置都在控制台（桌面图标）里完成。修改后如需生效，重启本应用即可。"
+      }
+    ]
+  }
+]

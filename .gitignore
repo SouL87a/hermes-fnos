@@ -1,0 +1,16 @@
+# 构建产物
+packaging/fnOS/dist/
+packaging/fnOS/.build-staging/
+packaging/fnOS/.cache/
+packaging/fnOS/.src/
+
+# 大文件：fpk 走 Releases，不进版本库
+*.fpk
+# 上游提包（仅本地参考，不入库）
+trim.hermes-0.20.2-2-tpk/
+
+# 临时
+*.tmp
+*.part
+__pycache__/
+*.pyc

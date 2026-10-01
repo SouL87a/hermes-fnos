@@ -1,0 +1,101 @@
+#!/bin/bash
+# 安装后：补回可执行位（fnpack 会把 app.tgz 里的权限拍平成 0666）、
+# 校验运行时完整性、准备数据目录。
+set -e
+
+APP="hermes"
+
+if [ -z "${TRIM_APPDEST}" ]; then
+    if [ -d "/var/apps/${APP}/target" ]; then
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}/target")"
+    else
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}")"
+    fi
+fi
+
+RUNTIME="${TRIM_APPDEST}/runtime"
+PY="${RUNTIME}/python/bin/python3"
+
+# fnpack 把文件权限拍平成 0666，这里补回可执行位。
+# 自带 CPython：bin/ 下的可执行文件 + lib/ 下的共享库都要补位。
+if [ -d "${RUNTIME}/python/bin" ]; then
+    find "${RUNTIME}/python/bin" -type f -exec chmod +x {} \; 2>/dev/null || true
+fi
+if [ -d "${RUNTIME}/python/lib" ]; then
+    find "${RUNTIME}/python/lib" -name '*.so' -o -name '*.so.*' 2>/dev/null | while read -r so; do
+        chmod +x "${so}" 2>/dev/null || true
+    done
+fi
+[ -f "${TRIM_APPDEST}/gateway-proxy.py" ] && chmod +x "${TRIM_APPDEST}/gateway-proxy.py" 2>/dev/null || true
+
+mkdir -p "${TRIM_PKGVAR}/log" "${TRIM_PKGVAR}/workspace" "${TRIM_PKGVAR}/state"
+
+### 系统 Python 模式：构建时放了 .use-system-python 标记，这里在 NAS 上建 venv 并装依赖。
+### 打包模式（自带 CPython）跳过此段 —— 依赖已随包分发。
+if [ -f "${RUNTIME}/.use-system-python" ]; then
+    VENV_DIR="${TRIM_PKGVAR}/venv"
+    echo "系统 Python 模式：创建 venv 并安装依赖（需联网）…" >> "${TRIM_PKGVAR}/info.log"
+
+    SYS_PY=""
+    for cand in /usr/bin/python3 /usr/local/bin/python3 "$(command -v python3 2>/dev/null)"; do
+        [ -n "${cand}" ] && [ -x "${cand}" ] && { SYS_PY="${cand}"; break; }
+    done
+    if [ -z "${SYS_PY}" ]; then
+        echo "未找到系统 python3，请先在飞牛安装 Python 3.11+（应用中心）" > "${TRIM_TEMP_LOGFILE}"
+        exit 1
+    fi
+    # 版本校验：上游要求 >=3.11,<3.15
+    if ! "${SYS_PY}" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] < (3,15) else 1)'; then
+        echo "系统 Python 版本不符（需 3.11–3.14）：$("${SYS_PY}" --version 2>&1)" > "${TRIM_TEMP_LOGFILE}"
+        exit 1
+    fi
+
+    # uv：优先系统/包内已有的，否则联网装
+    UV=""
+    for cand in "${TRIM_PKGVAR}/bin/uv" "$(command -v uv 2>/dev/null)"; do
+        [ -n "${cand}" ] && [ -x "${cand}" ] && { UV="${cand}"; break; }
+    done
+    if [ -z "${UV}" ]; then
+        mkdir -p "${TRIM_PKGVAR}/bin"
+        if command -v curl > /dev/null 2>&1; then
+            curl -fsSL https://astral.sh/uv/install.sh 2>/dev/null | \
+                env UV_INSTALL_DIR="${TRIM_PKGVAR}/bin" UV_NO_MODIFY_PATH=1 sh > /dev/null 2>&1 || true
+        fi
+        [ -x "${TRIM_PKGVAR}/bin/uv" ] && UV="${TRIM_PKGVAR}/bin/uv"
+    fi
+    if [ -z "${UV}" ]; then
+        echo "无法获取 uv，且系统 Python 模式需要它来装依赖（请检查网络）" > "${TRIM_TEMP_LOGFILE}"
+        exit 1
+    fi
+
+    rm -rf "${VENV_DIR}"
+    "${UV}" venv --python "${SYS_PY}" "${VENV_DIR}" >> "${TRIM_PKGVAR}/info.log" 2>&1 \
+        || { echo "venv 创建失败，详见应用日志" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+
+    # 依赖清单在构建时抽好，随包分发（runtime/deps.txt）
+    DEPS="${RUNTIME}/deps.txt"
+    if [ -f "${DEPS}" ]; then
+        "${UV}" pip install --python "${VENV_DIR}/bin/python3" -r "${DEPS}" \
+            >> "${TRIM_PKGVAR}/info.log" 2>&1 \
+            || { echo "依赖安装失败，详见应用日志" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+    else
+        echo "缺少依赖清单（${DEPS}）" > "${TRIM_TEMP_LOGFILE}"; exit 1
+    fi
+fi
+
+# 完整性校验
+if [ ! -x "${PY}" ]; then
+    echo "安装包缺少 Python 运行时（${PY}）" > "${TRIM_TEMP_LOGFILE}"
+    exit 1
+fi
+if [ ! -d "${RUNTIME}/hermes/hermes_cli" ]; then
+    echo "安装包缺少 Hermes 源码树（${RUNTIME}/hermes/hermes_cli）" > "${TRIM_TEMP_LOGFILE}"
+    exit 1
+fi
+if [ ! -f "${RUNTIME}/web_dist/index.html" ]; then
+    echo "安装包缺少预构建前端（${RUNTIME}/web_dist/index.html）" > "${TRIM_TEMP_LOGFILE}"
+    exit 1
+fi
+
+chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+exit 0

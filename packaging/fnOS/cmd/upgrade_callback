@@ -1,0 +1,24 @@
+#!/bin/bash
+# 升级后：补齐运行时可执行位。用户数据保留在 TRIM_PKGVAR。
+set -e
+
+APP="hermes"
+if [ -z "${TRIM_APPDEST}" ]; then
+    if [ -d "/var/apps/${APP}/target" ]; then
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}/target")"
+    else
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}")"
+    fi
+fi
+
+RUNTIME="${TRIM_APPDEST}/runtime"
+[ -d "${RUNTIME}/python/bin" ] && find "${RUNTIME}/python/bin" -type f -exec chmod +x {} \; 2>/dev/null || true
+if [ -d "${RUNTIME}/python/lib" ]; then
+    find "${RUNTIME}/python/lib" -name '*.so' -o -name '*.so.*' 2>/dev/null | while read -r so; do
+        chmod +x "${so}" 2>/dev/null || true
+    done
+fi
+[ -f "${TRIM_APPDEST}/gateway-proxy.py" ] && chmod +x "${TRIM_APPDEST}/gateway-proxy.py" 2>/dev/null || true
+
+chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+exit 0

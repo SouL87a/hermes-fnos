@@ -1,0 +1,11 @@
+[
+  {
+    "stepTitle": "Hermes Agent",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "Hermes Agent 是 Nous Research 的自我进化 AI Agent。安装后从桌面图标打开控制台，在里面配置模型与 API Key（支持 Nous Portal、OpenRouter、OpenAI、自建端点等）。\n\n本应用走飞牛统一网关（飞牛登录态），不开放局域网端口；数据与工作区保存在 NAS 上，手机 / 平板 / 电脑共用一份。首次打开可能需要几秒初始化。"
+      }
+    ]
+  }
+]

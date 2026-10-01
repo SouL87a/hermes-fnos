@@ -1,0 +1,197 @@
+name: build
+
+# 构建：push main / 打 tag v* / 手动都会跑（产出 Artifacts）
+# Release：仅 tag v* 或手动勾选 publish_release 时才发
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - ".github/workflows/build.yml"
+      - "upstream.version"
+      - "fnos.version"
+      - "packaging/**"
+  workflow_dispatch:
+    inputs:
+      hermes_ref:
+        description: "Hermes 上游 ref（tag / branch / commit），留空用 upstream.version 里钉住的值"
+        required: false
+        default: ""
+      publish_release:
+        description: "验证通过后发布 GitHub Release（勾选才发）"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  # 构建机必须 Linux：包里分发的是 Linux CPython 与 Linux .so，Windows/macOS 无法执行它们完成依赖安装。
+  NODE_VERSION: "22"
+
+jobs:
+  fpk:
+    name: Build fnOS fpk
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      ref: ${{ steps.pin.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version + upstream ref
+        id: ver
+        run: |
+          set -e
+          VERSION="$(head -n 1 fnos.version | tr -d '[:space:]')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "fnOS fpk 版本: $VERSION"
+
+      - name: Pin upstream ref
+        id: pin
+        run: |
+          set -e
+          if [ -n "${{ github.event.inputs.hermes_ref }}" ]; then
+            REF="${{ github.event.inputs.hermes_ref }}"
+          else
+            REF="$(grep -vE '^\s*#|^\s*$' upstream.version | head -n 1 | tr -d '[:space:]')"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "钉住的上游 ref: $REF"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install uv
+        run: |
+          curl -fsSL https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Show toolchain
+        run: |
+          python3 --version
+          node --version
+          npm --version
+          "$HOME/.local/bin/uv" --version
+          echo "--- glibc ---"
+          ldd --version | head -1
+
+      - name: Build fpk
+        env:
+          # 只取预编译 wheel：保证产物在 fnOS（Debian 12 / glibc 2.36）上可移植。
+          # runner 是 ubuntu-24.04（glibc 2.39），本地编译的 .so 会因符号版本过高而不可用。
+          HERMES_PIP_INDEX: "https://pypi.tuna.tsinghua.edu.cn/simple"
+          HERMES_NPM_REGISTRY: "https://registry.npmmirror.com"
+        run: |
+          set -e
+          bash packaging/fnOS/scripts/build.sh
+
+      - name: Verify fpk
+        run: |
+          set -e
+          FPK="$(ls packaging/fnOS/dist/hermes-*.fpk | head -1)"
+          echo "fpk: $FPK ($(du -h "$FPK" | cut -f1))"
+          LIST="$(tar -tzf "$FPK")"
+          echo "$LIST" | head -12
+          # 结构自检：缺任一都会导致装机失败或功能缺失
+          for need in manifest ICON.PNG ICON_256.PNG app.tgz cmd/main cmd/install_callback config/privilege ui/config wizard/install; do
+            echo "$LIST" | grep -qx "$need" || { echo "✗ fpk 缺少 $need"; exit 1; }
+          done
+          # app.tgz 内关键部件
+          tar -xzf "$FPK" app.tgz
+          A="$(tar -tzf app.tgz)"
+          for need in ./gateway-proxy.py ./hermes-update.py ./runtime/python/bin/python3 ./runtime/deps.txt ./runtime/web_dist/index.html ./runtime/hermes/hermes_cli/__init__.py; do
+            echo "$A" | grep -qx "$need" || { echo "✗ app.tgz 缺少 $need"; exit 1; }
+          done
+          # 在线更新依赖 .git —— 缺失则更新功能不可用，明确告警（不阻断构建）
+          if echo "$A" | grep -q "^\./runtime/hermes/\.git/"; then
+            echo "✓ 源码树含 .git（在线更新可用）"
+          else
+            echo "⚠ 源码树不含 .git —— 在线更新将不可用"
+          fi
+          echo "✓ fpk 结构检查通过"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-${{ steps.ver.outputs.version }}-fpk
+          path: packaging/fnOS/dist/hermes-*.fpk
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [fpk]
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download fpk artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hermes-${{ needs.fpk.outputs.version }}-fpk
+          path: dist
+
+      - name: Locate .fpk (unpack if needed)
+        run: |
+          set -euo pipefail
+          find dist -type f -name '*.zip' | while read -r z; do unzip -o "$z" -d "$(dirname "$z")"; done
+          FPK="$(find dist -type f -name 'hermes-*.fpk' | head -n 1)"
+          [ -n "$FPK" ] || { echo "✗ 未找到 hermes-*.fpk"; find dist -maxdepth 4; exit 1; }
+          mkdir -p release
+          cp -f "$FPK" "release/$(basename "$FPK")"
+          echo "fpk_path=release/$(basename "$FPK")" >> "$GITHUB_ENV"
+
+      - name: Create or update Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.fpk.outputs.version }}
+          UPSTREAM_REF: ${{ needs.fpk.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then TAG="${GITHUB_REF_NAME}"; else TAG="v${VERSION}"; fi
+          FPK="${fpk_path:?}"; BASENAME="$(basename "$FPK")"
+          SUM="$(sha256sum "$FPK" | awk '{print $1}')"
+          NOTES="$(mktemp)"
+          PREV_TAG="$(git tag --list 'v*' --sort=-v:refname | grep -vx "${TAG}" | head -n 1 || true)"
+          if [ -n "${PREV_TAG}" ]; then
+            CHANGES="$(git log --no-merges --pretty=format:'- %s (%h)' "${PREV_TAG}..HEAD")"
+            CHANGE_HEADER="自 \`${PREV_TAG}\` 以来："
+          else
+            CHANGES="$(git log --no-merges --pretty=format:'- %s (%h)' -n 10)"
+            CHANGE_HEADER="最近提交："
+          fi
+          [ -n "${CHANGES}" ] || CHANGES="- （无 commit 说明）"
+          cat > "$NOTES" <<EOF
+          ## Hermes Agent ${VERSION} · 飞牛 fnOS 原生版
+
+          - 上游 ref: \`${UPSTREAM_REF}\`
+          - 内置运行时: CPython 3.14（python-build-standalone）
+          - 构建: Actions run ${GITHUB_RUN_ID}
+          - \`${BASENAME}\` sha256: \`${SUM}\`
+
+          ### 安装
+          应用中心 → 手动安装 → 选择 \`${BASENAME}\`。桌面图标走飞牛统一网关，无需令牌。
+
+          ### 在线更新
+          安装后可在 dashboard 内（\`/app/hermes/__hermes/update/ui\`）或 SSH 里
+          \`hermes-update check|apply\` 更新到上游新版本。
+
+          ### 变更
+          ${CHANGE_HEADER}
+
+          ${CHANGES}
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$FPK" --clobber
+            gh release edit "$TAG" --notes-file "$NOTES"
+          else
+            gh release create "$TAG" "$FPK" --title "Hermes ${VERSION}" --notes-file "$NOTES"
+          fi
+          echo "✓ Release $TAG 已发布"

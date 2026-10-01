@@ -1,0 +1,13 @@
+# 钉住的上游 ref。用 3.14 → 必须用 2026-09 底之后的版本。
+#
+# 为什么钉 canary tag 而不是 main HEAD：
+#   main 的 Python 3.14 迁移尚未进入 stable tag（最后 stable v2026.9.24 仍是
+#   >=3.11,<3.14）；但 canary tag 已是 3.14（.python-version=3.14，
+#   requires-python >=3.11,<3.15，46 个依赖带 python_version >= '3.14' 标记）。
+#   canary tag 是打好的快照，比浮动的 main HEAD 可复现。
+#
+# 网关特性（X-Forwarded-Prefix 前缀反代、HERMES_WEB_DIST、--skip-build、
+# 回环免鉴权）在该 tag 已全部具备。
+#
+# 等上游把 3.14 打进 stable tag 后，换成那个 stable tag 即可。
+v0.21.4+canary.20261001T070239Z

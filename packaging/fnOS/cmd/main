@@ -1,0 +1,301 @@
+#!/bin/bash
+
+### Hermes Agent —— 飞牛 fnOS 服务生命周期
+###
+### 原生应用：自带 CPython（python-build-standalone），依赖预装进其 site-packages，
+### 运行期不联网、不 pip、不需要应用中心的 Node（web_dist 已预构建，--skip-build）。
+### 不用 venv：venv 的 pyvenv.cfg / bin 符号链接带构建机绝对路径，装到 NAS 后
+### 路径变化会失效；python-build-standalone 本身是可重定位的，直接用它最稳。
+###
+### 形态：hermes dashboard（FastAPI+uvicorn，仅绑 127.0.0.1）+
+###        gateway-proxy.py（监听 Unix Socket，反代到回环端口）。
+### 前端是 React Router SPA，原生支持路径前缀反代：代理只要发
+### X-Forwarded-Prefix: /app/hermes，服务端就改写 index.html 的资产 URL
+### 并注入 window.__HERMES_BASE_PATH__，所以代理层无需改写 HTML。
+###
+### ⚠ 应用/依赖可能装在任意存储空间（/vol1、/vol2、…）。所有路径从
+### TRIM_APPDEST 推导，绝不写死卷号。
+###
+### status 约定：运行中 exit 0，未运行 exit 3（不是 1）。
+
+APP="hermes"
+MODULE="hermes_cli.main"
+PORT="${TRIM_SERVICE_PORT:-9119}"
+GATEWAY_PREFIX="/app/hermes"
+
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+
+### TRIM_APPDEST 兜底：必须落到 target 链接指向的真目录。
+### /var/apps/<app> 本身是真目录，readlink -f 不穿透它 —— 拿它当 APPDEST 会拼出
+### 不存在的路径，status/stop 会静默失效。
+if [ -z "${TRIM_APPDEST}" ]; then
+    if [ -d "/var/apps/${APP}/target" ]; then
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}/target")"
+    else
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}")"
+    fi
+fi
+: "${TRIM_PKGVAR:=/var/apps/${APP}/var}"
+: "${TRIM_USERNAME:=${APP}}"
+: "${TRIM_GROUPNAME:=${TRIM_USERNAME}}"
+
+APP_DIR="${TRIM_APPDEST}"
+SRC_DIR="${APP_DIR}/runtime/hermes"
+### 两种运行时模式：
+###  - 打包模式（默认）：自带 CPython，PY=runtime/python/bin/python3，依赖在其 site-packages。
+###  - 系统 Python 模式：构建时放了 .use-system-python 标记，安装时在 NAS 上建
+###    venv（${TRIM_PKGVAR}/venv，路径是本机的、可移植性没问题），依赖装在里面。
+if [ -f "${APP_DIR}/runtime/.use-system-python" ]; then
+    PY="${TRIM_PKGVAR}/venv/bin/python3"
+else
+    PY="${APP_DIR}/runtime/python/bin/python3"
+fi
+WEB_DIST="${APP_DIR}/runtime/web_dist"
+GATEWAY_SOCKET="${APP_DIR}/hermes.sock"
+GATEWAY_PROXY="${APP_DIR}/gateway-proxy.py"
+DATA_DIR="${TRIM_PKGVAR}"
+
+### 进程识别：dashboard 进程 argv 含 ${APP_DIR}/runtime，
+### gateway-proxy 在 ${APP_DIR}/gateway-proxy.py。绝对路径匹配，不误伤其他 python。
+PATTERN="${APP_DIR}/runtime"
+GATEWAY_PATTERN="${APP_DIR}/gateway-proxy.py"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+### 进程存活判定以 /proc 为准。
+### 不用 kill -0：非属主调用时它对活着的进程返回 EPERM，与"不存在"无法区分，
+### 会把 pidfile 误删（而 pidfile 是 fnOS 判定服务状态的依据）。
+pid_alive() {
+    local pid="$1" cmd state
+    [ -n "${pid}" ] || return 1
+    [ -d "/proc/${pid}" ] || return 1
+    state="$(cut -d' ' -f3 "/proc/${pid}/stat" 2>/dev/null)"
+    [ "${state}" = "Z" ] && return 1
+    cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)"
+    [ -z "${cmd}" ] && return 0
+    case "${cmd}" in *"${PATTERN}"*|*"${GATEWAY_PATTERN}"*) return 0 ;; esac
+    return 1
+}
+
+### 只认本应用自己的进程（绝对路径匹配）。
+### pgrep/pkill 的 pattern 前必须加 --，否则会被 procps 当成选项。
+own_pids() {
+    pgrep -f -- "${PATTERN}" 2>/dev/null
+    pgrep -f -- "${GATEWAY_PATTERN}" 2>/dev/null
+}
+
+read_pid() {
+    [ -r "${PID_FILE}" ] && head -n 1 "${PID_FILE}" | tr -d '[:space:]'
+}
+
+### 工作区：优先 TRIM_DATA_SHARE_PATHS 里名为 hermes/workspace 的共享目录，
+### 否则第一个共享路径，最终兜底 PKGVAR/workspace。
+resolve_workspace() {
+    local p
+    if [ -n "${TRIM_DATA_SHARE_PATHS}" ]; then
+        local IFS=':'
+        for p in ${TRIM_DATA_SHARE_PATHS}; do
+            case "${p}" in */hermes/workspace) printf '%s' "${p}"; return 0 ;; esac
+        done
+        for p in ${TRIM_DATA_SHARE_PATHS}; do
+            [ -n "${p}" ] && { printf '%s' "${p}"; return 0; }
+        done
+    fi
+    printf '%s' "${TRIM_PKGVAR}/workspace"
+}
+
+port_listening() {
+    grep -q ":$(printf '%04X' "${PORT}")" /proc/net/tcp 2>/dev/null
+}
+
+### 面板入口说明（写给排查的人）：
+### ui/config 的入口是 /app/hermes（iframe）。飞牛统一网关把 /app/hermes/**
+### 转到 hermes.sock 且不剥前缀。gateway-proxy.py 剥掉前缀后转发到
+### 127.0.0.1:PORT，并给上游发 X-Forwarded-Prefix，让 dashboard 生成带前缀的
+### 资产 URL 与 __HERMES_BASE_PATH__。鉴权：dashboard 绑回环 → 不做 auth 门，
+### 网关侧用飞牛登录态（X-Trim-*）。
+
+start_process() {
+    if status > /dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ ! -x "${PY}" ]; then
+        log_msg "启动失败：找不到 ${PY}"
+        echo "应用文件缺失：${PY}" > "${TRIM_TEMP_LOGFILE}"
+        return 1
+    fi
+    if [ ! -d "${SRC_DIR}/hermes_cli" ]; then
+        log_msg "启动失败：找不到源码树 ${SRC_DIR}/hermes_cli"
+        echo "应用文件缺失：${SRC_DIR}" > "${TRIM_TEMP_LOGFILE}"
+        return 1
+    fi
+    if [ ! -f "${WEB_DIST}/index.html" ]; then
+        log_msg "启动失败：缺少预构建前端 ${WEB_DIST}/index.html"
+        echo "应用缺少预构建前端（web_dist）" > "${TRIM_TEMP_LOGFILE}"
+        return 1
+    fi
+
+    local ws
+    ws="$(resolve_workspace)"
+    mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "$(dirname "${PID_FILE}")"
+    rm -f "${GATEWAY_SOCKET}"
+
+    log_msg "Starting Hermes dashboard (gateway + loopback port) ..."
+    log_msg "PY=${PY}  APP_DIR=${APP_DIR}  HOME=${DATA_DIR}  WS=${ws}  PORT=${PORT}  SOCK=${GATEWAY_SOCKET}"
+
+    # 主服务：dashboard 仅绑回环，避免触发非回环的强制鉴权门。
+    # 资源定位用上游官方的 HERMES_BUNDLED_* 机制（比靠 PROJECT_ROOT 推导更稳，
+    # 与官方 fnOS 包的 hermes-env 一致）：源码树即资源根。
+    local CMD
+    CMD="cd '${SRC_DIR}' && exec env \
+HOME='${DATA_DIR}' \
+PYTHONPATH='${SRC_DIR}' \
+PYTHONUNBUFFERED=1 \
+PYTHONDONTWRITEBYTECODE=1 \
+HERMES_HOME='${DATA_DIR}' \
+HERMES_BUNDLED_SKILLS='${SRC_DIR}/skills' \
+HERMES_OPTIONAL_SKILLS='${SRC_DIR}/optional-skills' \
+HERMES_BUNDLED_PLUGINS='${SRC_DIR}/plugins' \
+HERMES_BUNDLED_LOCALES='${SRC_DIR}/locales' \
+HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
+HERMES_WEB_DIST='${WEB_DIST}' \
+HERMES_WRITE_SAFE_ROOT='${ws}' \
+HERMES_MANAGED_BY='trim-hermes-fnos' \
+'${PY}' -m ${MODULE} dashboard --host 127.0.0.1 --port '${PORT}' --no-open --skip-build"
+
+    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+        bash -c "${CMD}" >> "${LOG_FILE}" 2>&1 &
+    else
+        runuser -u "${TRIM_USERNAME}" -- bash -c "${CMD}" >> "${LOG_FILE}" 2>&1 &
+    fi
+    printf "%s" "$!" > "${PID_FILE}"
+
+    # 网关代理：Unix Socket → 127.0.0.1:PORT，剥前缀 + 发 X-Forwarded-Prefix。
+    if [ ! -f "${GATEWAY_PROXY}" ]; then
+        log_msg "启动失败：找不到 ${GATEWAY_PROXY}"
+        echo "缺少 gateway-proxy.py" > "${TRIM_TEMP_LOGFILE}"
+        return 1
+    fi
+    local GW_CMD
+    GW_CMD="exec env \
+HERMES_GATEWAY_SOCKET='${GATEWAY_SOCKET}' \
+HERMES_GATEWAY_PREFIX='${GATEWAY_PREFIX}' \
+HERMES_UPSTREAM_HOST='127.0.0.1' \
+HERMES_UPSTREAM_PORT='${PORT}' \
+'${PY}' '${GATEWAY_PROXY}'"
+    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+        bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
+    else
+        runuser -u "${TRIM_USERNAME}" -- bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
+    fi
+
+    # 就绪：TCP 回环监听 + Unix Socket
+    local i=0
+    while [ "${i}" -lt 90 ]; do
+        if port_listening && [ -S "${GATEWAY_SOCKET}" ]; then
+            log_msg "started, port ${PORT} + socket ${GATEWAY_SOCKET} (PID=$(cat "${PID_FILE}" 2>/dev/null))"
+            return 0
+        fi
+        pid_alive "$(read_pid)" || { log_msg "警告：Hermes 进程提前退出，详见日志"; return 1; }
+        sleep 1
+        i=$((i + 1))
+    done
+    if pid_alive "$(read_pid)" && [ -S "${GATEWAY_SOCKET}" ]; then
+        log_msg "started (slow), socket ready"
+        return 0
+    fi
+    if pid_alive "$(read_pid)"; then
+        log_msg "警告：端口/socket 暂未就绪但进程存活，交由应用中心继续探测"
+        return 0
+    fi
+    log_msg "警告：进程已退出且未就绪，请查看应用日志"
+    return 1
+}
+
+stop_process() {
+    log_msg "Stopping process ..."
+
+    local pid
+    pid="$(read_pid)"
+    if [ -n "${pid}" ]; then
+        if pid_alive "${pid}"; then
+            log_msg "send TERM signal to PID:${pid} ..."
+            kill -TERM "${pid}" 2>/dev/null || true
+            local count=0
+            while pid_alive "${pid}" && [ "${count}" -lt 12 ]; do
+                sleep 1
+                count=$((count + 1))
+            done
+            if pid_alive "${pid}"; then
+                log_msg "send KILL signal to PID:${pid} ..."
+                kill -KILL "${pid}" 2>/dev/null || true
+            fi
+        else
+            log_msg "pid ${pid} 已不存在"
+        fi
+        rm -f "${PID_FILE}"
+    fi
+
+    # 兜底：dashboard 会 spawn 子进程（pty/session reaper），runuser 包装导致
+    # pidfile 记的是 wrapper 的 PID，所以按绝对路径 pattern 兜底清理。
+    if own_pids > /dev/null 2>&1; then
+        log_msg "清理残留进程 (${PATTERN} / ${GATEWAY_PATTERN})"
+        pkill -TERM -f -- "${PATTERN}" 2>/dev/null || true
+        pkill -TERM -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -f -- "${PATTERN}" 2>/dev/null || true
+        pkill -KILL -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
+    fi
+    rm -f "${GATEWAY_SOCKET}"
+
+    log_msg "process stopped"
+    return 0
+}
+
+status() {
+    local pid
+    pid="$(read_pid)"
+    if [ -n "${pid}" ] && pid_alive "${pid}"; then
+        return 0
+    fi
+    # pidfile 所指进程确实不存在才清理；权限受限（读不到 cmdline）一律留着
+    if [ -n "${pid}" ] && [ ! -d "/proc/${pid}" ]; then
+        rm -f "${PID_FILE}"
+    fi
+    # pidfile 丢了但进程还在（异常重启后常见）——重新认领，避免 stop 失效
+    pid="$(own_pids | head -n 1)"
+    if [ -n "${pid}" ] && pid_alive "${pid}"; then
+        printf "%s" "${pid}" > "${PID_FILE}" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+### 在线更新：调 hermes-update.py（用同一个自带 Python）。
+### 用法：main update {check|apply|status|version}
+do_update() {
+    local script="${APP_DIR}/hermes-update.py"
+    if [ ! -f "${script}" ]; then
+        echo "缺少更新脚本：${script}" >&2
+        return 1
+    fi
+    if [ ! -x "${PY}" ]; then
+        echo "运行时不可用：${PY}" >&2
+        return 1
+    fi
+    HERMES_APP_ROOT="${APP_DIR}" HERMES_DATA_ROOT="${DATA_DIR}" \
+        "${PY}" "${script}" "${1:-status}"
+}
+
+case "$1" in
+    start)   start_process ;;
+    stop)    stop_process ;;
+    restart) stop_process; sleep 1; start_process ;;
+    status)  if status; then exit 0; else exit 3; fi ;;
+    update)  shift; do_update "${1:-status}" ;;
+    *)       exit 1 ;;
+esac
