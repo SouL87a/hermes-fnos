@@ -286,6 +286,58 @@ if [ -d "${SRC}/.git" ]; then
     fi
 fi
 
+# ── 3b. install-stamp.json（Hermes 版本的权威来源）───────────
+# Hermes 的版本解析顺序：install-stamp.json → 活的 .git → unknown。
+# 不写这个戳，dashboard 左下角会显示 "vunknown"。
+#
+# updateMechanism 取值决定更新归属：
+#   self     → 上游 `hermes update` 放行（但它要求 venv/PM 布局，与自带 CPython 冲突）
+#   external → 上游明确拒绝并提示"由安装方式管理"，更新走我们自己的
+#              hermes-update.py（dashboard 的 /__hermes/update/ui 或 SSH 命令）
+# 本项目用 external（更新链路自管，见 README）。
+echo "[build] 生成 install-stamp.json"
+STAMP="${RT}/hermes/install-stamp.json"
+STAMP_COMMIT="$(git -C "${SRC}" rev-parse HEAD 2>/dev/null || echo '')"
+STAMP_BRANCH="$(git -C "${SRC}" branch --show-current 2>/dev/null || echo '')"
+STAMP_DATE="$(git -C "${SRC}" log -1 --format=%ct 2>/dev/null || echo '')"
+# 从上游 ref 推导基础版本：v0.21.4+canary.xxx → 0.21.4；v2026.9.24 → 2026.9.24
+# 注意：直接读 upstream.version（不用 UPSTREAM 变量 —— 它只在克隆分支里定义）
+UPSTREAM_REF="$(grep -vE '^\s*#|^\s*$' "${REPO}/upstream.version" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
+STAMP_BASE="$(printf '%s' "${UPSTREAM_REF}" | sed -E 's/^v//; s/[+-].*$//')"
+[ -n "${STAMP_BASE}" ] || STAMP_BASE="0.0.0"
+[ -n "${STAMP_COMMIT}" ] || STAMP_COMMIT="$(printf '0%.0s' $(seq 1 40))"
+
+# 用构建机上任意可用的 python 写 stamp（不需要包内运行时）
+STAMP_PY=""
+for cand in "${PYBIN}" python3 python; do
+    if command -v "${cand}" > /dev/null 2>&1; then STAMP_PY="${cand}"; break; fi
+done
+[ -n "${STAMP_PY}" ] || { echo "✗ 找不到 python 用于生成 install-stamp.json"; exit 1; }
+
+"${STAMP_PY}" - "$(winpath "${STAMP}")" "$STAMP_COMMIT" "$STAMP_BASE" "$STAMP_BRANCH" "$STAMP_DATE" <<'PY'
+import json, sys, datetime
+out, commit, base, branch, cdate = sys.argv[1:6]
+stamp = {
+    "schemaVersion": 2,
+    "commit": commit,
+    "commitDate": int(cdate) if cdate.isdigit() else None,
+    "branch": branch or None,
+    "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "dirty": False,
+    "source": "local",          # 非 commit-build/docker/nix → 不触发额外拒绝
+    "distribution": None,       # 不声明发行形态
+    "updateMechanism": "external",  # 更新由本包的 hermes-update.py 管理
+    "baseVersion": base,
+    "displayVersion": base,
+    "distance": 0,
+}
+# payload 字段刻意不写：写了 bundled/light/runtime 会被判为"不可自更新"，
+# 这里要保持与 external 一致但语义清晰。
+open(out, "w", encoding="utf-8").write(json.dumps(stamp, ensure_ascii=False, indent=2) + "\n")
+print(f"[build]   stamp: base={base} commit={commit[:12] or '(none)'} mechanism=external")
+PY
+[ -f "${STAMP}" ] || { echo "✗ install-stamp.json 生成失败"; exit 1; }
+
 # ── 4. 前端预构建（web_dist）────────────────────────────────
 # 实测踩到的坑：
 #  a) 依赖必须 `npm ci --ignore-scripts`：某些包的 postinstall（如

@@ -261,6 +261,75 @@ def _reason(code: int) -> str:
             500: "Internal Server Error", 504: "Gateway Timeout"}.get(code, "OK")
 
 
+async def handle_native_update_proxy(method: str, path: str, headers, writer) -> None:
+    """把 dashboard 原生更新入口接到本包的 hermes-update.py。
+
+    上游 dashboard 期望：
+      GET  /api/hermes/update/check → UpdateCheckResponse
+        {install_method, current_version, behind, update_available,
+         can_apply, update_command, message}
+      POST /api/hermes/update       → ActionResponse
+        {name, ok, pid, message?, update_command?}
+
+    我们的 hermes-update.py 输出自己的 JSON，这里做字段映射。
+    """
+    def respond(code: int, body: dict) -> None:
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        writer.write(
+            f"HTTP/1.1 {code} {_reason(code)}\r\n"
+            f"Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(raw)}\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n".encode("latin-1") + raw
+        )
+
+    if not _is_admin(headers):
+        respond(403, {"ok": False, "message": "仅飞牛管理员可执行更新"})
+        await writer.drain()
+        writer.close()
+        return
+
+    loop = asyncio.get_running_loop()
+
+    if path.endswith("/check"):
+        code, body = await loop.run_in_executor(None, _run_update, "check")
+        try:
+            d = json.loads(body)
+        except ValueError:
+            d = {"ok": False, "message": body[:200]}
+        resp = {
+            "install_method": "fnos-fpk",
+            "current_version": d.get("current_version") or "unknown",
+            "behind": None,
+            "update_available": bool(d.get("available")),
+            "can_apply": True,   # 本包自管更新，随时可应用
+            "update_command": "hermes-update apply",
+            "message": d.get("message") or (
+                f"可更新到 {d.get('ref')}" if d.get("available") else "已是最新版本"
+            ),
+        }
+        respond(200, resp)
+    else:
+        code, body = await loop.run_in_executor(None, _run_update, "apply")
+        try:
+            d = json.loads(body)
+        except ValueError:
+            d = {"ok": False, "message": body[:200]}
+        resp = {
+            "name": "hermes-update",
+            "ok": bool(d.get("ok")),
+            "pid": None,
+            "message": d.get("message") or ("更新完成" if d.get("ok") else "更新失败"),
+            "update_command": "hermes-update apply",
+        }
+        if d.get("restart_required"):
+            resp["message"] = (resp["message"] or "") + "（请重启应用生效）"
+        respond(200 if d.get("ok") else 500, resp)
+
+    await writer.drain()
+    writer.close()
+
+
 async def read_head(reader: asyncio.StreamReader):
     """读取并解析请求头。返回 (method, target, version, raw_headers, body_expected)。"""
     try:
@@ -373,16 +442,32 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
             await handle_update_endpoint(method, up_path, headers, client_writer)
             return
 
+        # 接管上游 dashboard 的原生更新入口 —— 转到本包的 hermes-update.py。
+        # 原因：上游 `hermes update` 是 git 源码更新器，且要 venv/PM 布局；
+        # 本包是"自带 CPython + site-packages"，靠 install-stamp.json 的
+        # updateMechanism=external 让上游拒绝自更新。把 dashboard 的按钮接到
+        # 我们自己的更新链路，用户体验才连贯。
+        _base_path = up_path.split("?")[0]
+        if _base_path in ("/api/hermes/update", "/api/hermes/update/check"):
+            await handle_native_update_proxy(method, _base_path, headers, client_writer)
+            return
+
         up_reader, up_writer = await asyncio.open_connection(UP_HOST, UP_PORT)
 
         # 组装转发头：剔除 hop-by-hop，改 Host，注入 X-Forwarded-*
+        #
+        # ⚠ WebSocket 握手必须**同时**带上 `Upgrade: websocket` 与
+        #   `Connection: Upgrade` —— 上游（uvicorn/starlette）两者缺一就不回 101，
+        #   客户端拿不到升级、依赖 WS 的页面（对话 / SYSTEM）直接黑屏。
+        #   这里 Connection/Upgrade 都在 HOP_BY_HOP 里，所以要显式补回。
         out_lines = [f"{method} {up_path} {version}"]
         saw_host = False
         for k, v in headers:
             lk = k.lower()
             if lk in HOP_BY_HOP:
-                if lk == "upgrade":
-                    out_lines.append(f"{k}: {v}")  # WS 需要保留 Upgrade
+                if is_upgrade and lk in ("upgrade", "connection"):
+                    # 原样保留升级相关的这两个头
+                    out_lines.append(f"{k}: {v}")
                 continue
             if lk == "host":
                 saw_host = True

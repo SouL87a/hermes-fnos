@@ -96,22 +96,31 @@ jobs:
           echo "fpk: $FPK ($(du -h "$FPK" | cut -f1))"
           LIST="$(tar -tzf "$FPK")"
           echo "$LIST" | head -12
-          # 结构自检：缺任一都会导致装机失败或功能缺失
-          for need in manifest ICON.PNG ICON_256.PNG app.tgz cmd/main cmd/install_callback config/privilege ui/config wizard/install; do
-            echo "$LIST" | grep -qx "$need" || { echo "✗ fpk 缺少 $need"; exit 1; }
+
+          # fpk 顶层：注意 ui/ 在 app.tgz 内，不在顶层
+          for need in manifest ICON.PNG ICON_256.PNG app.tgz cmd/main cmd/install_callback cmd/config_callback config/privilege config/resource wizard/install wizard/config; do
+            echo "$LIST" | grep -qx "$need" || { echo "✗ fpk 顶层缺少 $need"; exit 1; }
           done
-          # app.tgz 内关键部件
+
+          # app.tgz 内关键部件（ui/ 与 gateway-proxy/hermes-update 都在这里）
           tar -xzf "$FPK" app.tgz
           A="$(tar -tzf app.tgz)"
-          for need in ./gateway-proxy.py ./hermes-update.py ./runtime/python/bin/python3 ./runtime/deps.txt ./runtime/web_dist/index.html ./runtime/hermes/hermes_cli/__init__.py; do
+          for need in ./ui/config ./ui/images/icon_64.png ./gateway-proxy.py ./hermes-update.py \
+                      ./bin/hermes-update ./runtime/deps.txt ./runtime/web_dist/index.html \
+                      ./runtime/python/bin/python3 ./runtime/hermes/hermes_cli/__init__.py; do
             echo "$A" | grep -qx "$need" || { echo "✗ app.tgz 缺少 $need"; exit 1; }
           done
-          # 在线更新依赖 .git —— 缺失则更新功能不可用，明确告警（不阻断构建）
-          if echo "$A" | grep -q "^\./runtime/hermes/\.git/"; then
-            echo "✓ 源码树含 .git（在线更新可用）"
-          else
-            echo "⚠ 源码树不含 .git —— 在线更新将不可用"
-          fi
+
+          # 安装戳（决定 dashboard 版本号显示）—— 缺失则显示 unknown
+          echo "$A" | grep -qx "./runtime/hermes/install-stamp.json" \
+            && echo "✓ 含 install-stamp.json（版本号可正确显示）" \
+            || { echo "✗ 缺少 install-stamp.json —— dashboard 会显示 vunknown"; exit 1; }
+
+          # 在线更新依赖 .git —— 缺失则更新功能不可用
+          echo "$A" | grep -q "^\./runtime/hermes/\.git/" \
+            && echo "✓ 源码树含 .git（在线更新可用）" \
+            || { echo "✗ 源码树不含 .git —— 在线更新不可用"; exit 1; }
+
           echo "✓ fpk 结构检查通过"
 
       - uses: actions/upload-artifact@v4
