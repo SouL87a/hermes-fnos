@@ -89,9 +89,13 @@ def repo_url() -> str:
 
 
 # ── 进程/工具 ────────────────────────────────────────────────
-def run(cmd: list[str], cwd: Path | None = None, timeout: int = 600) -> subprocess.CompletedProcess:
+def run(cmd: list[str], cwd: Path | None = None, timeout: int = 600,
+        env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    env = None
+    if env_extra:
+        env = {**os.environ, **env_extra}
     return subprocess.run(
-        cmd, cwd=str(cwd) if cwd else None,
+        cmd, cwd=str(cwd) if cwd else None, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         timeout=timeout, check=False, text=True,
     )
@@ -102,13 +106,32 @@ def find_git() -> str | None:
 
 
 def find_node_tool(name: str) -> str | None:
-    """node/npm 可能在自带运行时或系统里。"""
-    for cand in (
+    """node/npm 可能在自带运行时、fnOS 应用中心的 nodejs、或 PATH 里。
+
+    ⚠ 必须包含应用中心 nodejs 的路径：fnOS 上 node 由 nodejs_v22 应用提供，
+    位于 /vol*/@appcenter/nodejs_v22/bin，既不在自带 runtime 也不在 PATH
+    （第三轮审计实测：apply 因此跳过前端重建，留下"旧前端 × 新后端"错配）。
+    """
+    import glob as _glob
+    cands = [
         RUNTIME / "python" / "node" / "bin" / name,
         APP_ROOT / "runtime" / "node" / "bin" / name,
-    ):
+        Path("/var/apps/nodejs_v22/target/bin") / name,
+        Path("/var/apps/nodejs_v24/target/bin") / name,
+    ]
+    # 全卷 glob 兜底（应用可能装在任意存储空间）
+    cands += [Path(p) for p in _glob.glob(f"/vol*/@appcenter/nodejs_v*/bin/{name}")]
+    for cand in cands:
         if cand.exists() and os.access(cand, os.X_OK):
             return str(cand)
+    # HERMES_NODE 指向的目录也试一下（cmd/main 会设置）
+    hn = os.environ.get("HERMES_NODE")
+    if hn and name != "node":
+        sib = Path(hn).parent / name
+        if sib.exists() and os.access(sib, os.X_OK):
+            return str(sib)
+    if hn and name == "node":
+        return hn if os.access(hn, os.X_OK) else None
     return shutil.which(name)
 
 
@@ -179,8 +202,16 @@ def resolve_target(git: str) -> tuple[str, str, str]:
 
 
 def _ls_remote_map(git: str) -> dict[str, str]:
-    """一次拿全量远端 refs → {refname: sha}。避免多次往返与 shell 转义问题。"""
-    ls = run([git, "ls-remote", "origin"], cwd=SRC, timeout=180)
+    """一次拿全量远端 refs → {refname: sha}。避免多次往返与 shell 转义问题。
+
+    超时 20s（原 180s）：`check` 会被 dashboard 的 /system 首屏同步调用，
+    而本机访问 github.com 实测 2~180s 不等 —— 180s 的超时会让页面转圈长达
+    3 分钟（第三轮审计实测）。check 的定位是"快速看有没有新版本"，超时就
+    如实报错，由调用方（代理）转成 update_available=null，不能拖住页面。
+    GIT_TERMINAL_PROMPT=0：禁止 git 在凭据缺失时等交互输入（会挂到超时）。
+    """
+    ls = run([git, "ls-remote", "origin"], cwd=SRC, timeout=20,
+             env_extra={"GIT_TERMINAL_PROMPT": "0"})
     if ls.returncode != 0:
         raise RuntimeError(f"git ls-remote 失败：{ls.stdout.strip()[:200]}")
     out: dict[str, str] = {}
@@ -381,6 +412,14 @@ def apply_update(force: bool = False) -> dict[str, Any]:
     if not (SRC / ".git").exists():
         return {"ok": False, "message": f"源码树不是 git 检出：{SRC}"}
 
+    # 前置：node/npm 必须在 —— 否则 apply 会推进 Python 源码却重建不了前端，
+    # 留下「旧前端 × 新后端」的错配（第三轮审计 P0 第2条：「不要做一半」）。
+    # 现在更新一定会重建前端（不再允许跳过），所以缺 node 就直接拒绝。
+    if not all([find_node_tool("node"), find_node_tool("npm")]):
+        return {"ok": False,
+                "message": ("未找到 node/npm，无法重建前端；为避免新旧错配已中止更新。"
+                            "请在应用中心安装 Node.js（nodejs_v22）后重试。")}
+
     if LOCK_FILE.exists():
         # 陈旧锁（>30 分钟）自动清理
         try:
@@ -471,8 +510,17 @@ def apply_update(force: bool = False) -> dict[str, Any]:
         head_now = head_now.stdout.strip() if head_now.returncode == 0 else remote
 
         # 5. 前端
+        # 必须成功：前端不重建 = 旧前端 × 新后端错配（lazy chunk 路径变了会 404）。
+        # 失败则回滚代码与依赖，绝不留半成品。
         web_ok, web_detail = rebuild_web()
         step("重建前端", web_ok, web_detail)
+        if not web_ok:
+            if skip_git:
+                write_state(status="error", message=f"前端重建失败：{web_detail}", steps=steps)
+                return {"ok": False, "message": f"前端重建失败：{web_detail}", "steps": steps}
+            _rollback(git, old_commit, step)
+            write_state(status="error", message=f"前端重建失败，已回滚：{web_detail}", steps=steps)
+            return {"ok": False, "message": f"前端重建失败，已回滚到原版本：{web_detail}", "steps": steps}
 
         after = local_version()
         write_state(

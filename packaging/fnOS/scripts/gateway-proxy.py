@@ -120,6 +120,58 @@ def _is_admin(headers) -> bool:
     return False
 
 
+# ── 更新检查：超时 + 缓存 ─────────────────────────────────────
+# 为什么：dashboard 的 /system 首屏把 checkHermesUpdate 和 9 个本地接口绑在同一个
+# Promise.allSettled 里，只有全部 settle 才关转圈。而 check 要跑 `git ls-remote`
+# 打 github.com —— 本机实测 2~180s 不等，页面就被拖住 30~180s（第三轮审计实测）。
+# 这里：① 硬超时 15s，超时就返回 update_available=null，绝不拖住页面；
+#       ② 结果缓存 10 分钟，避免每次进 /system 都付一次网络代价。
+UPDATE_CHECK_TIMEOUT = float(os.environ.get("HERMES_UPDATE_CHECK_TIMEOUT", "15"))
+UPDATE_CHECK_TTL = float(os.environ.get("HERMES_UPDATE_CHECK_TTL", "600"))
+_update_check_cache: dict = {"at": 0.0, "payload": None}
+
+
+def _run_update_check_cached() -> dict:
+    """返回 dashboard UpdateCheckResponse 形状的 dict（已超时/缓存兜底）。"""
+    import time as _t
+    now = _t.time()
+    if _update_check_cache["payload"] and (now - _update_check_cache["at"]) < UPDATE_CHECK_TTL:
+        return {**_update_check_cache["payload"], "message": _update_check_cache["payload"].get("message")}
+
+    d: dict = {}
+    timed_out = False
+    try:
+        # 硬超时：_run_update 内部 subprocess 有各自的 timeout，这里再兜一层，
+        # 保证代理线程不会无限等（例如 git 卡在 DNS/凭据交互）。
+        code, body = _run_update("check", timeout=UPDATE_CHECK_TIMEOUT + 5)
+        try:
+            d = json.loads(body)
+        except ValueError:
+            d = {"ok": False, "message": (body or "")[:200]}
+    except Exception as exc:  # noqa: BLE001
+        timed_out = True
+        d = {"ok": False, "message": f"检查超时或失败：{exc}"}
+
+    payload = {
+        "install_method": "fnos-fpk",
+        "current_version": d.get("current_version") or "unknown",
+        "behind": None,
+        # 检查失败/超时 → None（前端按"未知"处理），而不是 false，
+        # 避免把"没查到"说成"已是最新"。
+        "update_available": (bool(d.get("available")) if d.get("ok") else None),
+        "can_apply": True,
+        "update_command": "hermes-update apply",
+        "message": d.get("message") or (
+            f"可更新到 {d.get('ref')}" if d.get("available") else "已是最新版本"
+        ),
+    }
+    if d.get("ok") and not timed_out:
+        # 只缓存成功结果（失败/超时下次仍会重试）
+        _update_check_cache["at"] = now
+        _update_check_cache["payload"] = payload
+    return payload
+
+
 # 自包含更新页（零依赖、不引用外部资源）。路径：<前缀>/__hermes/update/ui
 UPDATE_UI_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -192,7 +244,7 @@ $("#status").click();
 
 
 
-def _run_update(action: str) -> tuple[int, str]:
+def _run_update(action: str, timeout: float = 3600) -> tuple[int, str]:
     script = _update_script_path()
     if not os.path.exists(script):
         return 500, json.dumps({"ok": False, "message": f"缺少更新脚本：{script}"}, ensure_ascii=False)
@@ -201,13 +253,14 @@ def _run_update(action: str) -> tuple[int, str]:
         proc = subprocess.run(
             [py, script, action],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=3600, check=False, text=True,
+            timeout=timeout, check=False, text=True,
         )
         body = proc.stdout.strip()
         # 脚本输出是 JSON；原样透传
         return (200 if proc.returncode == 0 else 500), body
     except subprocess.TimeoutExpired:
-        return 504, json.dumps({"ok": False, "message": "更新操作超时"}, ensure_ascii=False)
+        return 504, json.dumps({"ok": False, "message": f"更新操作超时（{int(timeout)}s）"},
+                               ensure_ascii=False)
     except OSError as exc:
         return 500, json.dumps({"ok": False, "message": f"无法执行更新脚本：{exc}"}, ensure_ascii=False)
 
@@ -294,22 +347,9 @@ async def handle_native_update_proxy(method: str, path: str, headers, writer) ->
     loop = asyncio.get_running_loop()
 
     if path.endswith("/check"):
-        code, body = await loop.run_in_executor(None, _run_update, "check")
-        try:
-            d = json.loads(body)
-        except ValueError:
-            d = {"ok": False, "message": body[:200]}
-        resp = {
-            "install_method": "fnos-fpk",
-            "current_version": d.get("current_version") or "unknown",
-            "behind": None,
-            "update_available": bool(d.get("available")),
-            "can_apply": True,   # 本包自管更新，随时可应用
-            "update_command": "hermes-update apply",
-            "message": d.get("message") or (
-                f"可更新到 {d.get('ref')}" if d.get("available") else "已是最新版本"
-            ),
-        }
+        # 带硬超时的检查（默认 15s）+ 10 分钟缓存：/system 首屏会同步调它，
+        # 不能让它把页面拖住（第三轮审计：原实现无超时无缓存，实测 30~180s）。
+        resp = await loop.run_in_executor(None, _run_update_check_cached)
         respond(200, resp)
     else:
         code, body = await loop.run_in_executor(None, _run_update, "apply")
