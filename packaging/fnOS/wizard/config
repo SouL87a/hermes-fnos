@@ -1,10 +1,30 @@
 [
   {
-    "stepTitle": "Hermes Agent",
+    "stepTitle": "网络代理",
     "items": [
       {
         "type": "tips",
-        "helpText": "模型、API Key、工具与会话等配置都在控制台（桌面图标）里完成。修改后如需生效，重启本应用即可。"
+        "helpText": "填 HTTP 代理地址可让 Hermes 访问 github.com / PyPI（检查更新与在线更新需要）。不需要就留空。\n\n改动后需重启本应用生效。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_proxy",
+        "label": "HTTP 代理地址（留空=直连）",
+        "rules": [
+          {
+            "pattern": "^$|^https?://[A-Za-z0-9._~:/?#\\[\\]@!$&'()*+,;=%\\-]+$",
+            "message": "请填 http://主机:端口 形式，或留空"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "其他",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "模型、API Key、工具与会话等配置都在控制台（桌面图标）里完成。"
       }
     ]
   }

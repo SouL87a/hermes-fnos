@@ -7,5 +7,25 @@
         "helpText": "Hermes Agent 是 Nous Research 的自我进化 AI Agent。安装后从桌面图标打开控制台，在里面配置模型与 API Key（支持 Nous Portal、OpenRouter、OpenAI、自建端点等）。\n\n本应用走飞牛统一网关（飞牛登录态），不开放局域网端口；数据与工作区保存在 NAS 上，手机 / 平板 / 电脑共用一份。首次打开可能需要几秒初始化。"
       }
     ]
+  },
+  {
+    "stepTitle": "网络代理（可选）",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "如果 NAS 需要代理才能访问外网，在这里填 HTTP 代理地址；不需要就留空。\n\n用途：Hermes 的「检查更新 / 在线更新」要访问 github.com，装依赖要访问 PyPI —— 这两个域名国内经常连不上，配了代理能显著改善（也能让「系统」页的检查更新秒回）。\n\n格式：http://127.0.0.1:7890 或 http://192.168.1.10:7890。仅支持 http 代理；若你的代理软件只开 socks5，请在其中开启一个 http 端口。留空表示直连。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_proxy",
+        "label": "HTTP 代理地址（留空=直连）",
+        "rules": [
+          {
+            "pattern": "^$|^https?://[A-Za-z0-9._~:/?#\\[\\]@!$&'()*+,;=%\\-]+$",
+            "message": "请填 http://主机:端口 形式，或留空"
+          }
+        ]
+      }
+    ]
   }
 ]

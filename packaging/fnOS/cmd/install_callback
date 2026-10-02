@@ -99,6 +99,31 @@ fi
 
 chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
 
+# 安装向导里填的 HTTP 代理（wizard_proxy）落盘到 $HERMES_HOME/.env。
+# 逻辑与 config_callback 相同；这里只处理「安装时填了值」的情况，
+# 未填则不动（避免覆盖用户已有的 .env 代理配置）。
+if [ -n "${wizard_proxy:-}" ]; then
+    ENV_FILE="${TRIM_PKGVAR}/.env"
+    PROXY="${wizard_proxy}"
+    case "${PROXY}" in *$'\n'*) PROXY="" ;; esac
+    if [ -n "${PROXY}" ] && printf '%s' "${PROXY}" | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
+        touch "${ENV_FILE}"
+        TMP="${ENV_FILE}.tmp.$$"
+        grep -vE '^[[:space:]]*(export[[:space:]]+)?(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)=' \
+            "${ENV_FILE}" > "${TMP}" 2>/dev/null || true
+        {
+            echo "# ── HTTP 代理（安装向导写入）──"
+            echo "HTTP_PROXY=${PROXY}"
+            echo "HTTPS_PROXY=${PROXY}"
+            echo "ALL_PROXY=${PROXY}"
+            echo "NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local"
+        } >> "${TMP}"
+        mv "${TMP}" "${ENV_FILE}"
+        chmod 600 "${ENV_FILE}" 2>/dev/null || true
+        chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${ENV_FILE}" 2>/dev/null || true
+    fi
+fi
+
 # 依赖环境登记（见 fnos-depenv.py 的说明）。必须在 chown 之后跑，
 # 否则以 ${TRIM_USERNAME} 身份写入会被权限挡住。
 # 打包模式解释器是 ${PY}；系统 Python 模式用 ${TRIM_PKGVAR}/venv/bin/python3。

@@ -1,12 +1,63 @@
 #!/bin/bash
-# 应用设置页保存后回调。当前无设置项需要落盘（配置在 dashboard 内完成），
-# 仅确保数据目录权限正确，供重启后使用。
+# 应用设置页保存后回调。
+#
+# 目前只有一个设置项：HTTP 代理（向导字段 wizard_proxy，安装向导与设置页共用）。
+# 落盘到 $HERMES_HOME/.env 的 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY —— Hermes 会读
+# 这三个变量（agent/process_bootstrap.py、agent/auxiliary_client.py），git 与
+# pip 也认它们。留空则清除（直连）。
+#
+# 修改后需重启应用生效。
 set -e
 
 APP="hermes"
 if [ -z "${TRIM_PKGVAR}" ] && [ -d "/var/apps/${APP}/var" ]; then
     TRIM_PKGVAR="$(readlink -f "/var/apps/${APP}/var")"
 fi
+: "${TRIM_USERNAME:=${APP}}"
+: "${TRIM_GROUPNAME:=${TRIM_USERNAME}}"
+
 mkdir -p "${TRIM_PKGVAR}/log" "${TRIM_PKGVAR}/workspace" "${TRIM_PKGVAR}/state" 2>/dev/null || true
+
+ENV_FILE="${TRIM_PKGVAR}/.env"
+PROXY="${wizard_proxy:-}"
+
+# 纵深防御：只接受 http(s):// 开头或空值；拒绝含换行的注入
+case "${PROXY}" in
+    *$'\n'*) PROXY="" ;;
+esac
+if [ -n "${PROXY}" ]; then
+    if ! printf '%s' "${PROXY}" | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
+        echo "代理地址格式非法（需 http://主机:端口），已忽略" >> "${TRIM_PKGVAR}/info.log"
+        PROXY=""
+    fi
+fi
+
+# 管理与本机地址不走代理
+NO_PROXY_VAL="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local"
+
+### 就地更新 .env：删掉旧的四个代理键，再按需追加。其余行原样保留。
+touch "${ENV_FILE}"
+TMP="${ENV_FILE}.tmp.$$"
+grep -vE '^[[:space:]]*(export[[:space:]]+)?(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)=' \
+    "${ENV_FILE}" > "${TMP}" 2>/dev/null || true
+
+if [ -n "${PROXY}" ]; then
+    {
+        echo "# ── HTTP 代理（由应用设置页写入，改动后需重启）──"
+        echo "HTTP_PROXY=${PROXY}"
+        echo "HTTPS_PROXY=${PROXY}"
+        echo "ALL_PROXY=${PROXY}"
+        echo "NO_PROXY=${NO_PROXY_VAL}"
+    } >> "${TMP}"
+fi
+
+mv "${TMP}" "${ENV_FILE}"
+chmod 600 "${ENV_FILE}" 2>/dev/null || true
 chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+
+if [ -n "${PROXY}" ]; then
+    echo "已设置 HTTP 代理：${PROXY}" >> "${TRIM_PKGVAR}/info.log"
+else
+    echo "已清除 HTTP 代理（直连）" >> "${TRIM_PKGVAR}/info.log"
+fi
 exit 0
