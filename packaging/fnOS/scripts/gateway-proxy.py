@@ -43,6 +43,7 @@ import json
 import os
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -116,7 +117,45 @@ def _update_script_path() -> str:
     return os.path.join(here, "hermes-update.py")
 
 
-def _is_admin(headers) -> bool:
+def peer_uid(writer) -> int | None:
+    """Unix socket 对端进程的 uid（SO_PEERCRED）。取不到返回 None。
+
+    用途：区分「飞牛网关注入的 X-Trim-*」（对端是 root）与「本机其它进程
+    自己伪造的」（对端非 root）。socket 是 0666，任何本机进程都能连，
+    所以不能只看头是否存在 —— 必须看来路。
+    """
+    try:
+        tsock = writer.get_extra_info("socket")
+        if tsock is None:
+            return None
+        fd = tsock.fileno()
+        dup = os.dup(fd)
+        s = None
+        try:
+            s = socket.socket(fileno=dup)
+            dup = -1  # 所有权交给 s
+            fmt = struct.calcsize("3i")
+            raw = s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, fmt)
+            _pid, uid, _gid = struct.unpack("3i", raw)
+            return uid
+        finally:
+            if s is not None:
+                s.close()
+            elif dup >= 0:
+                os.close(dup)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _is_admin(headers, from_root: bool = False) -> bool:
+    """是否为飞牛管理员请求。
+
+    from_root=True 表示对端是 root（飞牛网关），此时信任 X-Trim-Isadmin。
+    否则视为不可信来源：本机普通进程可自加该头（socket 0666），
+    一律不认。
+    """
+    if not from_root:
+        return False
     for k, v in headers:
         if k.lower() == "x-trim-isadmin":
             return v.strip().lower() in ("1", "true", "yes")
@@ -268,7 +307,7 @@ def _run_update(action: str, timeout: float = 3600) -> tuple[int, str]:
         return 500, json.dumps({"ok": False, "message": f"无法执行更新脚本：{exc}"}, ensure_ascii=False)
 
 
-async def handle_update_endpoint(method: str, up_path: str, headers, writer) -> None:
+async def handle_update_endpoint(method: str, up_path: str, headers, writer, from_root: bool = False) -> None:
     def respond(code: int, body: str, ctype: str = "application/json; charset=utf-8") -> None:
         raw = body.encode("utf-8")
         writer.write(
@@ -279,7 +318,7 @@ async def handle_update_endpoint(method: str, up_path: str, headers, writer) -> 
             "Connection: close\r\n\r\n".encode("latin-1") + raw
         )
 
-    if not _is_admin(headers):
+    if not _is_admin(headers, from_root):
         respond(403, json.dumps({"ok": False, "message": "仅飞牛管理员可执行更新"}, ensure_ascii=False))
         await writer.drain()
         writer.close()
@@ -319,7 +358,7 @@ def _reason(code: int) -> str:
             500: "Internal Server Error", 504: "Gateway Timeout"}.get(code, "OK")
 
 
-async def handle_gateway_restart(up_path: str, headers, writer) -> None:
+async def handle_gateway_restart(up_path: str, headers, writer, from_root: bool = False) -> None:
     """接管 dashboard 的「重启网关」→ 调 cmd/main gateway-restart。
 
     上游实现 spawn `hermes gateway restart`，其子进程走 PM store python →
@@ -339,7 +378,7 @@ async def handle_gateway_restart(up_path: str, headers, writer) -> None:
             "Connection: close\r\n\r\n".encode("latin-1") + raw
         )
 
-    if not _is_admin(headers):
+    if not _is_admin(headers, from_root):
         respond(403, {"ok": False, "message": "仅飞牛管理员可重启网关", "name": "gateway-restart"})
         await writer.drain()
         writer.close()
@@ -373,7 +412,7 @@ async def handle_gateway_restart(up_path: str, headers, writer) -> None:
     writer.close()
 
 
-async def handle_native_update_proxy(method: str, path: str, headers, writer) -> None:
+async def handle_native_update_proxy(method: str, path: str, headers, writer, from_root: bool = False) -> None:
     """把 dashboard 原生更新入口接到本包的 hermes-update.py。
 
     上游 dashboard 期望：
@@ -395,7 +434,7 @@ async def handle_native_update_proxy(method: str, path: str, headers, writer) ->
             "Connection: close\r\n\r\n".encode("latin-1") + raw
         )
 
-    if not _is_admin(headers):
+    if not _is_admin(headers, from_root):
         respond(403, {"ok": False, "message": "仅飞牛管理员可执行更新"})
         await writer.drain()
         writer.close()
@@ -507,6 +546,10 @@ async def pipe(a: asyncio.StreamReader, b: asyncio.StreamWriter) -> None:
 
 async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter) -> None:
     peer = client_writer.get_extra_info("peername") or "local"
+    # 对端进程 uid：飞牛网关以 root 运行，是本 socket 唯一可信来源。
+    # 其它本机进程也能连（socket 0666），但它们不是 root ⇒ 伪造的 X-Trim-* 不被采信。
+    p_uid = peer_uid(client_writer)
+    from_root = p_uid == 0
     try:
         parsed = await read_head(client_reader)
         if not parsed:
@@ -574,7 +617,7 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         # 更新控制端点：由代理本机处理，不转发给上游 dashboard。
         # 只有带 X-Trim-Isadmin（飞牛管理员）的请求才放行。
         if up_path == "/__hermes/update" or up_path.startswith("/__hermes/update/"):
-            await handle_update_endpoint(method, up_path, headers, client_writer)
+            await handle_update_endpoint(method, up_path, headers, client_writer, from_root)
             return
 
         # 接管上游 dashboard 的原生更新入口 —— 转到本包的 hermes-update.py。
@@ -584,7 +627,7 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         # 我们自己的更新链路，用户体验才连贯。
         _base_path = up_path.split("?")[0]
         if _base_path in ("/api/hermes/update", "/api/hermes/update/check"):
-            await handle_native_update_proxy(method, _base_path, headers, client_writer)
+            await handle_native_update_proxy(method, _base_path, headers, client_writer, from_root)
             return
 
         # 接管 dashboard 的「重启网关」按钮。
@@ -595,7 +638,7 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         # cmd/main 的 gateway-restart（由 cmd/main 的 supervisor 负责拉起），
         # 同样绕开 PM。
         if _base_path == "/api/gateway/restart" and method == "POST":
-            await handle_gateway_restart(up_path, headers, client_writer)
+            await handle_gateway_restart(up_path, headers, client_writer, from_root)
             return
 
         up_reader, up_writer = await asyncio.open_connection(UP_HOST, UP_PORT)

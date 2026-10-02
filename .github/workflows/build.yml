@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
-      ref: ${{ steps.pin.outputs.ref }}
+      ref: ${{ steps.ver.outputs.ref }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,20 +41,18 @@ jobs:
         id: ver
         run: |
           set -e
-          VERSION="$(head -n 1 fnos.version | tr -d '[:space:]')"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "fnOS fpk 版本: $VERSION"
-
-      - name: Pin upstream ref
-        id: pin
-        run: |
-          set -e
+          # 版本跟随上游：fpk 版本 = 上游 ref 的版本号
+          # （v0.21.4+canary.… → 0.21.4），与应用中心/install-stamp 一致。
           if [ -n "${{ github.event.inputs.hermes_ref }}" ]; then
             REF="${{ github.event.inputs.hermes_ref }}"
           else
             REF="$(grep -vE '^\s*#|^\s*$' upstream.version | head -n 1 | tr -d '[:space:]')"
           fi
+          VERSION="$(printf '%s' "$REF" | sed -E 's/^v//; s/[+-].*$//')"
+          [ -n "$VERSION" ] || VERSION="$(grep -vE '^\s*#|^\s*$' fnos.version | head -n 1 | tr -d '[:space:]')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "版本: $VERSION（跟随上游 $REF）"
           echo "钉住的上游 ref: $REF"
 
       - uses: actions/setup-node@v4

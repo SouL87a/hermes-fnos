@@ -1,1 +1,6 @@
+# 兜底版本号。正常构建时**不用**这个值 —— fpk 版本跟随 upstream.version
+# （v0.21.4+canary.… → 0.21.4），使应用中心显示的版本能直接反映"当前是哪个
+# Hermes"，与 dashboard 左下角、install-stamp 一致。
+#
+# 仅在 HERMES_VERSION 未设且 upstream.version 解析不出（空/格式异常）时才用它。
 0.1.0

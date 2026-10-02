@@ -73,13 +73,22 @@ if [ "$(uname -s)" = "Darwin" ]; then
     echo "  请改用 Linux 或 WSL 构建。"
 fi
 
-# ── 版本号：仓库根 fnos.version 是单一事实来源 ────────────────
+# ── 版本号：跟随上游 ─────────────────────────────────────────
+# fpk 版本 = 上游 ref 的版本（与 dashboard 左下角、install-stamp 一致），
+# 这样应用中心显示的版本能直接反映"当前是哪个 Hermes"。
+#   v0.21.4+canary.20261001T070239Z → 0.21.4
+#   v2026.9.24                     → 2026.9.24
+# 覆盖顺序：HERMES_VERSION 环境变量 > 上游 ref 推导 > fnos.version 兜底。
+UPSTREAM_REF_V="$(grep -vE '^\s*#|^\s*$' "${REPO}/upstream.version" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
 VERSION="${HERMES_VERSION:-}"
-if [ -z "${VERSION}" ] && [ -f "${REPO}/fnos.version" ]; then
-    VERSION="$(head -n 1 "${REPO}/fnos.version" | tr -d '[:space:]')"
+if [ -z "${VERSION}" ] && [ -n "${UPSTREAM_REF_V}" ]; then
+    VERSION="$(printf '%s' "${UPSTREAM_REF_V}" | sed -E 's/^v//; s/[+-].*$//')"
 fi
-[ -z "${VERSION}" ] && VERSION="0.1.0"
-echo "[build] 版本 ${VERSION}"
+if [ -z "${VERSION}" ] && [ -f "${REPO}/fnos.version" ]; then
+    VERSION="$(grep -vE '^\s*#|^\s*$' "${REPO}/fnos.version" | head -n 1 | tr -d '[:space:]')"
+fi
+[ -z "${VERSION}" ] && VERSION="0.0.0"
+echo "[build] 版本 ${VERSION}（跟随上游 ${UPSTREAM_REF_V:-?}）"
 
 # ── 架构（首版 x86_64 单架构）───────────────────────────────
 # fnOS 的 TRIM_SYS_ARCH 取值是 x86 / arm（manifest platform 同款口径）。
@@ -306,10 +315,9 @@ STAMP_COMMIT="$(git -C "${SRC}" rev-parse HEAD 2>/dev/null || echo '')"
 STAMP_BRANCH="$(git -C "${SRC}" branch --show-current 2>/dev/null || echo '')"
 STAMP_DATE="$(git -C "${SRC}" log -1 --format=%ct 2>/dev/null || echo '')"
 # 从上游 ref 推导基础版本：v0.21.4+canary.xxx → 0.21.4；v2026.9.24 → 2026.9.24
-# 注意：直接读 upstream.version（不用 UPSTREAM 变量 —— 它只在克隆分支里定义）
-UPSTREAM_REF="$(grep -vE '^\s*#|^\s*$' "${REPO}/upstream.version" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
-STAMP_BASE="$(printf '%s' "${UPSTREAM_REF}" | sed -E 's/^v//; s/[+-].*$//')"
-[ -n "${STAMP_BASE}" ] || STAMP_BASE="0.0.0"
+# 与 fpk 版本统一（同一份推导，避免两处漂移）
+STAMP_BASE="${VERSION}"
+UPSTREAM_REF="${UPSTREAM_REF_V}"
 [ -n "${STAMP_COMMIT}" ] || STAMP_COMMIT="$(printf '0%.0s' $(seq 1 40))"
 
 # 用构建机上任意可用的 python 写 stamp（不需要包内运行时）
