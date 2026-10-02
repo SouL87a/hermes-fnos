@@ -79,12 +79,16 @@ if (!html.includes('hermes-xterm-css-fix')) {
     ? readdirSync(assetsDir).filter(f => /^xterm-.*\.css$/.test(f))
     : []
   if (xtermCssFiles.length > 0) {
+    // ⚠ 直接用**带前缀的**路径，不要写 "/assets/" 后靠服务端兜底改写 ——
+    // 兜底列表是逐条列举的，将来新 chunk 落进去就可能静默 404。
+    // 这里的 base 与 index.html 里其它资源保持一致。
+    const base = (process.env.HERMES_WEB_BASE || '/app/hermes/').replace(/\/+$/, '')
     const tags = xtermCssFiles
-      .map(f => `<link rel="stylesheet" crossorigin href="/assets/${f}" data-hermes-xterm-css-fix>`)
+      .map(f => `<link rel="stylesheet" crossorigin href="${base}/assets/${f}" data-hermes-xterm-css-fix>`)
       .join('\n    ')
     html = html.replace('</head>', `  ${tags}\n  </head>`)
     writeFileSync(indexPath, html)
-    console.log(`[web-build] xterm CSS 已静态引入 index.html: ${xtermCssFiles.join(', ')}`)
+    console.log(`[web-build] xterm CSS 已静态引入 index.html: ${base}/assets/${xtermCssFiles.join(', ')}`)
   } else {
     console.log('[web-build] 无独立 xterm CSS chunk（已并入入口或不存在）')
   }

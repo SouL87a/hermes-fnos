@@ -276,29 +276,62 @@ def install_deps(deps: list[str]) -> tuple[bool, str]:
 
 # ── 前端 ─────────────────────────────────────────────────────
 def rebuild_web() -> tuple[bool, str]:
-    """有 node/npm 就重建 web_dist。没有则保留旧 dist（可能过期但不影响启动）。"""
+    """有 node/npm 就重建 web_dist。没有则保留旧 dist（可能过期但不影响启动）。
+
+    ⚠ 必须用**包内自带的 web-build.mjs**，不能走上游 `npm run build`：
+    上游 scripts/build/web.mjs 不传 Vite base，产物 base 会回到 "/"，
+    而本包经 /app/hermes 前缀反代访问 —— JS 里懒加载 chunk 会请求
+    /assets/...（无前缀）→ 404 → 每个 lazy 路由黑屏（入口 HTML 由服务端
+    兜底改写，所以「外壳能渲染、内容区空」）。
+    web-build.mjs 里传了 base='/app/hermes/'，与打包时保持一致。
+    """
     npm = find_node_tool("npm")
     node = find_node_tool("node")
     if not (npm and node) or not (SRC / "web" / "package.json").exists():
         return False, "未找到 node/npm，跳过前端重建（沿用现有 web_dist）"
+
+    builder = APP_ROOT / "runtime" / "web-build.mjs"
+    if not builder.exists():
+        # 老包没有该文件：宁可不重建，也不能产出无前缀 dist（会导致黑屏）
+        return False, (f"缺少前端构建脚本 {builder}，跳过重建（避免产出无前缀 dist 导致黑屏）。"
+                       "请改用新版 fpk。")
+
     env = dict(os.environ)
     env["PATH"] = f"{Path(node).parent}{os.pathsep}{env.get('PATH', '')}"
+    env["HERMES_WEB_BASE"] = os.environ.get("HERMES_WEB_BASE", "/app/hermes/")
     try:
-        proc = run([npm, "install", "--no-audit", "--no-fund", "--workspace", "web"],
-                   cwd=SRC, timeout=1800)
+        # --ignore-scripts：避开会联网挂死的 postinstall（与 build.sh 同因）
+        proc = run([npm, "install", "--no-audit", "--no-fund", "--ignore-scripts",
+                    "--workspace", "web"], cwd=SRC, timeout=1800)
         if proc.returncode != 0:
             return False, "npm install 失败：" + "\n".join(proc.stdout.splitlines()[-20:])
-        proc = run([npm, "run", "build", "--workspace", "web"], cwd=SRC, timeout=1800)
+
+        # web-build.mjs 以 cwd 为源码树根，复制过去执行（与 build.sh 同款用法）
+        staged = SRC / ".hermes-web-build.mjs"
+        shutil.copyfile(builder, staged)
+        try:
+            proc = run([node, str(staged)], cwd=SRC, timeout=1800)
+        finally:
+            staged.unlink(missing_ok=True)
         if proc.returncode != 0:
-            return False, "npm build 失败：" + "\n".join(proc.stdout.splitlines()[-20:])
+            return False, "前端构建失败：" + "\n".join(proc.stdout.splitlines()[-20:])
+
         built = SRC / "hermes_cli" / "web_dist"
-        if built.exists():
-            # 就地更新包内 web_dist
-            if WEB_DIST.exists():
-                shutil.rmtree(WEB_DIST, ignore_errors=True)
-            shutil.copytree(built, WEB_DIST)
-            return True, "前端已重建"
-        return False, "构建产物缺失"
+        if not built.exists():
+            return False, "构建产物缺失"
+
+        # 自检：产物必须带前缀，否则更新完会黑屏。宁可失败也不覆盖现有 dist。
+        idx = built / "index.html"
+        if idx.exists():
+            html = idx.read_text(encoding="utf-8", errors="replace")
+            if "/app/hermes/assets/" not in html:
+                return False, ("产物未带 /app/hermes 前缀（base 注入失败），"
+                               "已中止以免更新后黑屏。原 web_dist 未改动。")
+
+        if WEB_DIST.exists():
+            shutil.rmtree(WEB_DIST, ignore_errors=True)
+        shutil.copytree(built, WEB_DIST)
+        return True, "前端已重建（含 /app/hermes 前缀）"
     except subprocess.TimeoutExpired:
         return False, "前端构建超时"
 

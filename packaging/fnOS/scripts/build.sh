@@ -389,6 +389,10 @@ fi
 [ -f "${RT}/web_dist/index.html" ] || { echo "✗ 缺 web_dist/index.html"; exit 1; }
 echo "[build] web_dist ✓ ($(du -sh "${RT}/web_dist" | cut -f1))"
 
+# 把前端构建脚本随包分发 —— 在线更新（hermes-update.py）重建 web_dist 时
+# 必须用它，否则会走上游 npm run build（不带 base 注入）→ 前缀丢失 → 黑屏。
+cp "${HERE}/web-build.mjs" "${RT}/web-build.mjs"
+
 # ── 4b. TUI bundle（对话页底部终端依赖它）────────────────────
 # 上游 main_tui_launch 按序查找 entry.js：
 #   $HERMES_TUI_DIR/dist/entry.js → hermes_cli/tui_dist/entry.js → <repo>/ui-tui/dist/entry.js

@@ -500,6 +500,20 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         #   这里 Connection/Upgrade 都在 HOP_BY_HOP 里，所以要显式补回。
         out_lines = [f"{method} {up_path} {version}"]
         saw_host = False
+        # 记录客户端原始 Host 与转发的协议，供下方 X-Forwarded-Host/Proto 使用。
+        # 飞牛网关会带 X-Forwarded-Host / X-Forwarded-Proto（我们剥掉客户端那对
+        # 以免重复），这里取它带来的值，没有则退回原始 Host。
+        client_host = ""
+        fwd_host = ""
+        fwd_proto = ""
+        for k, v in headers:
+            lk = k.lower()
+            if lk == "host":
+                client_host = v
+            elif lk == "x-forwarded-host":
+                fwd_host = v
+            elif lk == "x-forwarded-proto":
+                fwd_proto = v
         for k, v in headers:
             lk = k.lower()
             if lk in HOP_BY_HOP:
@@ -542,6 +556,14 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         # 关键：告诉 Hermes 它挂在 /app/hermes 下（唯一权威来源）
         if PREFIX:
             out_lines.append(f"X-Forwarded-Prefix: {PREFIX}")
+        # X-Forwarded-Host/Proto：上游据此生成绝对 URL（cookie 的 Secure 标志、
+        # OAuth 回调 url_for、重定向）。当前 dashboard 不做 auth 门，影响有限；
+        # 但一旦启用 dashboard auth 而这两个头缺失，回调 URL 会按
+        # http://127.0.0.1:9119 生成 → 浏览器完成不了回调 → 登录死循环。
+        # 取客户端原始 Host（等价于浏览器看到的域名），协议优先用网关给的值。
+        if fwd_host or client_host:
+            out_lines.append(f"X-Forwarded-Host: {fwd_host or client_host}")
+        out_lines.append(f"X-Forwarded-Proto: {fwd_proto or 'http'}")
         if not is_upgrade:
             out_lines.append("Connection: close")
 
