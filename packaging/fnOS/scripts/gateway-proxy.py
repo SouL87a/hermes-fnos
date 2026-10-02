@@ -439,6 +439,35 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
             xf = {k.lower(): v for k, v in headers if k.lower().startswith("x-forwarded-")}
             log(f"req {method} {path!r} → up={up_path!r} xfwd={xf}")
 
+        # ── 入口兜底：把「前缀本身」重定向到 /sessions ──────────────
+        #
+        # 上游前端有竞态 bug：入口 URL 恰好等于 basename（无路径）时，
+        # RootRedirect 刚跳到 /sessions，同一次 commit 里 ProfileProvider 的
+        # ?profile= 同步 effect 用相对 navigate 把 URL 覆盖回根路径 →
+        # <Routes> 无内容 → 页面只剩外壳（空白）。
+        # 触发条件：路径前缀反代 + 入口 URL 正好是前缀本身 ——
+        # fnOS 桌面图标的 url 就是 "/app/hermes"，故必现。
+        #
+        # 这里在代理层 302 到 <前缀>/sessions（保留 query），从入口就避开该状态。
+        # 只对带 text/html 的 GET 生效（浏览器导航），不误伤 API/资源请求。
+        if method == "GET" and PREFIX and path == PREFIX:
+            accept = ""
+            for k, v in headers:
+                if k.lower() == "accept":
+                    accept = v.lower()
+                    break
+            if "text/html" in accept:
+                loc = f"{PREFIX}/sessions{query}"
+                log(f"entry redirect {path!r} → {loc!r}")
+                client_writer.write(
+                    f"HTTP/1.1 302 Found\r\nLocation: {loc}\r\n"
+                    f"Content-Length: 0\r\nCache-Control: no-store\r\n"
+                    f"Connection: close\r\n\r\n".encode("latin-1")
+                )
+                await client_writer.drain()
+                client_writer.close()
+                return
+
         hmap = {k.lower(): v for k, v in headers}
         is_upgrade = (
             hmap.get("upgrade", "").lower() == "websocket"
