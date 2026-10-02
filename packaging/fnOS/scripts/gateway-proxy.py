@@ -105,7 +105,8 @@ def _split_target(target: str):
 # 实现：调用同目录的 hermes-update.py（用同一个自带 python）。
 UPDATE_SCRIPT = os.environ.get("HERMES_UPDATE_SCRIPT", "")
 
-# 应用根：本代理脚本部署在 <APP_ROOT>/gateway-proxy.py，cmd/main 在 <APP_ROOT>/cmd/main
+# 应用内容树根：本代理脚本部署在 <APP_ROOT>/gateway-proxy.py
+# （注意 cmd/main 不在这里，见 find_cmd_main）
 APP_ROOT = os.environ.get("HERMES_APP_ROOT") or os.path.dirname(os.path.abspath(__file__))
 
 
@@ -115,6 +116,37 @@ def _update_script_path() -> str:
     # 默认：与代理同目录
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, "hermes-update.py")
+
+
+def find_cmd_main() -> str | None:
+    """定位应用生命周期脚本 cmd/main。
+
+    ⚠ 它**不在**应用内容树里：fnOS 把 fpk 顶层的 cmd/ 装到 <appdata>/cmd/，
+    而应用内容树（app.tgz 解出的东西）在 /vol1/@appcenter/<app>/。
+    实测真机路径是 /var/apps/hermes/cmd/main（/var/apps 是 fnOS 统一视图，
+    跨卷有效）。这里按可能性依次探测，全部落空返回 None。
+    """
+    # 首选由 cmd/main 自己注入的真实路径（零猜测）
+    cands = []
+    env_path = os.environ.get("HERMES_CMD_MAIN", "").strip()
+    if env_path:
+        cands.append(env_path)
+    env_dir = os.environ.get("HERMES_APP_CTL_DIR", "").strip()
+    if env_dir:
+        cands.append(os.path.join(env_dir, "main"))
+    cands += [
+        os.path.join(APP_ROOT, "cmd", "main"),   # 与代理同级（若布局不同）
+        "/var/apps/hermes/cmd/main",             # fnOS 统一视图（真机实测）
+        "/var/apps/hermes/target/cmd/main",
+    ]
+    # 全卷兜底：/vol*/@appcenter/hermes/cmd/main 与 @appdata
+    import glob as _glob
+    cands += _glob.glob("/vol*/@appcenter/hermes/cmd/main")
+    cands += _glob.glob("/vol*/@appdata/hermes/cmd/main")
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
 
 
 def peer_uid(writer) -> int | None:
@@ -359,15 +391,23 @@ def _reason(code: int) -> str:
 
 
 async def handle_gateway_restart(up_path: str, headers, writer, from_root: bool = False) -> None:
-    """接管 dashboard 的「重启网关」→ 调 cmd/main gateway-restart。
+    """接管 dashboard 的网关启停（restart / start / stop）→ 调 cmd/main 同名子命令。
 
-    上游实现 spawn `hermes gateway restart`，其子进程走 PM store python →
-    activate_dependencies 拒绝（未提交依赖环境）→ exit 1。
-    这里改为调本包 cmd/main 的 gateway-restart 子命令：它删/写 want 文件并
-    重启 supervisor，完全不碰 PM。
+    上游实现 spawn `hermes gateway {restart,start,stop}`，其子进程走 PM store
+    python → activate_dependencies 拒绝（未提交依赖环境）→ exit 1。
+    这里改为调本包 cmd/main 的 gateway-* 子命令：它写/删 want 文件并启停
+    supervisor，完全不碰 PM。**只动消息网关**，不动 dashboard / 应用本身。
 
     返回 dashboard 期望的 ActionResponse：{name, ok, pid, message?}
     """
+    # 端点 → cmd/main 子命令 + 动作名
+    action = up_path.split("?")[0].rstrip("/").rsplit("/", 1)[-1]  # restart|start|stop
+    _ACT = {
+        "restart": ("gateway-restart", "gateway-restart", "网关已重启"),
+        "start": ("gateway-start", "gateway-start", "网关已启动"),
+        "stop": ("gateway-stop", "gateway-stop", "网关已停止"),
+    }
+    subcmd, name, ok_msg = _ACT.get(action, ("gateway-restart", "gateway-restart", "网关已重启"))
     def respond(code: int, body: dict) -> None:
         raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
         writer.write(
@@ -379,35 +419,36 @@ async def handle_gateway_restart(up_path: str, headers, writer, from_root: bool 
         )
 
     if not _is_admin(headers, from_root):
-        respond(403, {"ok": False, "message": "仅飞牛管理员可重启网关", "name": "gateway-restart"})
+        respond(403, {"ok": False, "message": "仅飞牛管理员可操作网关", "name": name})
         await writer.drain()
         writer.close()
         return
 
-    main_sh = os.path.join(APP_ROOT, "cmd", "main") if APP_ROOT else ""
-    if not main_sh or not os.path.exists(main_sh):
-        respond(500, {"ok": False, "message": f"找不到 {main_sh}", "name": "gateway-restart"})
+    main_sh = find_cmd_main()
+    if not main_sh:
+        respond(500, {"ok": False, "name": name,
+                      "message": "找不到 cmd/main（应用生命周期脚本）"})
         await writer.drain()
         writer.close()
         return
 
     def _do() -> tuple[int, str]:
         try:
-            proc = subprocess.run(["/bin/bash", main_sh, "gateway-restart"],
+            proc = subprocess.run(["/bin/bash", main_sh, subcmd],
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   timeout=90, check=False, text=True)
             return proc.returncode, proc.stdout.strip()
         except subprocess.TimeoutExpired:
-            return 504, "重启超时"
+            return 504, f"{action} 超时"
         except OSError as exc:
             return 500, f"无法执行：{exc}"
 
     code, out = await asyncio.get_running_loop().run_in_executor(None, _do)
     ok = code == 0
-    resp = {"name": "gateway-restart", "pid": None, "ok": ok,
-            "message": "网关已重启" if ok else f"网关重启失败：{out[-200:]}"}
+    resp = {"name": name, "pid": None, "ok": ok,
+            "message": ok_msg if ok else f"网关{action}失败：{out[-200:]}"}
     respond(200 if ok else 500, resp)
-    log(f"gateway restart via cmd/main: ok={ok}")
+    log(f"gateway {action} via cmd/main: ok={ok}")
     await writer.drain()
     writer.close()
 
@@ -630,14 +671,16 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
             await handle_native_update_proxy(method, _base_path, headers, client_writer, from_root)
             return
 
-        # 接管 dashboard 的「重启网关」按钮。
-        # 原因：上游 /api/gateway/restart 会 spawn `hermes gateway restart`，而那个
-        # 子进程用 PM store python 启动 → activate_dependencies 发现"未提交依赖
-        # 环境" → exit 1（PM 与「自带 CPython」布局的固有冲突）。
+        # 接管 dashboard 的网关启停按钮（restart / start / stop）。
+        # 原因：上游这三个端点都会 spawn `hermes gateway ...`，其子进程用 PM
+        # store python 启动 → activate_dependencies 发现"未提交依赖环境" →
+        # exit 1（PM 与「自带 CPython」布局的固有冲突）。
         # 官方 trim.hermes 用 Go wrapper 自己管进程、不碰 PM；本包改为调
-        # cmd/main 的 gateway-restart（由 cmd/main 的 supervisor 负责拉起），
-        # 同样绕开 PM。
-        if _base_path == "/api/gateway/restart" and method == "POST":
+        # cmd/main 的 gateway-{restart,start,stop}（由 cmd/main 的 supervisor
+        # 负责拉起/停止消息网关），同样绕开 PM。
+        # 注意：只动消息网关，不动 dashboard / 代理 / 整个 fnOS 应用。
+        if _base_path in ("/api/gateway/restart", "/api/gateway/start", "/api/gateway/stop") \
+                and method == "POST":
             await handle_gateway_restart(up_path, headers, client_writer, from_root)
             return
 

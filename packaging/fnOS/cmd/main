@@ -42,6 +42,13 @@ fi
 
 APP_DIR="${TRIM_APPDEST}"
 SRC_DIR="${APP_DIR}/runtime/hermes"
+
+### 本脚本的绝对路径 / 所在目录。
+### ⚠ cmd/ 被 fnOS 装在 /var/apps/<app>/cmd/（= <appdata>/cmd），**不在**
+### 应用内容树 APP_DIR（= /vol1/@appcenter/<app>）里 —— 任何 `${APP_DIR}/cmd/main`
+### 都是错的路径。凡是需要引用本脚本自身的地方，一律用下面这两个变量。
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+APP_CTL_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
 ### 两种运行时模式：
 ###  - 打包模式（默认）：自带 CPython，PY=runtime/python/bin/python3，依赖在其 site-packages。
 ###  - 系统 Python 模式：构建时放了 .use-system-python 标记，安装时在 NAS 上建
@@ -194,7 +201,7 @@ start_gateway_supervisor() {
         gateway_supervisor_loop "${ws}" "${node_env}" >> "${LOG_FILE}" 2>&1 &
     else
         runuser -u "${TRIM_USERNAME}" -- bash -c \
-            "exec '${APP_DIR}/cmd/main' __gateway_supervisor '${ws}'" >> "${LOG_FILE}" 2>&1 &
+            "exec '${SELF_PATH}' __gateway_supervisor '${ws}'" >> "${LOG_FILE}" 2>&1 &
     fi
     log_msg "启动消息网关 supervisor (pid=$!)"
 }
@@ -277,6 +284,8 @@ ${NODE_ENV}
     # 输出量很小（每请求一行），长期开启无妨。
     GW_CMD="exec env \
 HERMES_APP_ROOT='${APP_DIR}' \
+HERMES_CMD_MAIN='${SELF_PATH}' \
+HERMES_APP_CTL_DIR='${APP_CTL_DIR}' \
 HERMES_GATEWAY_SOCKET='${GATEWAY_SOCKET}' \
 HERMES_GATEWAY_PREFIX='${GATEWAY_PREFIX}' \
 HERMES_UPSTREAM_HOST='127.0.0.1' \
@@ -359,8 +368,11 @@ stop_process() {
         pkill -KILL -f -- "${PATTERN}" 2>/dev/null || true
         pkill -KILL -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
     fi
-    # supervisor 循环体本身（bash 跑 gateway_supervisor_loop）也按 cmd/main 路径兜底
-    pkill -TERM -f -- "${APP_DIR}/cmd/main __gateway_supervisor" 2>/dev/null || true
+    # supervisor 循环体本身（bash 跑 gateway_supervisor_loop）也按 cmd/main 路径兜底。
+    # 用 SELF_PATH（真实路径）—— APP_DIR/cmd/main 不存在，永不命中。
+    pkill -TERM -f -- "${SELF_PATH} __gateway_supervisor" 2>/dev/null || true
+    # 兼容：万一被别处用不同路径调用（符号链接等），放宽匹配子串
+    pkill -TERM -f -- "cmd/main __gateway_supervisor" 2>/dev/null || true
     rm -f "${GATEWAY_SOCKET}"
 
     log_msg "process stopped"
@@ -430,6 +442,39 @@ restart_gateway() {
     return 0
 }
 
+### 仅启动消息网关（不停 dashboard / 代理）。供代理的 /api/gateway/start 调用。
+start_gateway_only() {
+    local ws node_env="" nb
+    ws="$(resolve_workspace)"
+    if nb="$(find_node_bin)"; then node_env="HERMES_NODE='${nb}' \\"; fi
+    if [ -f "${GATEWAY_WANT_FILE}" ] && pgrep -f -- "${SRC_DIR}.*gateway run" > /dev/null 2>&1; then
+        log_msg "gateway 已在运行"
+        return 0
+    fi
+    start_gateway_supervisor "${ws}" "${node_env}"
+    log_msg "gateway start 完成"
+    return 0
+}
+
+### 仅停止消息网关（不停 dashboard / 代理）。供代理的 /api/gateway/stop 调用。
+stop_gateway_only() {
+    rm -f "${GATEWAY_WANT_FILE}"
+    local gpid
+    gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "${gpid}" ] && kill -TERM "${gpid}" 2>/dev/null || true
+    pkill -TERM -f -- "${SRC_DIR}.*gateway run" 2>/dev/null || true
+    local i=0
+    while [ "${i}" -lt 15 ]; do
+        pgrep -f -- "${SRC_DIR}.*gateway run" > /dev/null 2>&1 || break
+        sleep 1
+        i=$((i + 1))
+    done
+    pkill -KILL -f -- "${SRC_DIR}.*gateway run" 2>/dev/null || true
+    rm -f "${GATEWAY_PID_FILE}"
+    log_msg "gateway stop 完成"
+    return 0
+}
+
 case "$1" in
     start)   start_process ;;
     stop)    stop_process ;;
@@ -437,6 +482,8 @@ case "$1" in
     status)  if status; then exit 0; else exit 3; fi ;;
     update)  shift; do_update "${1:-status}" ;;
     gateway-restart) restart_gateway ;;
+    gateway-start)   start_gateway_only ;;
+    gateway-stop)    stop_gateway_only ;;
     # 内部：被 runuser 以应用用户身份拉起的 supervisor 循环体
     __gateway_supervisor) shift; gateway_supervisor_loop "$@" ;;
     *)       exit 1 ;;
