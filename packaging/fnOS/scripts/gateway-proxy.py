@@ -332,34 +332,6 @@ async def handle_native_update_proxy(method: str, path: str, headers, writer) ->
     writer.close()
 
 
-def rewrite_html_prefix(html: str, prefix: str) -> str:
-    """把 index.html 里的绝对资源路径改写到代理前缀下。
-
-    为什么代理层要做：上游 `_serve_index` 也会做同样的事，但它依赖
-    X-Forwarded-Prefix 且只在特定分支触发；真机上（飞牛网关自带该头）
-    实测不可靠。官方 Go wrapper 同样是自己在代理层改写。这里对齐。
-
-    改写目标（与上游一致）：
-      href="/assets/  src="/assets/  href="/favicon.ico"
-      href="/fonts/   href="/ds-assets/  src="/ds-assets/
-    以及 CSS 里可能的 url(/fonts/...) 等（由 /assets/*.css 单独处理）。
-    """
-    if not prefix:
-        return html
-    p = prefix.rstrip("/")
-    out = html
-    for attr in ('href="/assets/', 'src="/assets/', 'href="/favicon.ico"',
-                 'href="/fonts/', 'href="/fonts-terminal/', 'href="/ds-assets/',
-                 'src="/ds-assets/'):
-        # 已是带前缀的就跳过（幂等）
-        out = out.replace(attr, attr.replace('"/', f'"{p}/', 1))
-    # 修正 __HERMES_BASE_PATH__：上游若已注入则保持；若为空则补上
-    if 'window.__HERMES_BASE_PATH__=""' in out:
-        out = out.replace('window.__HERMES_BASE_PATH__=""',
-                          f'window.__HERMES_BASE_PATH__="{p}"')
-    return out
-
-
 async def read_head(reader: asyncio.StreamReader):
     """读取并解析请求头。返回 (method, target, version, raw_headers, body_expected)。"""
     try:
@@ -510,12 +482,30 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
                 saw_host = True
                 out_lines.append(f"Host: {UP_HOST}:{UP_PORT}")
                 continue
-            # ⚠ 剔除客户端原有的 X-Forwarded-*：飞牛网关会带自己的
-            #   X-Forwarded-Prefix（可能是 "/" 或空），若原样转发再追加我们的，
-            #   上游会收到重复头并取**第一个**（客户端那个）→ 前缀失效 →
-            #   index.html 的 /assets/ 不被改写 → 资源 404 → 页面黑屏。
-            #   前缀只能由本代理权威给出，见下方统一追加。
+            # 剔除客户端原有的 X-Forwarded-*：飞牛网关会带自己的
+            # X-Forwarded-Prefix（可能是 "/" 或空），若原样转发再追加我们的，
+            # 上游会收到重复头并取**第一个**（客户端那个）→ 前缀失效。
+            # 前缀只能由本代理权威给出，见下方统一追加。
             if lk in ("x-forwarded-prefix", "x-forwarded-host", "x-forwarded-proto"):
+                continue
+            # ⚠ 仅对 **WebSocket 升级请求**剔除 Origin（HTTP 请求保留不动）。
+            #
+            # 为什么：上游 0.21.x 新增了 _ws_host_origin_reason（对应安全公告
+            # GHSA-ppp5-vxwm-4cf7），要求 Origin 必须匹配 bound host；它通过
+            # dashboard.public_url → trusted_public_hosts 判定，而本包未配该值
+            # （配了会触发 OAuth 门禁、锁死 dashboard）→ 经反向代理访问时浏览器
+            # 带的外部域名 Origin 一律被拒 → WS 握手 403 → 对话/SYSTEM 页黑屏。
+            #
+            # 上游对该校验的实现是 `if not origin: return None`（无 Origin 直接
+            # 放行）—— 这是它为反代/非浏览器客户端预留的路径。而 0.20.2 及更早
+            # 版本**根本没有此校验**，剔除 Origin 等于回到旧版安全基线。
+            #
+            # 不削弱鉴权：WS 的真实凭据是 URL 里的 ?token=<会话 token>（浏览器
+            # 请求自带），攻击者拿不到 token 仍连不上；前置还有飞牛统一网关的
+            # 登录态（X-Trim-*）。失去的仅是 Origin 这一层的 DNS-rebinding 防护。
+            if is_upgrade and lk == "origin":
+                if DEBUG:
+                    log(f"WS: stripped Origin {v!r}")
                 continue
             out_lines.append(f"{k}: {v}")
         if not saw_host:
@@ -540,71 +530,12 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
 
         await pump_body(client_reader, up_writer, headers)
 
-        # 先只读响应头，据此决定「改写 HTML」还是「流式透传」。
-        # 不能无条件缓冲整个响应 —— 那会破坏 SSE/长连接等流式接口。
-        try:
-            head_raw = await up_reader.readuntil(b"\r\n\r\n")
-        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
-            head_raw = b""
-        if not head_raw:
-            client_writer.close()
-            try:
-                up_writer.close()
-            except Exception:
-                pass
-            return
-
-        status_line, _, raw_headers = head_raw.partition(b"\r\n")
-        hdrs = []
-        for line in raw_headers.split(b"\r\n"):
-            if not line:
-                continue
-            k, _, v = line.partition(b":")
-            hdrs.append((k.strip().decode("latin-1"), v.strip().decode("latin-1")))
-
-        hmap_resp = {k.lower(): v for k, v in hdrs}
-        ctype = hmap_resp.get("content-type", "").lower()
-        enc = hmap_resp.get("content-encoding", "").lower()
-
-        # 仅 HTML 且未压缩时改写；其余一律流式透传（保住 SSE / 大文件 / 二进制）
-        if PREFIX and "text/html" in ctype and enc in ("", "identity"):
-            body = b""
-            try:
-                body = await up_reader.read()
-            except Exception:
-                pass
-            rewritten = body
-            try:
-                text = body.decode("utf-8")
-                new = rewrite_html_prefix(text, PREFIX)
-                if new != text:
-                    rewritten = new.encode("utf-8")
-                    log(f"rewrote HTML asset paths for {path} (len {len(body)}→{len(rewritten)})")
-            except UnicodeDecodeError:
-                rewritten = body
-
-            out = [status_line.decode("latin-1")]
-            for k, v in hdrs:
-                lk = k.lower()
-                if lk in ("content-length", "content-encoding", "transfer-encoding",
-                          "connection", "keep-alive"):
-                    continue
-                out.append(f"{k}: {v}")
-            out.append("Connection: close")
-            out.append(f"Content-Length: {len(rewritten)}")
-            client_writer.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"))
-            if rewritten:
-                client_writer.write(rewritten)
-            await client_writer.drain()
-            client_writer.close()
-            try:
-                up_writer.close()
-            except Exception:
-                pass
-            return
-
-        # 非 HTML：原样流式回传
-        client_writer.write(head_raw)
+        # 响应：原样流式回传（已强制 Connection: close，读到 EOF 即可）。
+        #
+        # 这里**不做 HTML 改写**：资源前缀已由构建时的 Vite base 编译进
+        # index.html 与各 chunk（见 scripts/web-build.mjs），代理只需纯转发。
+        # 早期版本曾在此处改写 HTML —— 那是错误方向（改不到 JS 内部拼接的
+        # 懒加载路径），已移除。
         while True:
             chunk = await up_reader.read(65536)
             if not chunk:

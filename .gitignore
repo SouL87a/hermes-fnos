@@ -14,3 +14,7 @@ trim.hermes-0.20.2-2-tpk/
 *.part
 __pycache__/
 *.pyc
+
+# 诊断产物（用户放进来排查用的，不进版本库）
+*.log
+*-report.md

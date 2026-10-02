@@ -181,7 +181,12 @@ p = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 proj = p["project"]
 deps = list(proj.get("dependencies", []))
 extras = proj.get("optional-dependencies", {})
-for name in ("web",):
+# 装哪些 extra：
+#   web       —— dashboard 服务端（fastapi/uvicorn）
+#   messaging —— 消息平台适配器（aiohttp 等）。缺它则 QQ/Telegram 等
+#                适配器建不出来，gateway 日志报 "No adapter available"
+#                （用户实测报告 qqbot-channel-status-report.md）。
+for name in ("web", "messaging"):
     deps += list(extras.get(name, []))
 # 过滤自引用（形如 hermes-agent[xxx]），避免把项目本身拉进来
 out = [d for d in deps if not d.strip().lower().startswith("hermes-agent")]
