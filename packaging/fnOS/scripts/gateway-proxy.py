@@ -460,11 +460,12 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         path, query = _split_target(target)
         up_path = strip_prefix(path) + query
 
-        # 诊断（仅入口页）：记录客户端（飞牛网关）传入的 X-Forwarded-*。
-        # 真机排查用 —— 能直接看到网关到底传了什么。
-        if DEBUG and path.rstrip("/") in ("", "/app/hermes"):
+        # 诊断：记录每个请求的路径 + 客户端 X-Forwarded-*。
+        # 真机排查资源 404 的唯一现场证据 —— 能直接看出浏览器请求的是
+        # /assets/（无前缀，说明 index.html 未改写）还是 /app/hermes/assets/。
+        if DEBUG:
             xf = {k.lower(): v for k, v in headers if k.lower().startswith("x-forwarded-")}
-            log(f"entry: path={path!r} client_x_forwarded={xf}")
+            log(f"req {method} {path!r} → up={up_path!r} xfwd={xf}")
 
         hmap = {k.lower(): v for k, v in headers}
         is_upgrade = (

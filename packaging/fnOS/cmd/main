@@ -111,6 +111,24 @@ port_listening() {
     grep -q ":$(printf '%04X' "${PORT}")" /proc/net/tcp 2>/dev/null
 }
 
+### 查找 node —— 对话页的 TUI 终端需要它。
+### 为什么必须显式给：上游 _tui_node_bin 优先读 $HERMES_NODE；未设时会回退
+### `pm.ensure("node")`，在离线/受限环境会**卡死 240 秒且零输出**（实测报告缺陷 4）。
+### 应用中心装了 nodejs_v22 就有可用 node，直接指过去。
+find_node_bin() {
+    local d
+    # 优先应用中心的 nodejs（v22/v24），跨卷兜底
+    for d in /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node \
+             /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node; do
+        [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
+    done
+    d="$(command -v node 2>/dev/null)" && [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
+    for d in /vol*/@appcenter/nodejs_v*/bin/node; do
+        [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
+    done
+    return 1
+}
+
 ### 面板入口说明（写给排查的人）：
 ### ui/config 的入口是 /app/hermes（iframe）。飞牛统一网关把 /app/hermes/**
 ### 转到 hermes.sock 且不剥前缀。gateway-proxy.py 剥掉前缀后转发到
@@ -150,6 +168,15 @@ start_process() {
     # 主服务：dashboard 仅绑回环，避免触发非回环的强制鉴权门。
     # 资源定位用上游官方的 HERMES_BUNDLED_* 机制（比靠 PROJECT_ROOT 推导更稳，
     # 与官方 fnOS 包的 hermes-env 一致）：源码树即资源根。
+    # TUI 终端用的 node（缺陷 4）：显式给出，避免上游回退到会卡死的 pm.ensure
+    local NODE_BIN NODE_ENV=""
+    if NODE_BIN="$(find_node_bin)"; then
+        NODE_ENV="HERMES_NODE='${NODE_BIN}' \\"
+        log_msg "TUI node: ${NODE_BIN}"
+    else
+        log_msg "警告：未找到 node —— 对话页终端将不可用（请在应用中心安装 Node.js）"
+    fi
+
     local CMD
     CMD="cd '${SRC_DIR}' && exec env \
 HOME='${DATA_DIR}' \
@@ -165,6 +192,7 @@ HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
 HERMES_WEB_DIST='${WEB_DIST}' \
 HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
+${NODE_ENV}
 '${PY}' -m ${MODULE} dashboard --host 127.0.0.1 --port '${PORT}' --no-open --skip-build"
 
     if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
@@ -181,16 +209,48 @@ HERMES_MANAGED_BY='trim-hermes-fnos' \
         return 1
     fi
     local GW_CMD
+    # HERMES_GATEWAY_DEBUG=1：把每个请求的路径与客户端 X-Forwarded-* 记进日志，
+    # 以及 HTML 改写结果。真机排查资源 404 时这是唯一的现场证据。
+    # 输出量很小（每请求一行），长期开启无妨。
     GW_CMD="exec env \
 HERMES_GATEWAY_SOCKET='${GATEWAY_SOCKET}' \
 HERMES_GATEWAY_PREFIX='${GATEWAY_PREFIX}' \
 HERMES_UPSTREAM_HOST='127.0.0.1' \
 HERMES_UPSTREAM_PORT='${PORT}' \
+HERMES_GATEWAY_DEBUG='1' \
 '${PY}' '${GATEWAY_PROXY}'"
     if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
         bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
     else
         runuser -u "${TRIM_USERNAME}" -- bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
+    fi
+
+    # 消息网关（Telegram / QQ / 飞书等）—— 缺陷 5：官方 trim.hermes 会起它，
+    # 本包原先漏了，导致「Gateway Status: Stopped」，消息平台开箱不可用。
+    # --external-supervisor：由本脚本（应用 supervisor）托管生命周期，
+    # 不让 gateway 自己装 systemd/launchd 服务。
+    # 它可能因未配置任何平台而自行退出，属正常，故失败不阻断启动。
+    local GW_RUN_CMD
+    GW_RUN_CMD="cd '${SRC_DIR}' && exec env \
+HOME='${DATA_DIR}' \
+PYTHONPATH='${SRC_DIR}' \
+PYTHONUNBUFFERED=1 \
+PYTHONDONTWRITEBYTECODE=1 \
+HERMES_HOME='${DATA_DIR}' \
+HERMES_BUNDLED_SKILLS='${SRC_DIR}/skills' \
+HERMES_OPTIONAL_SKILLS='${SRC_DIR}/optional-skills' \
+HERMES_BUNDLED_PLUGINS='${SRC_DIR}/plugins' \
+HERMES_BUNDLED_LOCALES='${SRC_DIR}/locales' \
+HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
+HERMES_WRITE_SAFE_ROOT='${ws}' \
+HERMES_MANAGED_BY='trim-hermes-fnos' \
+${NODE_ENV}
+'${PY}' -m ${MODULE} gateway run --external-supervisor"
+    log_msg "启动消息网关 (gateway run --external-supervisor)"
+    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+        bash -c "${GW_RUN_CMD}" >> "${LOG_FILE}" 2>&1 &
+    else
+        runuser -u "${TRIM_USERNAME}" -- bash -c "${GW_RUN_CMD}" >> "${LOG_FILE}" 2>&1 &
     fi
 
     # 就绪：TCP 回环监听 + Unix Socket

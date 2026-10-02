@@ -384,6 +384,42 @@ fi
 [ -f "${RT}/web_dist/index.html" ] || { echo "✗ 缺 web_dist/index.html"; exit 1; }
 echo "[build] web_dist ✓ ($(du -sh "${RT}/web_dist" | cut -f1))"
 
+# ── 4b. TUI bundle（对话页底部终端依赖它）────────────────────
+# 上游 main_tui_launch 按序查找 entry.js：
+#   $HERMES_TUI_DIR/dist/entry.js → hermes_cli/tui_dist/entry.js → <repo>/ui-tui/dist/entry.js
+# 缺它则对话页终端是黑框（实测报告缺陷 3）。官方 trim.hermes 自带该文件。
+# 这里用上游 scripts/build/tui.mjs（esbuild）构建，产出落到 hermes_cli/tui_dist/。
+if [ "${SKIP_TUI:-0}" = "1" ] && [ -f "${SRC}/hermes_cli/tui_dist/entry.js" ]; then
+    echo "[build] --skip-tui：复用已有 tui_dist"
+else
+    if [ -f "${SRC}/scripts/build/tui.mjs" ]; then
+        echo "[build] 构建 TUI bundle（上游 scripts/build/tui.mjs）"
+        # --out 必须在源码树外（上游 productOutput 校验：树内路径会被当作构建输入）
+        TUI_OUT="${PKG_DIR}/.cache/tui-out"
+        rm -rf "${TUI_OUT}"
+        ( cd "${SRC}" && node scripts/build/tui.mjs --source "${SRC}" \
+            --out "${TUI_OUT}" ) \
+          || { echo "✗ TUI 构建失败"; exit 1; }
+        mkdir -p "${SRC}/hermes_cli/tui_dist"
+        if [ -f "${TUI_OUT}/dist/entry.js" ]; then
+            cp "${TUI_OUT}/dist/entry.js" "${SRC}/hermes_cli/tui_dist/entry.js"
+        elif [ -f "${SRC}/ui-tui/dist/entry.js" ]; then
+            cp "${SRC}/ui-tui/dist/entry.js" "${SRC}/hermes_cli/tui_dist/entry.js"
+        else
+            echo "✗ TUI 构建未产出 entry.js"; exit 1
+        fi
+    else
+        echo "⚠ 上游无 scripts/build/tui.mjs，跳过 TUI 构建（对话页终端将不可用）"
+    fi
+fi
+if [ -f "${SRC}/hermes_cli/tui_dist/entry.js" ]; then
+    mkdir -p "${RT}/hermes/hermes_cli/tui_dist"
+    cp "${SRC}/hermes_cli/tui_dist/entry.js" "${RT}/hermes/hermes_cli/tui_dist/entry.js"
+    echo "[build] tui_dist ✓ ($(du -h "${RT}/hermes/hermes_cli/tui_dist/entry.js" | cut -f1))"
+else
+    echo "⚠ 未产出 tui_dist/entry.js —— 对话页终端将不可用"
+fi
+
 # ── 5. 桌面入口 + 网关代理（ui 必须在 app/ 内）───────────────
 mkdir -p "${APP_DIR}/ui/images"
 cp "${PKG_DIR}/ui/config" "${APP_DIR}/ui/config"
