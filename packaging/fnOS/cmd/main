@@ -206,6 +206,43 @@ start_gateway_supervisor() {
     log_msg "启动消息网关 supervisor (pid=$!)"
 }
 
+### 依赖环境登记（缺陷：子进程 exit 1 "no dependency environment is committed"）。
+###
+### 为什么需要：本包自带 CPython、依赖预装在其 site-packages，不走 PM 的 uv 构建。
+### 但 PM 自己的 store Python 存在于 ${DATA_DIR}/tools/，而上游
+### hermes_cli/_launchers.py::runtime_command() 会优先用 store Python 拉起子进程；
+### 子进程启动时 pm/environments.py::activate_dependencies() 找不到任何
+### 「已提交的依赖环境」，于是 _require_own_dependencies() 对「非 venv +
+### base_prefix 在 store 内」的解释器直接拒绝 → exit 1。凡走 runtime_command 的
+### 子进程全灭：dashboard 的 doctor / 安全审计 / 备份 / 导入 / curator /
+### prompt-size / dump、cron 的 .py 脚本等。
+###
+### 这里在 install state 里登记一个指向自带 CPython 的依赖环境（等价于 PM 本来
+### 会做的那一步）：committed_venv() 不再返回 None，拒绝分支永不被触达。
+### 只写 ${DATA_DIR}/installs/<key>/，不改应用包；PM 工具链（uv/chromium/
+### agent-browser）行为不变。
+###
+### 每次启动都跑：解释器版本升级（3.14→3.15）或应用换卷后路径变化，登记需跟着重建。
+### 幂等、约 0.3s。失败不阻断启动（子动作退回旧症状，服务本身照常可用）。
+ensure_dependency_environment() {
+    local helper="${APP_DIR}/fnos-depenv.py"
+    if [ ! -f "${helper}" ]; then
+        log_msg "警告：缺少 ${helper}，dashboard 子动作会报 'no dependency environment is committed'"
+        return 0
+    fi
+    ### 只允许用应用自己的解释器：用 PM store Python 跑会把登记指向裸解释器，
+    ### 子进程虽不再报 pm repair，却会在第一个 import 上崩掉
+    ### （脚本内也有同样的拒绝）。
+    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+        env HOME="${DATA_DIR}" HERMES_HOME="${DATA_DIR}" HERMES_PKG_SRC="${SRC_DIR}" \
+            "${PY}" "${helper}" >> "${LOG_FILE}" 2>&1 || true
+    else
+        runuser -u "${TRIM_USERNAME}" -- env HOME="${DATA_DIR}" HERMES_HOME="${DATA_DIR}" \
+            HERMES_PKG_SRC="${SRC_DIR}" "${PY}" "${helper}" >> "${LOG_FILE}" 2>&1 || true
+    fi
+    return 0
+}
+
 start_process() {
     if status > /dev/null 2>&1; then
         return 0
@@ -226,6 +263,10 @@ start_process() {
         echo "应用缺少预构建前端（web_dist）" > "${TRIM_TEMP_LOGFILE}"
         return 1
     fi
+
+    ### 依赖环境登记：必须在拉起 dashboard 之前完成，否则它 spawn 的第一个
+    ### 子动作就会撞上 "no dependency environment is committed"。
+    ensure_dependency_environment
 
     local ws
     ws="$(resolve_workspace)"

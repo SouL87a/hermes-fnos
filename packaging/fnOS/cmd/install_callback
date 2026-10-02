@@ -98,4 +98,16 @@ if [ ! -f "${RUNTIME}/web_dist/index.html" ]; then
 fi
 
 chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+
+# 依赖环境登记（见 fnos-depenv.py 的说明）。必须在 chown 之后跑，
+# 否则以 ${TRIM_USERNAME} 身份写入会被权限挡住。
+# 打包模式解释器是 ${PY}；系统 Python 模式用 ${TRIM_PKGVAR}/venv/bin/python3。
+DEPENV_PY="${PY}"
+[ -x "${DEPENV_PY}" ] || DEPENV_PY="${TRIM_PKGVAR}/venv/bin/python3"
+if [ -f "${TRIM_APPDEST}/fnos-depenv.py" ] && [ -x "${DEPENV_PY}" ]; then
+    runuser -u "${TRIM_USERNAME}" -- env HOME="${TRIM_PKGVAR}" HERMES_HOME="${TRIM_PKGVAR}" \
+        HERMES_PKG_SRC="${RUNTIME}/hermes" "${DEPENV_PY}" "${TRIM_APPDEST}/fnos-depenv.py" \
+        >> "${TRIM_PKGVAR}/info.log" 2>&1 || true
+fi
+
 exit 0

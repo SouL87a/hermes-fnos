@@ -444,6 +444,9 @@ cp "${PKG_DIR}/ui-images/icon_64.png"  "${APP_DIR}/ui/images/icon_64.png"
 cp "${PKG_DIR}/ui-images/icon_256.png" "${APP_DIR}/ui/images/icon_256.png"
 # 统一网关适配层（替代官方 Go wrapper）
 cp "${HERE}/gateway-proxy.py" "${APP_DIR}/gateway-proxy.py"
+# 依赖环境登记脚本：cmd/main 每次启动调用，修 dashboard 子动作的
+# "no dependency environment is committed"（doctor/审计/备份/cron 等）
+cp "${HERE}/fnos-depenv.py" "${APP_DIR}/fnos-depenv.py"
 # 在线更新引擎
 cp "${HERE}/hermes-update.py" "${APP_DIR}/hermes-update.py"
 # CLI 包装：usr-local-linker 会把 app/bin/hermes-update 链接进 PATH，

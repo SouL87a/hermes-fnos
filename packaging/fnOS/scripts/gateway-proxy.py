@@ -194,36 +194,64 @@ def _is_admin(headers, from_root: bool = False) -> bool:
     return False
 
 
-# ── 更新检查：超时 + 缓存 ─────────────────────────────────────
+# ── 更新检查：超时 + 缓存（含失败缓存）───────────────────────
 # 为什么：dashboard 的 /system 首屏把 checkHermesUpdate 和 9 个本地接口绑在同一个
 # Promise.allSettled 里，只有全部 settle 才关转圈。而 check 要跑 `git ls-remote`
-# 打 github.com —— 本机实测 2~180s 不等，页面就被拖住 30~180s（第三轮审计实测）。
-# 这里：① 硬超时 15s，超时就返回 update_available=null，绝不拖住页面；
-#       ② 结果缓存 10 分钟，避免每次进 /system 都付一次网络代价。
-UPDATE_CHECK_TIMEOUT = float(os.environ.get("HERMES_UPDATE_CHECK_TIMEOUT", "15"))
+# 打 github.com —— 大陆网络实测成功率约 30%，失败时固定卡满超时。
+#
+# 三条关键设计（少了任一条这个按钮就会拖垮系统页）：
+#  ① 硬超时 3s：GitHub 不通时最多等 3 秒（原 15s→加缓冲变 20s，仍太慢）；
+#  ② **失败/超时结果也要缓存**（短 TTL）：否则「GitHub 不通」期间每次进
+#     /system 都要重付一次超时 —— 这正是上一版最致命的遗漏；
+#  ③ 成功结果用长 TTL（10 分钟），失败结果用短 TTL（90 秒）以便稍后自愈。
+UPDATE_CHECK_TIMEOUT = float(os.environ.get("HERMES_UPDATE_CHECK_TIMEOUT", "3"))
 UPDATE_CHECK_TTL = float(os.environ.get("HERMES_UPDATE_CHECK_TTL", "600"))
-_update_check_cache: dict = {"at": 0.0, "payload": None}
+UPDATE_CHECK_FAIL_TTL = float(os.environ.get("HERMES_UPDATE_CHECK_FAIL_TTL", "90"))
+_update_check_cache: dict = {"at": 0.0, "payload": None, "ttl": 0.0}
+
+
+def _update_check_cached_or_none() -> dict | None:
+    """命中未过期缓存则返回，否则 None（供调用方决定"阻塞查"还是"后台查"）。"""
+    import time as _t
+    if _update_check_cache["payload"] and \
+            (_t.time() - _update_check_cache["at"]) < _update_check_cache["ttl"]:
+        return _update_check_cache["payload"]
+    return None
+
+
+_check_inflight = {"running": False}
+
+
+def _kick_update_check_background() -> None:
+    """后台跑一次检查（不阻塞请求）。同一时刻只跑一个。"""
+    import threading
+    if _check_inflight["running"]:
+        return
+    def _work() -> None:
+        _check_inflight["running"] = True
+        try:
+            _run_update_check_cached()
+        except Exception as exc:  # noqa: BLE001
+            log(f"background update check failed: {exc!r}")
+        finally:
+            _check_inflight["running"] = False
+    threading.Thread(target=_work, daemon=True).start()
 
 
 def _run_update_check_cached() -> dict:
-    """返回 dashboard UpdateCheckResponse 形状的 dict（已超时/缓存兜底）。"""
-    import time as _t
-    now = _t.time()
-    if _update_check_cache["payload"] and (now - _update_check_cache["at"]) < UPDATE_CHECK_TTL:
-        return {**_update_check_cache["payload"], "message": _update_check_cache["payload"].get("message")}
-
+    """同步执行一次检查并写缓存（供后台线程 / 诊断调用，不在请求路径上）。"""
     d: dict = {}
-    timed_out = False
+    ok = False
     try:
         # 硬超时：_run_update 内部 subprocess 有各自的 timeout，这里再兜一层，
         # 保证代理线程不会无限等（例如 git 卡在 DNS/凭据交互）。
-        code, body = _run_update("check", timeout=UPDATE_CHECK_TIMEOUT + 5)
+        _code, body = _run_update("check", timeout=UPDATE_CHECK_TIMEOUT + 2)
         try:
             d = json.loads(body)
         except ValueError:
             d = {"ok": False, "message": (body or "")[:200]}
+        ok = bool(d.get("ok"))
     except Exception as exc:  # noqa: BLE001
-        timed_out = True
         d = {"ok": False, "message": f"检查超时或失败：{exc}"}
 
     payload = {
@@ -232,17 +260,18 @@ def _run_update_check_cached() -> dict:
         "behind": None,
         # 检查失败/超时 → None（前端按"未知"处理），而不是 false，
         # 避免把"没查到"说成"已是最新"。
-        "update_available": (bool(d.get("available")) if d.get("ok") else None),
+        "update_available": (bool(d.get("available")) if ok else None),
         "can_apply": True,
         "update_command": "hermes-update apply",
         "message": d.get("message") or (
             f"可更新到 {d.get('ref')}" if d.get("available") else "已是最新版本"
         ),
     }
-    if d.get("ok") and not timed_out:
-        # 只缓存成功结果（失败/超时下次仍会重试）
-        _update_check_cache["at"] = now
-        _update_check_cache["payload"] = payload
+    # 成功与失败都缓存 —— 失败用短 TTL，避免"GitHub 不通"期间反复付超时。
+    import time as _t
+    _update_check_cache["at"] = _t.time()
+    _update_check_cache["payload"] = payload
+    _update_check_cache["ttl"] = UPDATE_CHECK_TTL if ok else UPDATE_CHECK_FAIL_TTL
     return payload
 
 
@@ -484,10 +513,27 @@ async def handle_native_update_proxy(method: str, path: str, headers, writer, fr
     loop = asyncio.get_running_loop()
 
     if path.endswith("/check"):
-        # 带硬超时的检查（默认 15s）+ 10 分钟缓存：/system 首屏会同步调它，
-        # 不能让它把页面拖住（第三轮审计：原实现无超时无缓存，实测 30~180s）。
-        resp = await loop.run_in_executor(None, _run_update_check_cached)
-        respond(200, resp)
+        # /system 首屏会**同步**调它，且和 9 个本地接口绑在同一个
+        # Promise.allSettled 里 —— 只有全部 settle 才关转圈。
+        # 所以这里绝不阻塞等待网络：
+        #   命中缓存 → 立即返回真实结果；
+        #   未命中   → **后台线程去查**，本次立即返回 update_available=null
+        #              （前端按"未知"显示，不阻塞），下次访问即命中缓存。
+        # 这样无论 GitHub 通不通，系统页都是瞬时打开。
+        cached = _update_check_cached_or_none()
+        if cached is not None:
+            respond(200, cached)
+        else:
+            _kick_update_check_background()
+            respond(200, {
+                "install_method": "fnos-fpk",
+                "current_version": "unknown",
+                "behind": None,
+                "update_available": None,   # 未知：后台正在查
+                "can_apply": True,
+                "update_command": "hermes-update apply",
+                "message": "正在后台检查更新…",
+            })
     else:
         code, body = await loop.run_in_executor(None, _run_update, "apply")
         try:
