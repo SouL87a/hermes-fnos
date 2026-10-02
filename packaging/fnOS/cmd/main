@@ -136,6 +136,69 @@ find_node_bin() {
 ### 资产 URL 与 __HERMES_BASE_PATH__。鉴权：dashboard 绑回环 → 不做 auth 门，
 ### 网关侧用飞牛登录态（X-Trim-*）。
 
+GATEWAY_PID_FILE="${TRIM_PKGVAR}/gateway.pid"
+GATEWAY_WANT_FILE="${TRIM_PKGVAR}/gateway.want"   # 存在=期望运行；删除=停止
+
+### 消息网关 supervisor。
+### 为什么需要：dashboard 的「重启网关」会 spawn `hermes gateway restart`，而那个
+### 子进程用 PM store python 启动 → activate_dependencies 发现"未提交依赖环境"
+### → exit 1（PM 与我们「自带 CPython」布局的固有冲突）。
+### 官方 trim.hermes 用 Go wrapper 的 supervisor 循环自己管进程、不碰 PM；
+### 这里复刻同样做法：本脚本当 supervisor，gateway 退出就拉起。
+### --external-supervisor 的语义正是"退出后交还给 manager 重启"。
+###
+### gateway_want 存在 → 持续拉起；被删除 → 循环退出（用于正常停止）。
+gateway_supervisor_loop() {
+    local ws="$1" node_env="$2"
+    local GW_CMD
+    GW_CMD="cd '${SRC_DIR}' && exec env \
+HOME='${DATA_DIR}' \
+PYTHONPATH='${SRC_DIR}' \
+PYTHONUNBUFFERED=1 \
+PYTHONDONTWRITEBYTECODE=1 \
+HERMES_HOME='${DATA_DIR}' \
+HERMES_BUNDLED_SKILLS='${SRC_DIR}/skills' \
+HERMES_OPTIONAL_SKILLS='${SRC_DIR}/optional-skills' \
+HERMES_BUNDLED_PLUGINS='${SRC_DIR}/plugins' \
+HERMES_BUNDLED_LOCALES='${SRC_DIR}/locales' \
+HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
+HERMES_WRITE_SAFE_ROOT='${ws}' \
+HERMES_MANAGED_BY='trim-hermes-fnos' \
+${node_env}
+'${PY}' -m ${MODULE} gateway run --external-supervisor"
+
+    while [ -f "${GATEWAY_WANT_FILE}" ]; do
+        log_msg "supervisor: 启动 gateway"
+        if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+            bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
+        else
+            runuser -u "${TRIM_USERNAME}" -- bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
+        fi
+        local gwpid=$!
+        printf '%s' "${gwpid}" > "${GATEWAY_PID_FILE}"
+        wait "${gwpid}" 2>/dev/null
+        local rc=$?
+        # 被主动停止（want 文件已删）→ 退出循环
+        [ -f "${GATEWAY_WANT_FILE}" ] || break
+        log_msg "supervisor: gateway 退出 (code=${rc})，1s 后重启"
+        sleep 1
+    done
+    rm -f "${GATEWAY_PID_FILE}"
+    log_msg "supervisor: 退出"
+}
+
+start_gateway_supervisor() {
+    local ws="$1" node_env="$2"
+    : > "${GATEWAY_WANT_FILE}"
+    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+        gateway_supervisor_loop "${ws}" "${node_env}" >> "${LOG_FILE}" 2>&1 &
+    else
+        runuser -u "${TRIM_USERNAME}" -- bash -c \
+            "exec '${APP_DIR}/cmd/main' __gateway_supervisor '${ws}'" >> "${LOG_FILE}" 2>&1 &
+    fi
+    log_msg "启动消息网关 supervisor (pid=$!)"
+}
+
 start_process() {
     if status > /dev/null 2>&1; then
         return 0
@@ -213,6 +276,7 @@ ${NODE_ENV}
     # 以及 HTML 改写结果。真机排查资源 404 时这是唯一的现场证据。
     # 输出量很小（每请求一行），长期开启无妨。
     GW_CMD="exec env \
+HERMES_APP_ROOT='${APP_DIR}' \
 HERMES_GATEWAY_SOCKET='${GATEWAY_SOCKET}' \
 HERMES_GATEWAY_PREFIX='${GATEWAY_PREFIX}' \
 HERMES_UPSTREAM_HOST='127.0.0.1' \
@@ -227,31 +291,11 @@ HERMES_GATEWAY_DEBUG='1' \
 
     # 消息网关（Telegram / QQ / 飞书等）—— 缺陷 5：官方 trim.hermes 会起它，
     # 本包原先漏了，导致「Gateway Status: Stopped」，消息平台开箱不可用。
-    # --external-supervisor：由本脚本（应用 supervisor）托管生命周期，
-    # 不让 gateway 自己装 systemd/launchd 服务。
-    # 它可能因未配置任何平台而自行退出，属正常，故失败不阻断启动。
-    local GW_RUN_CMD
-    GW_RUN_CMD="cd '${SRC_DIR}' && exec env \
-HOME='${DATA_DIR}' \
-PYTHONPATH='${SRC_DIR}' \
-PYTHONUNBUFFERED=1 \
-PYTHONDONTWRITEBYTECODE=1 \
-HERMES_HOME='${DATA_DIR}' \
-HERMES_BUNDLED_SKILLS='${SRC_DIR}/skills' \
-HERMES_OPTIONAL_SKILLS='${SRC_DIR}/optional-skills' \
-HERMES_BUNDLED_PLUGINS='${SRC_DIR}/plugins' \
-HERMES_BUNDLED_LOCALES='${SRC_DIR}/locales' \
-HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
-HERMES_WRITE_SAFE_ROOT='${ws}' \
-HERMES_MANAGED_BY='trim-hermes-fnos' \
-${NODE_ENV}
-'${PY}' -m ${MODULE} gateway run --external-supervisor"
-    log_msg "启动消息网关 (gateway run --external-supervisor)"
-    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
-        bash -c "${GW_RUN_CMD}" >> "${LOG_FILE}" 2>&1 &
-    else
-        runuser -u "${TRIM_USERNAME}" -- bash -c "${GW_RUN_CMD}" >> "${LOG_FILE}" 2>&1 &
-    fi
+    #
+    # 由本脚本当 supervisor（--external-supervisor 的语义就是"退出后交还给
+    # manager 重启"）：gateway 退出就拉起，这样 dashboard 的「重启网关」才有意义
+    # （见下面 supervisor 循环）。
+    start_gateway_supervisor "${ws}" "${NODE_ENV}"
 
     # 就绪：TCP 回环监听 + Unix Socket
     local i=0
@@ -300,6 +344,11 @@ stop_process() {
         rm -f "${PID_FILE}"
     fi
 
+    # 先停 gateway supervisor：删 want 文件 → 它不再拉起 gateway，循环自然退出。
+    # 必须在清理进程之前做，否则 supervisor 会把我们刚杀掉的 gateway 又拉起来。
+    rm -f "${GATEWAY_WANT_FILE}"
+    rm -f "${GATEWAY_PID_FILE}"
+
     # 兜底：dashboard 会 spawn 子进程（pty/session reaper），runuser 包装导致
     # pidfile 记的是 wrapper 的 PID，所以按绝对路径 pattern 兜底清理。
     if own_pids > /dev/null 2>&1; then
@@ -310,6 +359,8 @@ stop_process() {
         pkill -KILL -f -- "${PATTERN}" 2>/dev/null || true
         pkill -KILL -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
     fi
+    # supervisor 循环体本身（bash 跑 gateway_supervisor_loop）也按 cmd/main 路径兜底
+    pkill -TERM -f -- "${APP_DIR}/cmd/main __gateway_supervisor" 2>/dev/null || true
     rm -f "${GATEWAY_SOCKET}"
 
     log_msg "process stopped"
@@ -351,11 +402,42 @@ do_update() {
         "${PY}" "${script}" "${1:-status}"
 }
 
+### 单独重启消息网关（供代理的重启端点调用）：
+### 删 want 文件让 supervisor 循环退出，再写回 want 文件 + 杀掉当前 gateway，
+### supervisor 会自动拉起新的。不动 dashboard / 代理。
+restart_gateway() {
+    local ws node_env="" nb
+    ws="$(resolve_workspace)"
+    if nb="$(find_node_bin)"; then node_env="HERMES_NODE='${nb}' \\"; fi
+
+    # 停：删 want → 杀 gateway → 等 supervisor 退出
+    rm -f "${GATEWAY_WANT_FILE}"
+    local gpid
+    gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "${gpid}" ] && kill -TERM "${gpid}" 2>/dev/null || true
+    pkill -TERM -f -- "${SRC_DIR}.*gateway run" 2>/dev/null || true
+    local i=0
+    while [ "${i}" -lt 15 ]; do
+        pgrep -f -- "${SRC_DIR}.*gateway run" > /dev/null 2>&1 || break
+        sleep 1
+        i=$((i + 1))
+    done
+    pkill -KILL -f -- "${SRC_DIR}.*gateway run" 2>/dev/null || true
+
+    # 起：写回 want → 重启 supervisor
+    start_gateway_supervisor "${ws}" "${node_env}"
+    log_msg "gateway restart 完成"
+    return 0
+}
+
 case "$1" in
     start)   start_process ;;
     stop)    stop_process ;;
     restart) stop_process; sleep 1; start_process ;;
     status)  if status; then exit 0; else exit 3; fi ;;
     update)  shift; do_update "${1:-status}" ;;
+    gateway-restart) restart_gateway ;;
+    # 内部：被 runuser 以应用用户身份拉起的 supervisor 循环体
+    __gateway_supervisor) shift; gateway_supervisor_loop "$@" ;;
     *)       exit 1 ;;
 esac

@@ -104,6 +104,9 @@ def _split_target(target: str):
 # 实现：调用同目录的 hermes-update.py（用同一个自带 python）。
 UPDATE_SCRIPT = os.environ.get("HERMES_UPDATE_SCRIPT", "")
 
+# 应用根：本代理脚本部署在 <APP_ROOT>/gateway-proxy.py，cmd/main 在 <APP_ROOT>/cmd/main
+APP_ROOT = os.environ.get("HERMES_APP_ROOT") or os.path.dirname(os.path.abspath(__file__))
+
 
 def _update_script_path() -> str:
     if UPDATE_SCRIPT and os.path.exists(UPDATE_SCRIPT):
@@ -314,6 +317,60 @@ async def handle_update_endpoint(method: str, up_path: str, headers, writer) -> 
 def _reason(code: int) -> str:
     return {200: "OK", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
             500: "Internal Server Error", 504: "Gateway Timeout"}.get(code, "OK")
+
+
+async def handle_gateway_restart(up_path: str, headers, writer) -> None:
+    """接管 dashboard 的「重启网关」→ 调 cmd/main gateway-restart。
+
+    上游实现 spawn `hermes gateway restart`，其子进程走 PM store python →
+    activate_dependencies 拒绝（未提交依赖环境）→ exit 1。
+    这里改为调本包 cmd/main 的 gateway-restart 子命令：它删/写 want 文件并
+    重启 supervisor，完全不碰 PM。
+
+    返回 dashboard 期望的 ActionResponse：{name, ok, pid, message?}
+    """
+    def respond(code: int, body: dict) -> None:
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        writer.write(
+            f"HTTP/1.1 {code} {_reason(code)}\r\n"
+            f"Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(raw)}\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n".encode("latin-1") + raw
+        )
+
+    if not _is_admin(headers):
+        respond(403, {"ok": False, "message": "仅飞牛管理员可重启网关", "name": "gateway-restart"})
+        await writer.drain()
+        writer.close()
+        return
+
+    main_sh = os.path.join(APP_ROOT, "cmd", "main") if APP_ROOT else ""
+    if not main_sh or not os.path.exists(main_sh):
+        respond(500, {"ok": False, "message": f"找不到 {main_sh}", "name": "gateway-restart"})
+        await writer.drain()
+        writer.close()
+        return
+
+    def _do() -> tuple[int, str]:
+        try:
+            proc = subprocess.run(["/bin/bash", main_sh, "gateway-restart"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  timeout=90, check=False, text=True)
+            return proc.returncode, proc.stdout.strip()
+        except subprocess.TimeoutExpired:
+            return 504, "重启超时"
+        except OSError as exc:
+            return 500, f"无法执行：{exc}"
+
+    code, out = await asyncio.get_running_loop().run_in_executor(None, _do)
+    ok = code == 0
+    resp = {"name": "gateway-restart", "pid": None, "ok": ok,
+            "message": "网关已重启" if ok else f"网关重启失败：{out[-200:]}"}
+    respond(200 if ok else 500, resp)
+    log(f"gateway restart via cmd/main: ok={ok}")
+    await writer.drain()
+    writer.close()
 
 
 async def handle_native_update_proxy(method: str, path: str, headers, writer) -> None:
@@ -528,6 +585,17 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         _base_path = up_path.split("?")[0]
         if _base_path in ("/api/hermes/update", "/api/hermes/update/check"):
             await handle_native_update_proxy(method, _base_path, headers, client_writer)
+            return
+
+        # 接管 dashboard 的「重启网关」按钮。
+        # 原因：上游 /api/gateway/restart 会 spawn `hermes gateway restart`，而那个
+        # 子进程用 PM store python 启动 → activate_dependencies 发现"未提交依赖
+        # 环境" → exit 1（PM 与「自带 CPython」布局的固有冲突）。
+        # 官方 trim.hermes 用 Go wrapper 自己管进程、不碰 PM；本包改为调
+        # cmd/main 的 gateway-restart（由 cmd/main 的 supervisor 负责拉起），
+        # 同样绕开 PM。
+        if _base_path == "/api/gateway/restart" and method == "POST":
+            await handle_gateway_restart(up_path, headers, client_writer)
             return
 
         up_reader, up_writer = await asyncio.open_connection(UP_HOST, UP_PORT)
