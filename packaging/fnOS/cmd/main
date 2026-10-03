@@ -247,10 +247,21 @@ ${node_env}
 ### ⚠ 排除自身：本函数会被 `restart_gateway`（自身 cmdline = `cmd/main gateway-restart`）
 ###   调用，按该 pattern 匹配会把自己也算进去 → 自检误报 / pkill 自杀。
 supervisor_pids() {
-    local pat pid
+    local pat pid ppid out=""
+    # ① 精确：新版 exec 出来的循环体（cmdline = `${SELF_PATH} __gateway_supervisor`）
     for pat in \
         "${SELF_PATH} __gateway_supervisor" \
-        "cmd/main __gateway_supervisor" \
+        "cmd/main __gateway_supervisor"; do
+        for pid in $(pgrep -f -- "${pat}" 2>/dev/null); do
+            [ "${pid}" = "$$" ] || [ "${pid}" = "${PPID}" ] || out="${out}${pid}\n"
+        done
+    done
+    # ② 旧版（fork 子 shell）遗留：cmdline 与调用者一致（`cmd/main gateway-restart`
+    #    / `gateway-start`），【无法】与"用户恰好敲了同一命令的 shell"区分 ——
+    #    曾在诊断时误杀外层测试 shell。唯一可靠判据是【已孤儿化】：旧循环体的
+    #    父进程（那次 gateway-* 调用）早已退出 → PPID=1；用户活着的 shell 有正常
+    #    父进程。故只收 PPID=1 的。新版一律 exec（见 ①），不再产生这类遗留。
+    for pat in \
         "${SELF_PATH} gateway-restart" \
         "${SELF_PATH} gateway-start" \
         "cmd/main gateway-restart" \
@@ -258,9 +269,11 @@ supervisor_pids() {
         for pid in $(pgrep -f -- "${pat}" 2>/dev/null); do
             [ "${pid}" = "$$" ] && continue
             [ "${pid}" = "${PPID}" ] && continue
-            printf '%s\n' "${pid}"
+            ppid="$(awk '/^PPid:/{print $2}' "/proc/${pid}/status" 2>/dev/null)"
+            [ "${ppid}" = "1" ] && out="${out}${pid}\n"
         done
-    done | sort -u
+    done
+    printf '%b' "${out}" | sort -u
 }
 
 kill_supervisors() {

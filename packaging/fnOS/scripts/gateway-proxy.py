@@ -109,6 +109,40 @@ UPDATE_SCRIPT = os.environ.get("HERMES_UPDATE_SCRIPT", "")
 # （注意 cmd/main 不在这里，见 find_cmd_main）
 APP_ROOT = os.environ.get("HERMES_APP_ROOT") or os.path.dirname(os.path.abspath(__file__))
 
+# ── 网关动作结果登记（修「重启网关」假失败）─────────────────────
+# 背景：dashboard 的动作条（index chunk）在 POST /api/gateway/{restart,start,stop}
+# 之后，会轮询 GET /api/actions/gateway-*/status，并用 `exit_code === 0` 判成功。
+# 但上游的 exit_code 只从【上游进程内】的 _ACTION_PROCS/_ACTION_RESULTS 推导
+# （hermes_cli/web_routers/actions.py）—— 而我们的动作是**代理自己**执行的，上游
+# 毫不知情 → 返回 {"running":false,"exit_code":null} → 前端 `null !== 0` → 误报
+# 「操作失败 (?)」，尽管服务端 100% 成功。
+# 解法：代理记录自己执行过的动作结果，接管 status 端点返回真实的 exit_code。
+_GATEWAY_ACTION_RESULTS: dict = {}   # name -> {"exit_code": int, "lines": [str], "at": float}
+_GATEWAY_ACTION_TTL = float(os.environ.get("HERMES_GATEWAY_ACTION_TTL", "600") or "600")
+_GATEWAY_ACTION_NAMES = ("gateway-restart", "gateway-start", "gateway-stop")
+
+
+def _record_gateway_action(name: str, exit_code: int, lines) -> None:
+    """登记一次网关动作的真实结果（供随后 dashboard 的 status 轮询读取）。"""
+    if isinstance(lines, str):
+        lines = [lines] if lines else []
+    _GATEWAY_ACTION_RESULTS[name] = {
+        "exit_code": int(exit_code),
+        "lines": [str(x) for x in (lines or [])][-20:],
+        "at": time.time(),
+    }
+
+
+def _gateway_action_status(name: str):
+    """取近期登记的结果；过期或不存在返回 None（调用方回退转发上游）。"""
+    rec = _GATEWAY_ACTION_RESULTS.get(name)
+    if not rec:
+        return None
+    if (time.time() - rec.get("at", 0)) > _GATEWAY_ACTION_TTL:
+        _GATEWAY_ACTION_RESULTS.pop(name, None)
+        return None
+    return rec
+
 
 def _update_script_path() -> str:
     if UPDATE_SCRIPT and os.path.exists(UPDATE_SCRIPT):
@@ -476,12 +510,56 @@ async def handle_gateway_restart(up_path: str, headers, writer, from_root: bool 
 
     code, out = await asyncio.get_running_loop().run_in_executor(None, _do)
     ok = code == 0
+    # 登记真实结果：随后的 /api/actions/<name>/status 轮询据此返回 exit_code，
+    # 避免前端把上游的 exit_code=null 误判成「操作失败」（见 _GATEWAY_ACTION_RESULTS 说明）。
+    _record_gateway_action(name, code, out.splitlines() if out else [])
     resp = {"name": name, "pid": None, "ok": ok,
             "message": ok_msg if ok else f"网关{action}失败：{out[-200:]}"}
     respond(200 if ok else 500, resp)
     log(f"gateway {action} via cmd/main: ok={ok}")
     await writer.drain()
     writer.close()
+
+
+async def handle_gateway_action_status(up_path: str, method: str, headers, writer,
+                                       from_root: bool = False) -> bool:
+    """接管 GET /api/actions/gateway-{restart,start,stop}/status。
+
+    有近期登记 → 合成上游动作条期望的响应：{name, running:false, exit_code, pid, lines}。
+    没有 / 已过期 → 返回 False，调用方回退走上游转发（行为与改动前一致）。
+
+    返回 True 表示已自行应答（writer 已关闭）；False 表示未处理、请继续转发。
+    """
+    base = up_path.split("?")[0].rstrip("/")
+    # /api/actions/<name>/status
+    if not (base.startswith("/api/actions/") and base.endswith("/status")):
+        return False
+    name = base[len("/api/actions/"):-len("/status")]
+    if name not in _GATEWAY_ACTION_NAMES:
+        return False
+    if not _is_admin(headers, from_root):
+        return False  # 交给上游走它自己的鉴权/错误路径
+    rec = _gateway_action_status(name)
+    if rec is None:
+        return False  # 没有我们的记录 → 回退上游，行为不变
+    body = {
+        "name": name,
+        "running": False,
+        "exit_code": rec["exit_code"],
+        "pid": None,
+        "lines": rec["lines"],
+    }
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    writer.write(
+        f"HTTP/1.1 200 {_reason(200)}\r\n"
+        f"Content-Type: application/json; charset=utf-8\r\n"
+        f"Content-Length: {len(raw)}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n".encode("latin-1") + raw
+    )
+    await writer.drain()
+    writer.close()
+    return True
 
 
 async def handle_native_update_proxy(method: str, path: str, headers, writer, from_root: bool = False) -> None:
@@ -729,6 +807,13 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
                 and method == "POST":
             await handle_gateway_restart(up_path, headers, client_writer, from_root)
             return
+
+        # 动作状态轮询：上游的 exit_code 只认它自己进程内的记录，而我们的网关动作
+        # 由代理执行 → 上游返回 exit_code=null → 前端误报「操作失败」。若有本代理的
+        # 登记就合成真实结果；否则回退上游转发（行为不变）。
+        if method == "GET" and _base_path.startswith("/api/actions/"):
+            if await handle_gateway_action_status(_base_path, method, headers, client_writer, from_root):
+                return
 
         up_reader, up_writer = await asyncio.open_connection(UP_HOST, UP_PORT)
 

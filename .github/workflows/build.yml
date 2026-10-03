@@ -214,7 +214,7 @@ jobs:
           ## Hermes Agent ${VERSION} · 飞牛 fnOS 原生版
 
           - 上游 ref: \`${UPSTREAM_REF}\`
-          - 内置运行时: CPython 3.14（python-build-standalone）
+          - 内置运行时: CPython 3.12（python-build-standalone，自带 SQLite 3.53.1）
           - 构建: Actions run ${GITHUB_RUN_ID}
           - \`${BASENAME}\` sha256: \`${SUM}\`
 
