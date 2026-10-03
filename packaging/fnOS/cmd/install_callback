@@ -34,7 +34,28 @@ mkdir -p "${TRIM_PKGVAR}/log" "${TRIM_PKGVAR}/workspace" "${TRIM_PKGVAR}/state"
 ### 打包模式（自带 CPython）跳过此段 —— 依赖已随包分发。
 if [ -f "${RUNTIME}/.use-system-python" ]; then
     VENV_DIR="${TRIM_PKGVAR}/venv"
-    echo "系统 Python 模式：创建 venv 并安装依赖（需联网）…" >> "${TRIM_PKGVAR}/info.log"
+    LOG="${TRIM_PKGVAR}/info.log"
+    echo "系统 Python 模式：创建 venv 并安装依赖（需联网）…" >> "${LOG}"
+
+    ### ⚠ 代理必须【尽早】进入环境：安装期的 uv 下载与 uv pip install 都会发
+    ### 网络请求，而向导填的 wizard_proxy 原先只在末尾写 .env —— 安装时用不上，
+    ### 结果直连境外源龟速（实测 18KB/s，下 20MB 要 18 分钟）。
+    ### 这里立刻：写 .env + export 成环境变量（curl/uv/pip 都认 HTTP(S)_PROXY）。
+    PROXY="${wizard_proxy:-}"
+    case "${PROXY}" in *$'\n'*) PROXY="" ;; esac
+    if [ -n "${PROXY}" ] && printf '%s' "${PROXY}" | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
+        export HTTP_PROXY="${PROXY}" HTTPS_PROXY="${PROXY}" ALL_PROXY="${PROXY}"
+        export http_proxy="${PROXY}" https_proxy="${PROXY}" all_proxy="${PROXY}"
+        export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local"
+        echo "  已启用代理：${PROXY}（供 uv/pip/curl 使用）" >> "${LOG}"
+    else
+        ### 无代理：走国内 PyPI 镜像，避免直连 pypi.org 龟速
+        export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+        export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+        echo "  未配置代理：使用清华 PyPI 镜像 ${UV_DEFAULT_INDEX}" >> "${LOG}"
+    fi
+    ### 兜底镜像（代理不通或走镜像更快时也能用）
+    : "${UV_DEFAULT_INDEX:=https://pypi.tuna.tsinghua.edu.cn/simple}"
 
     ### Python 解释器候选（按优先级）：
     ###   1. 应用中心的 python312（实测 = Python 3.12.4，真名就是 python312）
@@ -65,38 +86,65 @@ if [ -f "${RUNTIME}/.use-system-python" ]; then
         echo "未找到合适的 Python（需 3.11–3.13）。请在飞牛应用中心安装「Python 3.12」后重试。" > "${TRIM_TEMP_LOGFILE}"
         exit 1
     fi
-    echo "系统 Python 模式：使用 ${SYS_PY} ($("${SYS_PY}" --version 2>&1))" >> "${TRIM_PKGVAR}/info.log"
+    echo "  使用 ${SYS_PY} ($("${SYS_PY}" --version 2>&1))" >> "${LOG}"
 
-    # uv：优先用 PM store 里已有的（实测 /vol1/@appdata/hermes/tools/uv-*/uv），
-    # 其次包内/系统，最后才联网安装 —— 尽量避开安装期硬联网。
+    ### uv：按顺序找，尽量避开联网下载。
+    ###   1. python312 应用自带（有就最省事）
+    ###   2. PM store 里的（tools/uv-*/uv）
+    ###   3. 包内/数据目录
+    ###   4. 系统 PATH
+    ### 都没有才联网取（走代理/镜像）。
     UV=""
-    for cand in "${RUNTIME}/bin/uv" "${TRIM_PKGVAR}/bin/uv" \
+    for cand in /vol*/@appcenter/python312/bin/uv /var/apps/python312/target/bin/uv \
+                "${RUNTIME}/bin/uv" "${TRIM_PKGVAR}/bin/uv" \
                 /vol*/@appdata/hermes/tools/uv-*/uv "$(command -v uv 2>/dev/null)"; do
         [ -n "${cand}" ] && [ -x "${cand}" ] && { UV="${cand}"; break; }
     done
     if [ -z "${UV}" ]; then
         mkdir -p "${TRIM_PKGVAR}/bin"
+        echo "  未找到本地 uv，联网获取…" >> "${LOG}"
+        ### 优先用清华 PyPI 上的 uv wheel（国内快），失败再退回 astral.sh
+        _UV_TMP="$(mktemp -d 2>/dev/null || echo /tmp/uvget.$$)"
+        mkdir -p "${_UV_TMP}"
         if command -v curl > /dev/null 2>&1; then
-            curl -fsSL https://astral.sh/uv/install.sh 2>/dev/null | \
-                env UV_INSTALL_DIR="${TRIM_PKGVAR}/bin" UV_NO_MODIFY_PATH=1 sh > /dev/null 2>&1 || true
+            # 从清华源取 uv wheel 并解出二进制（wheel 就是 zip）
+            _WHEEL_URL="$(curl -fsSL --max-time 60 \
+                "https://pypi.tuna.tsinghua.edu.cn/simple/uv/" 2>/dev/null \
+                | grep -oE 'https://[^"]*uv-[0-9.]+-py3-none-manylinux[^"]*x86_64\.whl' | tail -1)"
+            if [ -n "${_WHEEL_URL}" ] && curl -fsSL --max-time 180 -o "${_UV_TMP}/uv.whl" "${_WHEEL_URL}" 2>/dev/null; then
+                ( cd "${_UV_TMP}" && unzip -oq uv.whl 2>/dev/null ) || true
+                # wheel 内二进制常见位置：uv/uv（或根目录 uv）
+                for p in "${_UV_TMP}/uv/uv" "${_UV_TMP}/uv"; do
+                    [ -f "${p}" ] && [ ! -d "${p}" ] && { cp "${p}" "${TRIM_PKGVAR}/bin/uv"; break; }
+                done
+            fi
+            # 回退：astral.sh（走代理时快）
+            if [ ! -x "${TRIM_PKGVAR}/bin/uv" ]; then
+                curl -fsSL --max-time 180 https://astral.sh/uv/install.sh 2>/dev/null | \
+                    env UV_INSTALL_DIR="${TRIM_PKGVAR}/bin" UV_NO_MODIFY_PATH=1 sh > /dev/null 2>&1 || true
+            fi
         fi
+        rm -rf "${_UV_TMP}" 2>/dev/null || true
         [ -x "${TRIM_PKGVAR}/bin/uv" ] && UV="${TRIM_PKGVAR}/bin/uv"
     fi
     if [ -z "${UV}" ]; then
-        echo "无法获取 uv，且系统 Python 模式需要它来装依赖（请检查网络）" > "${TRIM_TEMP_LOGFILE}"
+        echo "无法获取 uv（本地没有、联网也失败）。请在 NAS 上配好 HTTP 代理后重试，或手动放置 uv 到 ${TRIM_PKGVAR}/bin/uv。" > "${TRIM_TEMP_LOGFILE}"
         exit 1
     fi
+    echo "  使用 uv：${UV}" >> "${LOG}"
 
     rm -rf "${VENV_DIR}"
-    "${UV}" venv --python "${SYS_PY}" "${VENV_DIR}" >> "${TRIM_PKGVAR}/info.log" 2>&1 \
+    "${UV}" venv --python "${SYS_PY}" "${VENV_DIR}" >> "${LOG}" 2>&1 \
         || { echo "venv 创建失败，详见应用日志" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
 
     # 依赖清单在构建时抽好，随包分发（runtime/deps.txt）
     DEPS="${RUNTIME}/deps.txt"
     if [ -f "${DEPS}" ]; then
-        "${UV}" pip install --python "${VENV_DIR}/bin/python3" -r "${DEPS}" \
-            >> "${TRIM_PKGVAR}/info.log" 2>&1 \
-            || { echo "依赖安装失败，详见应用日志" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+        ### 装依赖：显式带索引（代理缺失时用清华镜像；代理在则直连也快）
+        "${UV}" pip install --python "${VENV_DIR}/bin/python3" \
+            --default-index "${UV_DEFAULT_INDEX}" -r "${DEPS}" \
+            >> "${LOG}" 2>&1 \
+            || { echo "依赖安装失败，详见应用日志（${TRIM_PKGVAR}/info.log）" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
     else
         echo "缺少依赖清单（${DEPS}）" > "${TRIM_TEMP_LOGFILE}"; exit 1
     fi
