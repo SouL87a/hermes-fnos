@@ -88,6 +88,16 @@ if [ -f "${RUNTIME}/.use-system-python" ]; then
     fi
     echo "  使用 ${SYS_PY} ($("${SYS_PY}" --version 2>&1))" >> "${LOG}"
 
+    ### ⚠ uv 在跑任何子命令前都会先初始化 cache（默认 $HOME/.cache/uv）。
+    ### 本脚本由 appcenter 以应用用户拉起，HOME 继承自 root 服务（/root，不可写），
+    ### 而应用用户自己的 home 在安装期也还没建 → uv venv 第一步就
+    ### "Failed to initialize cache at /root/.cache/uv: Permission denied (os error 13)"
+    ### → 整个安装 10238 失败（用户实机两连复现）。
+    ### 显式指向应用数据目录（属 hermes、可写）；uv venv 与 uv pip install 都吃这两个变量。
+    export HOME="${TRIM_PKGVAR}"
+    export UV_CACHE_DIR="${TRIM_PKGVAR}/.uv-cache"
+    mkdir -p "${UV_CACHE_DIR}"
+
     ### uv：按顺序找，尽量避开联网下载。
     ###   1. python312 应用自带（有就最省事）
     ###   2. PM store 里的（tools/uv-*/uv）
@@ -135,7 +145,7 @@ if [ -f "${RUNTIME}/.use-system-python" ]; then
 
     rm -rf "${VENV_DIR}"
     "${UV}" venv --python "${SYS_PY}" "${VENV_DIR}" >> "${LOG}" 2>&1 \
-        || { echo "venv 创建失败，详见应用日志" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+        || { { echo "venv 创建失败："; tail -n 20 "${LOG}" 2>/dev/null; } > "${TRIM_TEMP_LOGFILE}"; exit 1; }
 
     # 依赖清单在构建时抽好，随包分发（runtime/deps.txt）
     DEPS="${RUNTIME}/deps.txt"
@@ -144,7 +154,7 @@ if [ -f "${RUNTIME}/.use-system-python" ]; then
         "${UV}" pip install --python "${VENV_DIR}/bin/python3" \
             --default-index "${UV_DEFAULT_INDEX}" -r "${DEPS}" \
             >> "${LOG}" 2>&1 \
-            || { echo "依赖安装失败，详见应用日志（${TRIM_PKGVAR}/info.log）" > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+            || { { echo "依赖安装失败："; tail -n 30 "${LOG}" 2>/dev/null; } > "${TRIM_TEMP_LOGFILE}"; exit 1; }
     else
         echo "缺少依赖清单（${DEPS}）" > "${TRIM_TEMP_LOGFILE}"; exit 1
     fi
