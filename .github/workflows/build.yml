@@ -104,7 +104,7 @@ jobs:
           tar -xzf "$FPK" app.tgz
           A="$(tar -tzf app.tgz)"
           for need in ./ui/config ./ui/images/icon_64.png ./gateway-proxy.py ./hermes-update.py \
-                      ./fnos-depenv.py ./bin/hermes-update ./runtime/deps.txt \
+                      ./bin/hermes-update ./runtime/deps.txt \
                       ./runtime/web_dist/index.html ./runtime/web-build.mjs \
                       ./runtime/hermes/hermes_cli/__init__.py; do
             echo "$A" | grep -qx "$need" || { echo "✗ app.tgz 缺少 $need"; exit 1; }
@@ -121,13 +121,16 @@ jobs:
             echo "✗ 既无 .use-system-python 标记，也无 runtime/python/bin/python3"; exit 1
           fi
 
-          # 安装戳（决定 dashboard 版本号显示）—— 缺失则显示 unknown
+          # 构建信息戳（commit/发行方）。⚠ 版本号不来自它：上游读源码树的
+          # hermes_cli/__init__.py；此文件对自更新无作用，仅留构建来源。
           echo "$A" | grep -qx "./runtime/hermes/install-stamp.json" \
-            && echo "✓ 含 install-stamp.json（版本号可正确显示）" \
-            || { echo "✗ 缺少 install-stamp.json —— dashboard 会显示 vunknown"; exit 1; }
+            && echo "✓ 含 install-stamp.json（构建来源信息）" \
+            || { echo "✗ 缺少 install-stamp.json"; exit 1; }
 
-          # .git 必须在【工作树外】（runtime/hermes-git.git）——
-          # 放工作树里会让 hermes update 的准入判定放行（自伤），见第三轮审计 P0。
+          # .git 必须在【工作树外】（runtime/hermes-git.git）：
+          # ① 我们的 hermes-update.py 用 GIT_DIR 定向它做 git 更新；
+          # ② 工作树无 .git → 上游 `hermes update` 在 Linux 直接 "Not a git
+          #    repository. Please reinstall:" 退出，堵住自伤通道。见第三轮审计 P0。
           echo "$A" | grep -q "^\./runtime/hermes-git\.git/" \
             && echo "✓ .git 已移出工作树（在线更新可用，且堵住 hermes update 自伤）" \
             || { echo "✗ 缺少 runtime/hermes-git.git"; exit 1; }

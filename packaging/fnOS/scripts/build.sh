@@ -315,15 +315,17 @@ if [ -d "${SRC}/.git" ]; then
     GIT_DIR="${RT}/hermes-git.git" git config core.filemode false 2>/dev/null || true
 fi
 
-# ── 3b. install-stamp.json（Hermes 版本的权威来源）───────────
-# Hermes 的版本解析顺序：install-stamp.json → 活的 .git → unknown。
-# 不写这个戳，dashboard 左下角会显示 "vunknown"。
+# ── 3b. install-stamp.json（构建信息戳）─────────────────────
+# ⚠ 上游 stable 的版本号【不读这个文件】——它来自源码树的 hermes_cli/__init__.py
+#   （__version__）与 pyproject.toml。install-stamp.json 只有 Electron 桌面端在用，
+#   我们的 web dashboard 运行时不碰它。写它只为留构建来源信息（commit/日期/发行方），
+#   对自更新【没有】作用，别再靠它拦自伤。
 #
-# updateMechanism 取值决定更新归属：
-#   self     → 上游 `hermes update` 放行（但它要求 venv/PM 布局，与自带 CPython 冲突）
-#   external → 上游明确拒绝并提示"由安装方式管理"，更新走我们自己的
-#              hermes-update.py（dashboard 的 /__hermes/update/ui 或 SSH 命令）
-# 本项目用 external（更新链路自管，见 README）。
+# 【拦自伤的真实机制】工作树里没有 .git → 上游 `hermes update` 在 Linux 上直接
+#   `✗ Not a git repository. Please reinstall:` 退出（update_cmd.py 的
+#   _prepare_git_command）。build.sh 把 .git 移到 runtime/hermes-git.git（工作树外），
+#   既让我们的 hermes-update.py 能用 GIT_DIR 走 git 更新，又让上游 update 无从下手。
+#   见第三轮审计 P0。
 echo "[build] 生成 install-stamp.json"
 STAMP="${RT}/hermes/install-stamp.json"
 # .git 已在 3a 移出工作树 → 用 GIT_DIR/GIT_WORK_TREE 定向
@@ -355,14 +357,8 @@ stamp = {
     "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "dirty": False,
     "source": "local",          # 非 commit-build/docker/nix → 不触发额外拒绝
-    # distribution 写明发行形态：上游 sealed_steward() 在「工作树无 .git」时
-    # 会读它 → 返回该字符串（非 None）→ hermes update 判定为"sealed，非我们
-    # 的树"→ 拒绝并提示走应用中心。这正是我们要的：堵住 `hermes update`
-    # 的 git reset --hard 自伤通道（第三轮审计 P0）。
-    # 注意：若工作树里有 .git，sealed_steward 会提前 return None 绕过本字段 ——
-    # 所以 build.sh 同时把 .git 移出工作树（放 runtime/hermes-git.git）。
-    "distribution": "fnOS App Center",
-    "updateMechanism": "external",  # 更新由本包的 hermes-update.py 管理
+    "distribution": "fnOS App Center",   # 仅作发行标记（上游不读；见上方说明）
+    "updateMechanism": "external",  # 仅作标记：更新由本包的 hermes-update.py 管理
     "baseVersion": base,
     "displayVersion": base,
     "distance": 0,
@@ -473,9 +469,6 @@ cp "${PKG_DIR}/ui-images/icon_64.png"  "${APP_DIR}/ui/images/icon_64.png"
 cp "${PKG_DIR}/ui-images/icon_256.png" "${APP_DIR}/ui/images/icon_256.png"
 # 统一网关适配层（替代官方 Go wrapper）
 cp "${HERE}/gateway-proxy.py" "${APP_DIR}/gateway-proxy.py"
-# 依赖环境登记脚本：cmd/main 每次启动调用，修 dashboard 子动作的
-# "no dependency environment is committed"（doctor/审计/备份/cron 等）
-cp "${HERE}/fnos-depenv.py" "${APP_DIR}/fnos-depenv.py"
 # 在线更新引擎
 cp "${HERE}/hermes-update.py" "${APP_DIR}/hermes-update.py"
 # CLI 包装：usr-local-linker 会把 app/bin/hermes-update 链接进 PATH，

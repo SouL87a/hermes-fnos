@@ -54,8 +54,13 @@ if [ -f "${RUNTIME}/.use-system-python" ]; then
         export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
         echo "  未配置代理：使用清华 PyPI 镜像 ${UV_DEFAULT_INDEX}" >> "${LOG}"
     fi
-    ### 兜底镜像（代理不通或走镜像更快时也能用）
-    : "${UV_DEFAULT_INDEX:=https://pypi.tuna.tsinghua.edu.cn/simple}"
+    ### 兜底索引。⚠ 有代理时【不能】用国内镜像：实测「清华镜像 + HTTP 代理」
+    ### 会 SSL_ERROR_SYSCALL 失败，而 pypi.org 走代理很快（实测 23MB/s）。
+    if [ -n "${PROXY}" ]; then
+        : "${UV_DEFAULT_INDEX:=https://pypi.org/simple}"
+    else
+        : "${UV_DEFAULT_INDEX:=https://pypi.tuna.tsinghua.edu.cn/simple}"
+    fi
 
     ### Python 解释器候选（按优先级）：
     ###   1. 应用中心的 python312（实测 = Python 3.12.4，真名就是 python312）
@@ -118,14 +123,27 @@ if [ -f "${RUNTIME}/.use-system-python" ]; then
         mkdir -p "${_UV_TMP}"
         if command -v curl > /dev/null 2>&1; then
             # 从清华源取 uv wheel 并解出二进制（wheel 就是 zip）
-            _WHEEL_URL="$(curl -fsSL --max-time 60 \
-                "https://pypi.tuna.tsinghua.edu.cn/simple/uv/" 2>/dev/null \
-                | grep -oE 'https://[^"]*uv-[0-9.]+-py3-none-manylinux[^"]*x86_64\.whl' | tail -1)"
+            ### ⚠ 清华 simple 页面的 href 是【相对路径】（../../packages/...），
+            ### 用 grep 'https://...' 永远抓不到（实测 0 命中）→ 只能退回 astral.sh。
+            ### 改用解释器做 urljoin（此时 SYS_PY 已就绪）。
+            _WHEEL_URL="$("${SYS_PY}" - <<'PYEOF' 2>/dev/null
+import re, urllib.parse, urllib.request
+base = "https://pypi.tuna.tsinghua.edu.cn/simple/uv/"
+try:
+    html = urllib.request.urlopen(base, timeout=30).read().decode("utf-8", "replace")
+except Exception:
+    raise SystemExit(0)
+rels = re.findall(r'href="([^"]*manylinux[^"]*x86_64\.whl[^"]*)"', html)
+if rels:
+    print(urllib.parse.urljoin(base, rels[-1]).split("#")[0])
+PYEOF
+)"
             if [ -n "${_WHEEL_URL}" ] && curl -fsSL --max-time 180 -o "${_UV_TMP}/uv.whl" "${_WHEEL_URL}" 2>/dev/null; then
                 ( cd "${_UV_TMP}" && unzip -oq uv.whl 2>/dev/null ) || true
                 # wheel 内二进制常见位置：uv/uv（或根目录 uv）
                 for p in "${_UV_TMP}/uv/uv" "${_UV_TMP}/uv"; do
-                    [ -f "${p}" ] && [ ! -d "${p}" ] && { cp "${p}" "${TRIM_PKGVAR}/bin/uv"; break; }
+                    # unzip 不一定恢复执行位；cp 后补 chmod，否则下面 [ -x ] 判定失败
+                    [ -f "${p}" ] && [ ! -d "${p}" ] && { cp "${p}" "${TRIM_PKGVAR}/bin/uv" && chmod 0755 "${TRIM_PKGVAR}/bin/uv"; break; }
                 done
             fi
             # 回退：astral.sh（走代理时快）
@@ -160,9 +178,17 @@ if [ -f "${RUNTIME}/.use-system-python" ]; then
     fi
 fi
 
-# 完整性校验
-if [ ! -x "${PY}" ]; then
-    echo "安装包缺少 Python 运行时（${PY}）" > "${TRIM_TEMP_LOGFILE}"
+# 完整性校验。
+# ⚠ 模式感知：系统 Python 模式的解释器是 NAS 上现建的 venv，包内【没有】
+# runtime/python/ —— 直接判 ${PY} 会 100% 失败（实机报「安装包缺少 Python
+# 运行时（/vol1/@appcenter/hermes/runtime/python/bin/python3）」）。
+if [ -f "${RUNTIME}/.use-system-python" ]; then
+    PY_CHECK="${TRIM_PKGVAR}/venv/bin/python3"
+else
+    PY_CHECK="${PY}"
+fi
+if [ ! -x "${PY_CHECK}" ]; then
+    echo "安装包缺少 Python 运行时（${PY_CHECK}）" > "${TRIM_TEMP_LOGFILE}"
     exit 1
 fi
 if [ ! -d "${RUNTIME}/hermes/hermes_cli" ]; then
@@ -199,17 +225,6 @@ if [ -n "${wizard_proxy:-}" ]; then
         chmod 600 "${ENV_FILE}" 2>/dev/null || true
         chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${ENV_FILE}" 2>/dev/null || true
     fi
-fi
-
-# 依赖环境登记（见 fnos-depenv.py 的说明）。必须在 chown 之后跑，
-# 否则以 ${TRIM_USERNAME} 身份写入会被权限挡住。
-# 打包模式解释器是 ${PY}；系统 Python 模式用 ${TRIM_PKGVAR}/venv/bin/python3。
-DEPENV_PY="${PY}"
-[ -x "${DEPENV_PY}" ] || DEPENV_PY="${TRIM_PKGVAR}/venv/bin/python3"
-if [ -f "${TRIM_APPDEST}/fnos-depenv.py" ] && [ -x "${DEPENV_PY}" ]; then
-    runuser -u "${TRIM_USERNAME}" -- env HOME="${TRIM_PKGVAR}" HERMES_HOME="${TRIM_PKGVAR}" \
-        HERMES_PKG_SRC="${RUNTIME}/hermes" "${DEPENV_PY}" "${TRIM_APPDEST}/fnos-depenv.py" \
-        >> "${TRIM_PKGVAR}/info.log" 2>&1 || true
 fi
 
 exit 0

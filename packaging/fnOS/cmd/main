@@ -2,11 +2,13 @@
 
 ### Hermes Agent —— 飞牛 fnOS 服务生命周期
 ###
-### 原生应用：自带 CPython（python-build-standalone），依赖预装进其 site-packages，
-### 运行期不联网、不 pip、不需要应用中心的 Node（web_dist 已预构建，--skip-build）。
-### 不用 venv：venv 的 pyvenv.cfg / bin 符号链接带构建机绝对路径，装到 NAS 后
-### 路径变化会失效；python-build-standalone 本身是可重定位的，直接用它最稳。
-###
+### 原生应用，两种运行时模式（构建时定）：
+###  - 系统 Python 模式（默认）：安装时在 NAS 上建 venv（${TRIM_PKGVAR}/venv），
+###    解释器取自应用中心「Python 3.12」，依赖装进该 venv。
+###  - 自带 CPython 模式：依赖预装进包内 python-build-standalone 的 site-packages，
+###    运行期零联网；不用 venv（venv 的 pyvenv.cfg/符号链接带构建机绝对路径，
+###    装到 NAS 后路径变化会失效）。
+### 两种模式都不需要在运行期 pip；web_dist 已预构建（--skip-build）。
 ### 形态：hermes dashboard（FastAPI+uvicorn，仅绑 127.0.0.1）+
 ###        gateway-proxy.py（监听 Unix Socket，反代到回环端口）。
 ### 前端是 React Router SPA，原生支持路径前缀反代：代理只要发
@@ -63,9 +65,13 @@ GATEWAY_SOCKET="${APP_DIR}/hermes.sock"
 GATEWAY_PROXY="${APP_DIR}/gateway-proxy.py"
 DATA_DIR="${TRIM_PKGVAR}"
 
-### 进程识别：dashboard 进程 argv 含 ${APP_DIR}/runtime，
-### gateway-proxy 在 ${APP_DIR}/gateway-proxy.py。绝对路径匹配，不误伤其他 python。
-PATTERN="${APP_DIR}/runtime"
+### 进程识别：绝对路径匹配，不误伤其他 python。
+### ⚠ 系统 Python 模式下 dashboard 的 argv[0] 是 ${TRIM_PKGVAR}/venv/bin/python3，
+### 【不含】${APP_DIR}/runtime（实测该进程 cmdline 只有 venv 解释器 + 参数）。
+### 沿用旧 pattern 会让 pid_alive()/status() 恒判「未运行」：应用中心显示已停止 /
+### 启动失败，而 start 会重复拉起（端口冲突），stop 的兜底 pkill 也失效。
+### 改用「解释器 + 模块」前缀，两种运行时模式都精确命中。
+PATTERN="${PY} -m ${MODULE}"
 GATEWAY_PATTERN="${APP_DIR}/gateway-proxy.py"
 
 log_msg() {
@@ -147,12 +153,10 @@ GATEWAY_PID_FILE="${TRIM_PKGVAR}/gateway.pid"
 GATEWAY_WANT_FILE="${TRIM_PKGVAR}/gateway.want"   # 存在=期望运行；删除=停止
 
 ### 消息网关 supervisor。
-### 为什么需要：dashboard 的「重启网关」会 spawn `hermes gateway restart`，而那个
-### 子进程用 PM store python 启动 → activate_dependencies 发现"未提交依赖环境"
-### → exit 1（PM 与我们「自带 CPython」布局的固有冲突）。
-### 官方 trim.hermes 用 Go wrapper 的 supervisor 循环自己管进程、不碰 PM；
-### 这里复刻同样做法：本脚本当 supervisor，gateway 退出就拉起。
-### --external-supervisor 的语义正是"退出后交还给 manager 重启"。
+### 为什么需要：dashboard 的「重启网关」会把 gateway 进程退出、指望外部 manager
+### 重新拉起（--external-supervisor 的语义就是"退出后交还给 manager"）。fnOS 没有
+### systemd/s6 那样自带的 manager，所以本脚本充当 supervisor：want 文件在 → 退出就拉起。
+### 官方 trim.hermes 用 Go wrapper 做同样的事。
 ###
 ### gateway_want 存在 → 持续拉起；被删除 → 循环退出（用于正常停止）。
 gateway_supervisor_loop() {
@@ -206,43 +210,6 @@ start_gateway_supervisor() {
     log_msg "启动消息网关 supervisor (pid=$!)"
 }
 
-### 依赖环境登记（缺陷：子进程 exit 1 "no dependency environment is committed"）。
-###
-### 为什么需要：本包自带 CPython、依赖预装在其 site-packages，不走 PM 的 uv 构建。
-### 但 PM 自己的 store Python 存在于 ${DATA_DIR}/tools/，而上游
-### hermes_cli/_launchers.py::runtime_command() 会优先用 store Python 拉起子进程；
-### 子进程启动时 pm/environments.py::activate_dependencies() 找不到任何
-### 「已提交的依赖环境」，于是 _require_own_dependencies() 对「非 venv +
-### base_prefix 在 store 内」的解释器直接拒绝 → exit 1。凡走 runtime_command 的
-### 子进程全灭：dashboard 的 doctor / 安全审计 / 备份 / 导入 / curator /
-### prompt-size / dump、cron 的 .py 脚本等。
-###
-### 这里在 install state 里登记一个指向自带 CPython 的依赖环境（等价于 PM 本来
-### 会做的那一步）：committed_venv() 不再返回 None，拒绝分支永不被触达。
-### 只写 ${DATA_DIR}/installs/<key>/，不改应用包；PM 工具链（uv/chromium/
-### agent-browser）行为不变。
-###
-### 每次启动都跑：解释器版本升级（3.14→3.15）或应用换卷后路径变化，登记需跟着重建。
-### 幂等、约 0.3s。失败不阻断启动（子动作退回旧症状，服务本身照常可用）。
-ensure_dependency_environment() {
-    local helper="${APP_DIR}/fnos-depenv.py"
-    if [ ! -f "${helper}" ]; then
-        log_msg "警告：缺少 ${helper}，dashboard 子动作会报 'no dependency environment is committed'"
-        return 0
-    fi
-    ### 只允许用应用自己的解释器：用 PM store Python 跑会把登记指向裸解释器，
-    ### 子进程虽不再报 pm repair，却会在第一个 import 上崩掉
-    ### （脚本内也有同样的拒绝）。
-    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
-        env HOME="${DATA_DIR}" HERMES_HOME="${DATA_DIR}" HERMES_PKG_SRC="${SRC_DIR}" \
-            "${PY}" "${helper}" >> "${LOG_FILE}" 2>&1 || true
-    else
-        runuser -u "${TRIM_USERNAME}" -- env HOME="${DATA_DIR}" HERMES_HOME="${DATA_DIR}" \
-            HERMES_PKG_SRC="${SRC_DIR}" "${PY}" "${helper}" >> "${LOG_FILE}" 2>&1 || true
-    fi
-    return 0
-}
-
 start_process() {
     if status > /dev/null 2>&1; then
         return 0
@@ -263,10 +230,6 @@ start_process() {
         echo "应用缺少预构建前端（web_dist）" > "${TRIM_TEMP_LOGFILE}"
         return 1
     fi
-
-    ### 依赖环境登记：必须在拉起 dashboard 之前完成，否则它 spawn 的第一个
-    ### 子动作就会撞上 "no dependency environment is committed"。
-    ensure_dependency_environment
 
     local ws
     ws="$(resolve_workspace)"
@@ -468,14 +431,14 @@ restart_gateway() {
     local gpid
     gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
     [ -n "${gpid}" ] && kill -TERM "${gpid}" 2>/dev/null || true
-    pkill -TERM -f -- "${SRC_DIR}.*gateway run" 2>/dev/null || true
+    pkill -TERM -f -- "${PATTERN} gateway run" 2>/dev/null || true
     local i=0
     while [ "${i}" -lt 15 ]; do
-        pgrep -f -- "${SRC_DIR}.*gateway run" > /dev/null 2>&1 || break
+        pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1 || break
         sleep 1
         i=$((i + 1))
     done
-    pkill -KILL -f -- "${SRC_DIR}.*gateway run" 2>/dev/null || true
+    pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
 
     # 起：写回 want → 重启 supervisor
     start_gateway_supervisor "${ws}" "${node_env}"
@@ -488,7 +451,7 @@ start_gateway_only() {
     local ws node_env="" nb
     ws="$(resolve_workspace)"
     if nb="$(find_node_bin)"; then node_env="HERMES_NODE='${nb}' \\"; fi
-    if [ -f "${GATEWAY_WANT_FILE}" ] && pgrep -f -- "${SRC_DIR}.*gateway run" > /dev/null 2>&1; then
+    if [ -f "${GATEWAY_WANT_FILE}" ] && pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
         log_msg "gateway 已在运行"
         return 0
     fi
@@ -503,14 +466,14 @@ stop_gateway_only() {
     local gpid
     gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
     [ -n "${gpid}" ] && kill -TERM "${gpid}" 2>/dev/null || true
-    pkill -TERM -f -- "${SRC_DIR}.*gateway run" 2>/dev/null || true
+    pkill -TERM -f -- "${PATTERN} gateway run" 2>/dev/null || true
     local i=0
     while [ "${i}" -lt 15 ]; do
-        pgrep -f -- "${SRC_DIR}.*gateway run" > /dev/null 2>&1 || break
+        pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1 || break
         sleep 1
         i=$((i + 1))
     done
-    pkill -KILL -f -- "${SRC_DIR}.*gateway run" 2>/dev/null || true
+    pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
     rm -f "${GATEWAY_PID_FILE}"
     log_msg "gateway stop 完成"
     return 0

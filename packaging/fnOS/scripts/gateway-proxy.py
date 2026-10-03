@@ -422,10 +422,12 @@ def _reason(code: int) -> str:
 async def handle_gateway_restart(up_path: str, headers, writer, from_root: bool = False) -> None:
     """接管 dashboard 的网关启停（restart / start / stop）→ 调 cmd/main 同名子命令。
 
-    上游实现 spawn `hermes gateway {restart,start,stop}`，其子进程走 PM store
-    python → activate_dependencies 拒绝（未提交依赖环境）→ exit 1。
-    这里改为调本包 cmd/main 的 gateway-* 子命令：它写/删 want 文件并启停
-    supervisor，完全不碰 PM。**只动消息网关**，不动 dashboard / 应用本身。
+    上游实现 spawn `hermes gateway {restart,start,stop}`，由它自己找进程、发信号；
+    但本包的消息网关是**外部 supervisor**（cmd/main）托管的，进程生命周期只有一个
+    所有者，上游那套不认识我们的 want 文件模型，直接放行会出现「重启后 supervisor
+    与上游各拉一份 / 停不干净」。这里改为调 cmd/main 的 gateway-* 子命令：它写/删
+    want 文件并启停 supervisor，进程归属唯一。**只动消息网关**，不动 dashboard /
+    应用本身。
 
     返回 dashboard 期望的 ActionResponse：{name, ok, pid, message?}
     """
@@ -708,22 +710,20 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
             return
 
         # 接管上游 dashboard 的原生更新入口 —— 转到本包的 hermes-update.py。
-        # 原因：上游 `hermes update` 是 git 源码更新器，且要 venv/PM 布局；
-        # 本包是"自带 CPython + site-packages"，靠 install-stamp.json 的
-        # updateMechanism=external 让上游拒绝自更新。把 dashboard 的按钮接到
-        # 我们自己的更新链路，用户体验才连贯。
+        # 原因：上游 `hermes update` 是 git 源码更新器，不认识本包「应用中心 + 外部
+        # supervisor」的布局；且工作树里没有 .git，它只会报错退出。把 dashboard
+        # 的按钮接到我们自己的 hermes-update.py（git 更新 + 重启应用），体验才连贯。
         _base_path = up_path.split("?")[0]
         if _base_path in ("/api/hermes/update", "/api/hermes/update/check"):
             await handle_native_update_proxy(method, _base_path, headers, client_writer, from_root)
             return
 
         # 接管 dashboard 的网关启停按钮（restart / start / stop）。
-        # 原因：上游这三个端点都会 spawn `hermes gateway ...`，其子进程用 PM
-        # store python 启动 → activate_dependencies 发现"未提交依赖环境" →
-        # exit 1（PM 与「自带 CPython」布局的固有冲突）。
-        # 官方 trim.hermes 用 Go wrapper 自己管进程、不碰 PM；本包改为调
-        # cmd/main 的 gateway-{restart,start,stop}（由 cmd/main 的 supervisor
-        # 负责拉起/停止消息网关），同样绕开 PM。
+        # 原因：消息网关由 cmd/main 的外部 supervisor 托管，进程所有权必须唯一。
+        # 上游这三个端点会自己 spawn/信号 `hermes gateway ...`，与 supervisor
+        # 的 want 文件模型冲突（可能重启出两份、或停不掉）。官方 trim.hermes 用
+        # Go wrapper 自己管进程；本包改为调 cmd/main 的 gateway-{restart,start,stop}
+        # （由 cmd/main 的 supervisor 负责拉起/停止消息网关），归属单一。
         # 注意：只动消息网关，不动 dashboard / 代理 / 整个 fnOS 应用。
         if _base_path in ("/api/gateway/restart", "/api/gateway/start", "/api/gateway/stop") \
                 and method == "POST":
