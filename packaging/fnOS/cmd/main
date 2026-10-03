@@ -227,7 +227,8 @@ ${node_env}
                 # 已有实例在服务同一 profile / 抢单例失败 → 退避重试
                 log_msg "supervisor: gateway 退出 (code=${rc})，${backoff}s 后重试"
                 sleep "${backoff}"
-                backoff=$(( backoff < 30 ? backoff * 2 : 30 )) ;;
+                # 翻倍但封顶 30（对"翻倍结果"封顶，否则 16→32 会先冲过头再回落 30）
+                backoff=$(( backoff * 2 > 30 ? 30 : backoff * 2 )) ;;
             *)
                 log_msg "supervisor: gateway 退出 (code=${rc})，1s 后重启"
                 sleep 1 ;;
