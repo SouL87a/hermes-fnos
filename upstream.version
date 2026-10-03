@@ -1,13 +1,12 @@
-# 钉住的上游 ref。用 3.14 → 必须用 2026-09 底之后的版本。
+# 钉住的上游 **正式发布** tag（不是 main / canary）。
 #
-# 为什么钉 canary tag 而不是 main HEAD：
-#   main 的 Python 3.14 迁移尚未进入 stable tag（最后 stable v2026.9.24 仍是
-#   >=3.11,<3.14）；但 canary tag 已是 3.14（.python-version=3.14，
-#   requires-python >=3.11,<3.15，46 个依赖带 python_version >= '3.14' 标记）。
-#   canary tag 是打好的快照，比浮动的 main HEAD 可复现。
+# 为什么用 stable 而不是 canary：
+#   · 用户要求「正式版 Hermes」；
+#   · stable 的 requires-python 是 >=3.11,<3.14 —— 与商店的 Python 3.12 匹配；
+#   · 2026-09 底 main 上开始迁 3.14（46 个依赖带 python_version >= '3.14'
+#     标记），但**至今未进 stable**；canary 属预发布通道，不算正式版。
 #
-# 网关特性（X-Forwarded-Prefix 前缀反代、HERMES_WEB_DIST、--skip-build、
-# 回环免鉴权）在该 tag 已全部具备。
-#
-# 等上游把 3.14 打进 stable tag 后，换成那个 stable tag 即可。
-v0.21.4+canary.20261001T070239Z
+# 最近核实（2026-10-03）：最新 stable 仍是 v2026.9.24。
+# 上游发新 stable 后改这一行即可 —— build.sh 会自动改 fpk 版本号与 stamp，
+# 并在线的「检查更新」按 stable 通道跟随（见 hermes-update.py 的 channel）。
+v2026.9.24

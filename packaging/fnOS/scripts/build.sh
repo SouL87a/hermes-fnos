@@ -129,13 +129,18 @@ echo "[build] 源码树：${SRC} ($(cd "${SRC}" && git rev-parse --short HEAD 2>
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}" "${APP_DIR}" "${DIST}" "${RT}"
 
-# ── 1. CPython 运行时（python-build-standalone）──────────────
-# 用 3.14：上游 main/canary 已迁 3.14（requires-python >=3.11,<3.15）。默认自带
-# CPython，运行期零联网。3.14 较新，个别原生轮子可能暂无 cp314 wheel（构建时
-# 会退化成源码编译）——盯构建日志里 `Building wheel for ...` 的行。
-# 若改回复用系统 Python，设 HERMES_USE_SYSTEM_PYTHON=1（见下方分支）。
+# ── 1. Python 运行时 ─────────────────────────────────────────
+# 默认【复用系统 Python】（HERMES_USE_SYSTEM_PYTHON=1）：
+#   飞牛应用中心提供 Python 3.12（可直接装、无网络问题），安装时在 NAS 上
+#   用 uv 建 venv 并装依赖（见 cmd/install_callback）。
+#   好处：包体积小一个数量级（不打包 460MB 的 CPython）。
+#   代价：安装时需联网装依赖（PyPI）；用户可在应用设置里配代理。
+#
+# 上游 stable（v2026.9.24）要求 >=3.11,<3.14 → 商店的 3.12 正好在范围内。
+#
+# 想改回「自带 CPython、运行期零联网」：设 HERMES_USE_SYSTEM_PYTHON=0。
 PY_VERSION="${HERMES_PY_VERSION:-3.14.7}"
-PBS_TAG="${HERMES_PBS_TAG:-20260929}"     # 可覆盖；脚本会从 release 资产里挑匹配项
+PBS_TAG="${HERMES_PBS_TAG:-20260929}"     # 自带模式下的 PBS 标签
 PBS_CACHE="${PKG_DIR}/.cache"
 mkdir -p "${PBS_CACHE}"
 
@@ -148,14 +153,14 @@ pbs_url() {
 }
 
 PBS_TGZ="${PBS_CACHE}/cpython-${PY_VERSION}-${PBS_TRIPLE}.tar.gz"
-if [ "${HERMES_USE_SYSTEM_PYTHON:-0}" = "1" ]; then
-    # 复用系统 Python（你在飞牛已装的 3.12）：不打包 CPython，运行期直接用
-    # 系统 python3。代价：依赖要在安装时联网装（构建期无法预装到系统解释器）。
-    echo "[build] HERMES_USE_SYSTEM_PYTHON=1：跳过打包 CPython，运行期用系统 python3"
+if [ "${HERMES_USE_SYSTEM_PYTHON:-1}" = "1" ]; then
+    # 复用系统 Python（飞牛应用中心的 3.12）：不打包 CPython，运行期用
+    # NAS 上现成的 python3 建 venv。构建机只需能跑 python3 来抽依赖清单/写 stamp。
+    echo "[build] 系统 Python 模式（默认）：跳过打包 CPython，安装时在 NAS 上建 venv"
     PYBIN="$(command -v python3 || command -v python)"
-    [ -n "${PYBIN}" ] || { echo "✗ 本机找不到 python3（系统 Python 模式下构建机也需要它来预装/校验）"; exit 1; }
+    [ -n "${PYBIN}" ] || { echo "✗ 本机找不到 python3（构建脚本自用）"; exit 1; }
     "${PYBIN}" --version
-    # 标记：cmd/main 见到此文件即改用系统 python3
+    # 标记：cmd/main / install_callback 见到此文件即改用 NAS 上的 venv
     : > "${RT}/.use-system-python"
 else
     if [ ! -f "${PBS_TGZ}" ]; then
@@ -204,7 +209,7 @@ PY
 [ -s "${DEPS_TXT}" ] || { echo "✗ 依赖清单抽取失败（${DEPS_TXT}）"; exit 1; }
 echo "[build] 依赖条数：$(grep -c . "${DEPS_TXT}")"
 
-if [ "${HERMES_USE_SYSTEM_PYTHON:-0}" = "1" ]; then
+if [ "${HERMES_USE_SYSTEM_PYTHON:-1}" = "1" ]; then
     echo "[build] 系统 Python 模式：跳过构建期依赖安装（依赖清单已随包，安装时 uv 装）"
 else
 echo "[build] 安装 Python 依赖（core + [web]）→ site-packages"
@@ -272,9 +277,14 @@ fi  # 结束「打包模式」分支
 # ── 3. 源码树拷进包 ──────────────────────────────────────────
 echo "[build] 拷贝源码树 → runtime/hermes"
 mkdir -p "${RT}/hermes"
-# 关键：**保留 .git** —— 在线更新靠 git fetch/reset（用户选定「真·git 检出」）。
-# 但不要完整历史：构建源是浅克隆（--depth 1），.git 本就很小；再压掉多余引用。
+### ⚠ .git 刻意 **不放进工作树** —— 放到 runtime/hermes-git.git（见下方 3a）。
+### 原因（第三轮审计 P0）：工作树里有 .git 会让上游 sealed_steward() 直接
+### return None → `hermes update` 的准入判定放行 → 用户敲一次就 git reset --hard
+### 覆盖代码树（自伤）。移出工作树后 sealed_steward 走 stamp 的 distribution
+### 分支 → 被正确拒绝并提示走应用中心；而我们的 hermes-update.py 用
+### GIT_DIR/GIT_WORK_TREE 定向，在线更新功能不受影响。
 ( cd "${SRC}" && tar -cf - \
+    --exclude='.git' \
     --exclude='node_modules' \
     --exclude='web/node_modules' \
     --exclude='ui-tui/node_modules' \
@@ -288,16 +298,21 @@ mkdir -p "${RT}/hermes"
     --exclude='website' \
     . ) | ( cd "${RT}/hermes" && tar -xf - )
 
-# 记录来源仓库，供 hermes-update.py 用（.git 的 origin 可能因浅克隆/打包丢失）
+# ── 3a. .git 移到工作树外（保留在线更新能力，同时堵住 hermes update 自伤）──
 if [ -d "${SRC}/.git" ]; then
+    echo "[build] 移出 .git → runtime/hermes-git.git（并补 origin）"
+    rm -rf "${RT}/hermes-git.git"
+    cp -a "${SRC}/.git" "${RT}/hermes-git.git"
+    # 记录 origin 与 HEAD，供 hermes-update.py 用
     git -C "${SRC}" remote get-url origin > "${RT}/.origin-url" 2>/dev/null || true
-    ( cd "${RT}/hermes" && git rev-parse HEAD > "${RT}/.git-head" 2>/dev/null || true )
-    # 补上 origin（打包过程可能剥离了 remote 配置）
-    if [ -f "${RT}/.origin-url" ] && [ -d "${RT}/hermes/.git" ]; then
-        ORIGIN_URL="$(cat "${RT}/.origin-url")"
-        git -C "${RT}/hermes" remote remove origin 2>/dev/null || true
-        git -C "${RT}/hermes" remote add origin "${ORIGIN_URL}" 2>/dev/null || true
+    git -C "${SRC}" rev-parse HEAD > "${RT}/.git-head" 2>/dev/null || true
+    ORIGIN_URL="$(cat "${RT}/.origin-url" 2>/dev/null || true)"
+    if [ -n "${ORIGIN_URL}" ]; then
+        GIT_DIR="${RT}/hermes-git.git" git remote remove origin 2>/dev/null || true
+        GIT_DIR="${RT}/hermes-git.git" git remote add origin "${ORIGIN_URL}" 2>/dev/null || true
     fi
+    # 新增文件模式下 git 认为工作树"全脏"（fnpack 会拍平权限）→ 关掉 filemode 检测
+    GIT_DIR="${RT}/hermes-git.git" git config core.filemode false 2>/dev/null || true
 fi
 
 # ── 3b. install-stamp.json（Hermes 版本的权威来源）───────────
@@ -311,9 +326,11 @@ fi
 # 本项目用 external（更新链路自管，见 README）。
 echo "[build] 生成 install-stamp.json"
 STAMP="${RT}/hermes/install-stamp.json"
-STAMP_COMMIT="$(git -C "${SRC}" rev-parse HEAD 2>/dev/null || echo '')"
-STAMP_BRANCH="$(git -C "${SRC}" branch --show-current 2>/dev/null || echo '')"
-STAMP_DATE="$(git -C "${SRC}" log -1 --format=%ct 2>/dev/null || echo '')"
+# .git 已在 3a 移出工作树 → 用 GIT_DIR/GIT_WORK_TREE 定向
+STAMP_GIT_ENV=(env "GIT_DIR=${RT}/hermes-git.git" "GIT_WORK_TREE=${RT}/hermes")
+STAMP_COMMIT="$("${STAMP_GIT_ENV[@]}" git rev-parse HEAD 2>/dev/null || echo '')"
+STAMP_BRANCH="$("${STAMP_GIT_ENV[@]}" git branch --show-current 2>/dev/null || echo '')"
+STAMP_DATE="$("${STAMP_GIT_ENV[@]}" git log -1 --format=%ct 2>/dev/null || echo '')"
 # 从上游 ref 推导基础版本：v0.21.4+canary.xxx → 0.21.4；v2026.9.24 → 2026.9.24
 # 与 fpk 版本统一（同一份推导，避免两处漂移）
 STAMP_BASE="${VERSION}"
@@ -338,7 +355,13 @@ stamp = {
     "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "dirty": False,
     "source": "local",          # 非 commit-build/docker/nix → 不触发额外拒绝
-    "distribution": None,       # 不声明发行形态
+    # distribution 写明发行形态：上游 sealed_steward() 在「工作树无 .git」时
+    # 会读它 → 返回该字符串（非 None）→ hermes update 判定为"sealed，非我们
+    # 的树"→ 拒绝并提示走应用中心。这正是我们要的：堵住 `hermes update`
+    # 的 git reset --hard 自伤通道（第三轮审计 P0）。
+    # 注意：若工作树里有 .git，sealed_steward 会提前 return None 绕过本字段 ——
+    # 所以 build.sh 同时把 .git 移出工作树（放 runtime/hermes-git.git）。
+    "distribution": "fnOS App Center",
     "updateMechanism": "external",  # 更新由本包的 hermes-update.py 管理
     "baseVersion": base,
     "displayVersion": base,
@@ -456,9 +479,11 @@ cat > "${APP_DIR}/bin/hermes-update" <<'WRAP'
 #!/bin/bash
 # Hermes 在线更新 CLI（fnOS）。转发到 hermes-update.py。
 APP_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-PY="${APP_DIR}/runtime/python/bin/python3"
-[ -x "${PY}" ] || PY="$(command -v python3)"
 DATA="${TRIM_PKGVAR:-/var/apps/hermes/var}"
+# 解释器优先级：系统 Python 模式（NAS 上建的 venv）→ 自带 CPython → PATH
+PY="${DATA}/venv/bin/python3"
+[ -x "${PY}" ] || PY="${APP_DIR}/runtime/python/bin/python3"
+[ -x "${PY}" ] || PY="$(command -v python3)"
 exec env HERMES_APP_ROOT="${APP_DIR}" HERMES_DATA_ROOT="${DATA}" "${PY}" "${APP_DIR}/hermes-update.py" "$@"
 WRAP
 chmod 755 "${APP_DIR}/bin/hermes-update"
@@ -471,7 +496,7 @@ if grep -rn -e '{port}' -e '{display_name}' "${APP_DIR}/ui" > /dev/null 2>&1; th
     echo "✗ ui/ 里仍有 {port} / {display_name} 占位符 → 桌面图标会点了没反应"
     exit 1
 fi
-if [ "${HERMES_USE_SYSTEM_PYTHON:-0}" = "1" ]; then
+if [ "${HERMES_USE_SYSTEM_PYTHON:-1}" = "1" ]; then
     [ -f "${RT}/.use-system-python" ] || { echo "✗ 系统 Python 模式缺标记文件"; exit 1; }
     [ -f "${RT}/deps.txt" ] || { echo "✗ 系统 Python 模式缺依赖清单 runtime/deps.txt"; exit 1; }
 else

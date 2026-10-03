@@ -44,9 +44,15 @@ APP_ROOT = Path(os.environ.get("HERMES_APP_ROOT") or os.environ.get("TRIM_APPDES
 DATA_ROOT = Path(os.environ.get("HERMES_DATA_ROOT") or os.environ.get("TRIM_PKGVAR") or (APP_ROOT / "var"))
 
 RUNTIME = APP_ROOT / "runtime"
-SRC = RUNTIME / "hermes"                 # 源码树（含 .git）
+SRC = RUNTIME / "hermes"                 # 源码树（.git 可能在工作树内或 <APP>/runtime/hermes-git.git）
 WEB_DIST = RUNTIME / "web_dist"          # 预构建前端
-PY = RUNTIME / "python" / "bin" / "python3"
+
+### 解释器：系统 Python 模式（默认）用 NAS 上建的 venv；否则用自带 CPython。
+### 与 cmd/main 的判定保持一致（都以 .use-system-python 标记为准）。
+if (RUNTIME / ".use-system-python").exists():
+    PY = DATA_ROOT / "venv" / "bin" / "python3"
+else:
+    PY = RUNTIME / "python" / "bin" / "python3"
 STATE_FILE = DATA_ROOT / "update-state.json"
 LOCK_FILE = DATA_ROOT / "update.lock"
 CONFIG_FILE = DATA_ROOT / "update.json"
@@ -105,6 +111,31 @@ def find_git() -> str | None:
     return shutil.which("git")
 
 
+### .git 被移出工作树（放到 <APP>/runtime/hermes-git.git），见 build.sh。
+### 原因：源码树里有 .git 会让上游 sealed_steward() 返回 None → `hermes update`
+### 的准入判定放行 → 用户敲一次就会 git reset --hard（自伤，见第三轮审计 P0）。
+### 把 .git 移出工作树后 sealed_steward 走 stamp 的 distribution 分支 → 被正确拒绝；
+### 而我们的 hermes-update.py 用 GIT_DIR / GIT_WORK_TREE 定向，功能不受影响。
+GIT_DIR_PATH = Path(os.environ.get("HERMES_UPDATE_GIT_DIR") or (APP_ROOT / "runtime" / "hermes-git.git"))
+WORK_TREE = SRC
+
+
+def _has_git() -> bool:
+    """工作树内有 .git，或 .git 已移出（见 build.sh）—— 都算可用。"""
+    return (SRC / ".git").exists() or GIT_DIR_PATH.is_dir()
+
+
+def git_cmd(git: str, *args: str) -> tuple[list[str], dict[str, str]]:
+    """构造指向「移出工作树的 .git」的 git 命令。
+
+    返回 (argv, env_extra)。若外部 git dir 不存在（开发态/旧包），退回 `-C SRC`。
+    """
+    if GIT_DIR_PATH.is_dir():
+        return ([git, *args],
+                {"GIT_DIR": str(GIT_DIR_PATH), "GIT_WORK_TREE": str(WORK_TREE)})
+    return ([git, "-C", str(WORK_TREE), *args], {})
+
+
 def find_node_tool(name: str) -> str | None:
     """node/npm 可能在自带运行时、fnOS 应用中心的 nodejs、或 PATH 里。
 
@@ -144,11 +175,12 @@ def local_version() -> dict[str, str]:
     """
     out = {"version": "unknown", "commit": "", "ref": ""}
     git = find_git()
-    if git and (SRC / ".git").exists():
-        head = run([git, "-C", str(SRC), "rev-parse", "--short", "HEAD"], timeout=20)
+    # .git 可能已移出工作树（见 build.sh）—— 两种布局都认
+    if git and ((SRC / ".git").exists() or GIT_DIR_PATH.is_dir()):
+        _c, _e = git_cmd(git, "rev-parse", "--short", "HEAD"); head = run(_c, env_extra=_e, timeout=20)
         if head.returncode == 0:
             out["commit"] = head.stdout.strip()
-        desc = run([git, "-C", str(SRC), "describe", "--tags", "--always"], timeout=20)
+        _c, _e = git_cmd(git, "describe", "--tags", "--always"); desc = run(_c, env_extra=_e, timeout=20)
         if desc.returncode == 0:
             out["ref"] = desc.stdout.strip()
             out["version"] = out["ref"]
@@ -210,8 +242,9 @@ def _ls_remote_map(git: str) -> dict[str, str]:
     如实报错，由调用方（代理）转成 update_available=null，不能拖住页面。
     GIT_TERMINAL_PROMPT=0：禁止 git 在凭据缺失时等交互输入（会挂到超时）。
     """
-    ls = run([git, "ls-remote", "origin"], cwd=SRC, timeout=20,
-             env_extra={"GIT_TERMINAL_PROMPT": "0"})
+    _c, _e = git_cmd(git, "ls-remote", "origin")
+    _e = {**_e, "GIT_TERMINAL_PROMPT": "0"}
+    ls = run(_c, timeout=20, env_extra=_e)
     if ls.returncode != 0:
         raise RuntimeError(f"git ls-remote 失败：{ls.stdout.strip()[:200]}")
     out: dict[str, str] = {}
@@ -372,8 +405,8 @@ def check_update() -> dict[str, Any]:
     git = find_git()
     if not git:
         return {"ok": False, "error": "no_git", "message": "系统未安装 git，无法在线更新"}
-    if not (SRC / ".git").exists():
-        return {"ok": False, "error": "no_git_tree", "message": f"源码树不是 git 检出：{SRC}"}
+    if not _has_git():
+        return {"ok": False, "error": "no_git_tree", "message": f"找不到 git 仓库：{SRC}（或 {GIT_DIR_PATH}）"}
 
     write_state(status="checking")
     try:
@@ -386,7 +419,7 @@ def check_update() -> dict[str, Any]:
     cur = local_version()
     local_commit = cur.get("commit", "")
     # 比较完整 commit：local_version 给的是短 hash，这里取全量
-    head_full = run([git, "-C", str(SRC), "rev-parse", "HEAD"], timeout=20)
+    _c, _e = git_cmd(git, "rev-parse", "HEAD"); head_full = run(_c, env_extra=_e, timeout=20)
     head_full = head_full.stdout.strip() if head_full.returncode == 0 else ""
     available = bool(remote) and remote != head_full
 
@@ -409,8 +442,8 @@ def apply_update(force: bool = False) -> dict[str, Any]:
     git = find_git()
     if not git:
         return {"ok": False, "message": "系统未安装 git，无法在线更新"}
-    if not (SRC / ".git").exists():
-        return {"ok": False, "message": f"源码树不是 git 检出：{SRC}"}
+    if not _has_git():
+        return {"ok": False, "message": f"找不到 git 仓库：{SRC}（或 {GIT_DIR_PATH}）"}
 
     # 前置：node/npm 必须在 —— 否则 apply 会推进 Python 源码却重建不了前端，
     # 留下「旧前端 × 新后端」的错配（第三轮审计 P0 第2条：「不要做一半」）。
@@ -442,7 +475,7 @@ def apply_update(force: bool = False) -> dict[str, Any]:
         # 1. 解析目标
         kind, ref, label = resolve_target(git)
         remote = remote_commit(git, kind, ref)
-        head_full = run([git, "-C", str(SRC), "rev-parse", "HEAD"], timeout=20)
+        _c, _e = git_cmd(git, "rev-parse", "HEAD"); head_full = run(_c, env_extra=_e, timeout=20)
         head_full = head_full.stdout.strip() if head_full.returncode == 0 else ""
 
         # 「已是最新」必须同时满足：commit 匹配 **且** 依赖已为该 commit 同步过。
@@ -468,10 +501,10 @@ def apply_update(force: bool = False) -> dict[str, Any]:
         if not skip_git:
             # 2. 拉取。按 ref 名（不是裸 sha）—— 按 sha 取需要服务端允许，未必可用。
             fetch_spec = f"refs/tags/{ref}" if kind == "tag" else ref
-            proc = run([git, "-C", str(SRC), "fetch", "--depth", "1", "origin", fetch_spec], timeout=900)
+            _c, _e = git_cmd(git, "fetch", "--depth", "1", "origin", fetch_spec); proc = run(_c, env_extra=_e, timeout=900)
             if proc.returncode != 0:
                 # 回退：不带 --depth（老 git 或服务端限制）
-                proc = run([git, "-C", str(SRC), "fetch", "origin", fetch_spec], timeout=900)
+                _c, _e = git_cmd(git, "fetch", "origin", fetch_spec); proc = run(_c, env_extra=_e, timeout=900)
             if proc.returncode != 0:
                 step("git fetch", False, proc.stdout[-300:])
                 write_state(status="error", message="git fetch 失败")
@@ -480,7 +513,7 @@ def apply_update(force: bool = False) -> dict[str, Any]:
 
             # 3. 切代码。FETCH_HEAD 指向刚取到的 ref。
             #    reset --hard 不动 gitignore 的 web_dist / node_modules，前端产物得以保留。
-            proc = run([git, "-C", str(SRC), "reset", "--hard", "FETCH_HEAD"], timeout=300)
+            _c, _e = git_cmd(git, "reset", "--hard", "FETCH_HEAD"); proc = run(_c, env_extra=_e, timeout=300)
             if proc.returncode != 0:
                 step("git reset", False, proc.stdout[-300:])
                 write_state(status="error", message="git reset 失败")
@@ -506,7 +539,7 @@ def apply_update(force: bool = False) -> dict[str, Any]:
             return {"ok": False, "message": "依赖安装失败，已回滚到原版本", "steps": steps}
 
         # 记录「依赖已为哪个 commit 同步过」—— 中断恢复的判据
-        head_now = run([git, "-C", str(SRC), "rev-parse", "HEAD"], timeout=20)
+        _c, _e = git_cmd(git, "rev-parse", "HEAD"); head_now = run(_c, env_extra=_e, timeout=20)
         head_now = head_now.stdout.strip() if head_now.returncode == 0 else remote
 
         # 5. 前端
@@ -548,7 +581,7 @@ def apply_update(force: bool = False) -> dict[str, Any]:
 def _rollback(git: str, old_commit: str, step) -> None:
     if not old_commit:
         return
-    run([git, "-C", str(SRC), "reset", "--hard", old_commit], timeout=300)
+    _c, _e = git_cmd(git, "reset", "--hard", old_commit); run(_c, env_extra=_e, timeout=300)
     step("回滚代码", True, old_commit[:12])
     try:
         deps = extract_deps(SRC)
