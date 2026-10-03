@@ -126,9 +126,9 @@ port_listening() {
 }
 
 ### 查找 node —— 对话页的 TUI 终端需要它。
-### 为什么必须显式给：上游 _tui_node_bin 优先读 $HERMES_NODE；未设时会回退
-### `pm.ensure("node")`，在离线/受限环境会**卡死 240 秒且零输出**（实测报告缺陷 4）。
-### 应用中心装了 nodejs_v22 就有可用 node，直接指过去。
+### 为什么必须显式给：上游找 node 时优先读 $HERMES_NODE；未设时它会走自己的运行时
+### 定位路径，在离线/受限环境会**长时间无输出**（实测报告缺陷 4）。应用中心装了
+### nodejs_v22 就有可用 node，直接指过去最稳。
 find_node_bin() {
     local d
     # 优先应用中心的 nodejs（v22/v24），跨卷兜底
@@ -163,7 +163,7 @@ GATEWAY_WANT_FILE="${TRIM_PKGVAR}/gateway.want"   # 存在=期望运行；删除
 gateway_supervisor_loop() {
     local ws="$1"
     ### node_env 不靠参数传递：runuser 分支只传了 ws，参数化会在那条路径上丢失
-    ### HERMES_NODE（上游 _tui_node_bin 会回退到 pm.ensure 卡 240 秒）。循环体自行解析。
+    ### HERMES_NODE。循环体自行解析（见 find_node_bin 的说明）。
     local node_env="" _nb
     if _nb="$(find_node_bin)"; then node_env="HERMES_NODE='${_nb}' \\"; fi
     ### 退出时带走自己 spawn 的 gateway 子进程。
@@ -323,7 +323,7 @@ start_process() {
     # 主服务：dashboard 仅绑回环，避免触发非回环的强制鉴权门。
     # 资源定位用上游官方的 HERMES_BUNDLED_* 机制（比靠 PROJECT_ROOT 推导更稳，
     # 与官方 fnOS 包的 hermes-env 一致）：源码树即资源根。
-    # TUI 终端用的 node（缺陷 4）：显式给出，避免上游回退到会卡死的 pm.ensure
+    # TUI 终端用的 node：显式给出，避免上游自己找 node 时长时间无输出
     local NODE_BIN NODE_ENV=""
     if NODE_BIN="$(find_node_bin)"; then
         NODE_ENV="HERMES_NODE='${NODE_BIN}' \\"
