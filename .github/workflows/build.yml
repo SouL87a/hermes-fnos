@@ -104,20 +104,36 @@ jobs:
           tar -xzf "$FPK" app.tgz
           A="$(tar -tzf app.tgz)"
           for need in ./ui/config ./ui/images/icon_64.png ./gateway-proxy.py ./hermes-update.py \
-                      ./bin/hermes-update ./runtime/deps.txt ./runtime/web_dist/index.html \
-                      ./runtime/python/bin/python3 ./runtime/hermes/hermes_cli/__init__.py; do
+                      ./fnos-depenv.py ./bin/hermes-update ./runtime/deps.txt \
+                      ./runtime/web_dist/index.html ./runtime/web-build.mjs \
+                      ./runtime/hermes/hermes_cli/__init__.py; do
             echo "$A" | grep -qx "$need" || { echo "✗ app.tgz 缺少 $need"; exit 1; }
           done
+
+          # Python 运行时：两种模式二选一
+          #   系统模式（默认）→ runtime/.use-system-python 标记，安装时在 NAS 建 venv
+          #   自带模式        → runtime/python/bin/python3
+          if echo "$A" | grep -qx "./runtime/.use-system-python"; then
+            echo "✓ 系统 Python 模式（安装时在 NAS 建 venv）"
+          elif echo "$A" | grep -qx "./runtime/python/bin/python3"; then
+            echo "✓ 自带 CPython 模式"
+          else
+            echo "✗ 既无 .use-system-python 标记，也无 runtime/python/bin/python3"; exit 1
+          fi
 
           # 安装戳（决定 dashboard 版本号显示）—— 缺失则显示 unknown
           echo "$A" | grep -qx "./runtime/hermes/install-stamp.json" \
             && echo "✓ 含 install-stamp.json（版本号可正确显示）" \
             || { echo "✗ 缺少 install-stamp.json —— dashboard 会显示 vunknown"; exit 1; }
 
-          # 在线更新依赖 .git —— 缺失则更新功能不可用
-          echo "$A" | grep -q "^\./runtime/hermes/\.git/" \
-            && echo "✓ 源码树含 .git（在线更新可用）" \
-            || { echo "✗ 源码树不含 .git —— 在线更新不可用"; exit 1; }
+          # .git 必须在【工作树外】（runtime/hermes-git.git）——
+          # 放工作树里会让 hermes update 的准入判定放行（自伤），见第三轮审计 P0。
+          echo "$A" | grep -q "^\./runtime/hermes-git\.git/" \
+            && echo "✓ .git 已移出工作树（在线更新可用，且堵住 hermes update 自伤）" \
+            || { echo "✗ 缺少 runtime/hermes-git.git"; exit 1; }
+          echo "$A" | grep -qx "./runtime/hermes/.git/HEAD" \
+            && { echo "✗ 工作树内仍有 .git —— 会让 hermes update 自伤"; exit 1; } \
+            || echo "✓ 工作树内无 .git"
 
           echo "✓ fpk 结构检查通过"
 
