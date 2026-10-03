@@ -111,14 +111,26 @@ jobs:
           done
 
           # Python 运行时：两种模式二选一
-          #   系统模式（默认）→ runtime/.use-system-python 标记，安装时在 NAS 建 venv
-          #   自带模式        → runtime/python/bin/python3
+          #   自带模式（默认）→ runtime/python/bin/python3
+          #   系统模式        → runtime/.use-system-python 标记，安装时在 NAS 建 venv
           if echo "$A" | grep -qx "./runtime/.use-system-python"; then
             echo "✓ 系统 Python 模式（安装时在 NAS 建 venv）"
           elif echo "$A" | grep -qx "./runtime/python/bin/python3"; then
             echo "✓ 自带 CPython 模式"
           else
             echo "✗ 既无 .use-system-python 标记，也无 runtime/python/bin/python3"; exit 1
+          fi
+
+          # 自带模式：实跑包内解释器，断言 SQLite 版本过 Hermes 的 WAL-reset 门。
+          # 这是本次默认切自带模式的【核心目的】—— 若 PBS tag 变更导致 SQLite 掉回
+          # 窗口外（如 3.51.1），此处立即失败，而不是等装到 NAS 上才发现 WAL 被降级。
+          # ⚠ 用单行 -c：YAML 块标量里没法把多行 Python 顶格写，缩进的顶层语句会
+          #   触发 IndentationError: unexpected indent。
+          if echo "$A" | grep -qx "./runtime/python/bin/python3"; then
+            tar -xzf app.tgz ./runtime/python
+            ./runtime/python/bin/python3 -c "import sqlite3,sys; print('  自带 CPython SQLite:', sqlite3.sqlite_version); i=sqlite3.sqlite_version_info; sys.exit(1 if not (i<(3,7,0) or i>=(3,51,3) or (3,50,7)<=i<(3,51,0) or (3,44,6)<=i<(3,45,0)) else 0)" \
+              || { echo '✗ SQLite 命中 WAL-reset 门 —— state.db 会降级 DELETE，doctor 报假 FTS 损坏'; exit 1; }
+            echo '✓ SQLite 过 WAL-reset 门（WAL 可用）'
           fi
 
           # 构建信息戳（commit/发行方）。⚠ 版本号不来自它：上游读源码树的

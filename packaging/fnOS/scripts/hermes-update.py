@@ -3,9 +3,10 @@
 Hermes Agent · 飞牛 fnOS 在线更新引擎。
 
 为什么不用上游的 `hermes update`：
-  它是**源码检出更新器**，要求 PROJECT_ROOT/.git 存在，走 `git pull` + `pm.sync_venv()`；
-  `pm` 假设有一个标准 venv。本包是「自带 CPython + 依赖装进其 site-packages」，
-  没有 venv，所以 `hermes update` 会拒绝或走错路。这里自己实现同样的语义。
+  它是**源码检出更新器**，要求 PROJECT_ROOT/.git 存在。本包刻意把 .git 移出工作树
+  （放 runtime/hermes-git.git）—— 既是给在线更新用的 git 仓库，又让上游 `hermes update`
+  在 Linux 上直接报 "Not a git repository" 而拒绝（堵住 git reset --hard 自伤）。
+  这里自己实现同样的语义：用 GIT_DIR 定向到工作树外的 .git。
 
 更新做什么（按用户选定：真·git 检出 + 同步重装依赖 + Python 不升级）：
   1. git fetch 目标 ref（分支或 tag）
@@ -47,7 +48,7 @@ RUNTIME = APP_ROOT / "runtime"
 SRC = RUNTIME / "hermes"                 # 源码树（.git 可能在工作树内或 <APP>/runtime/hermes-git.git）
 WEB_DIST = RUNTIME / "web_dist"          # 预构建前端
 
-### 解释器：系统 Python 模式（默认）用 NAS 上建的 venv；否则用自带 CPython。
+### 解释器：自带 CPython（默认）用包内解释器；系统 Python 模式（标记文件存在）用 NAS 上建的 venv。
 ### 与 cmd/main 的判定保持一致（都以 .use-system-python 标记为准）。
 if (RUNTIME / ".use-system-python").exists():
     PY = DATA_ROOT / "venv" / "bin" / "python3"

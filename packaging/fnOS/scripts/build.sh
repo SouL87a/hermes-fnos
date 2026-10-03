@@ -5,7 +5,7 @@
 # 产物：packaging/fnOS/dist/hermes-<version>.fpk
 #
 # payload 不是上游的现成 runtime（上游只给安装脚本，靠 uv 现拉），而是本地装配：
-#   1. python-build-standalone 的 CPython 3.14（可重定位，随包分发）
+#   1. python-build-standalone 的 CPython 3.12（可重定位、自带 SQLite 3.53.1，随包分发）
 #   2. 依赖装进该 CPython 的 site-packages（构建时联网一次，运行期零联网）
 #   3. 前端预构建（npm build → hermes_cli/web_dist）
 #   4. 上游源码树（钉住 upstream.version 的提交）
@@ -130,16 +130,25 @@ rm -rf "${STAGE}"
 mkdir -p "${STAGE}" "${APP_DIR}" "${DIST}" "${RT}"
 
 # ── 1. Python 运行时 ─────────────────────────────────────────
-# 默认【复用系统 Python】（HERMES_USE_SYSTEM_PYTHON=1）：
-#   飞牛应用中心提供 Python 3.12（可直接装、无网络问题），安装时在 NAS 上
-#   用 uv 建 venv 并装依赖（见 cmd/install_callback）。
-#   好处：包体积小一个数量级（不打包 460MB 的 CPython）。
-#   代价：安装时需联网装依赖（PyPI）；用户可在应用设置里配代理。
+# 默认【自带 CPython】（python-build-standalone），依赖预装进其 site-packages，
+#   运行期零联网、不 pip、不依赖应用中心的 Python。
 #
-# 上游 stable（v2026.9.24）要求 >=3.11,<3.14 → 商店的 3.12 正好在范围内。
+# 为什么默认自带（而非复用应用中心 Python 3.12）：
+#   · SQLite：应用中心的 Python 3.12 链的是系统 libsqlite3 **3.40.1**，命中 Hermes
+#     的 WAL-reset 门（安全窗口 [3.44.6,3.45.0) ∪ [3.50.7,3.51.0) ∪ ≥3.51.3）
+#     → state.db 降级成 journal_mode=DELETE（写并发/持久性变差），且 doctor 的
+#     FTS 探针用 3.42+ 才有的 `flush` 命令 → 它报「FTS 损坏」是假阳性。
+#     PBS 自带 CPython 静态内嵌 SQLite —— 实测 cpython-3.12.14 = **3.53.1**，达标。
+#   · 安装期零联网：不必在 NAS 上 uv 建 venv 装依赖（代理/镜像那套复杂度一并消失）。
+#   · 不绑应用中心 Python 路径：用户卸载/升级 python312 不会让 venv 失效。
+#   代价：包体积大一个数量级（~127MB → ~500MB）。
 #
-# 想改回「自带 CPython、运行期零联网」：设 HERMES_USE_SYSTEM_PYTHON=0。
-PY_VERSION="${HERMES_PY_VERSION:-3.14.7}"
+# 想改回「复用系统 Python」：设 HERMES_USE_SYSTEM_PYTHON=1（商店装 Python 3.12，
+#   安装时在 NAS 上建 venv 装依赖 —— 会重新受系统 SQLite 3.40.1 拖累）。
+#
+# ⚠ 上游 stable（v2026.9.24）要求 >=3.11,<3.14 → 只能 3.11 / 3.12 / 3.13（3.14 超范围）。
+#   3.12.14 是上游实测主力版本：48 个依赖全部有 cp312 manylinux wheel、零源码编译。
+PY_VERSION="${HERMES_PY_VERSION:-3.12.14}"
 PBS_TAG="${HERMES_PBS_TAG:-20260929}"     # 自带模式下的 PBS 标签
 PBS_CACHE="${PKG_DIR}/.cache"
 mkdir -p "${PBS_CACHE}"
@@ -153,10 +162,10 @@ pbs_url() {
 }
 
 PBS_TGZ="${PBS_CACHE}/cpython-${PY_VERSION}-${PBS_TRIPLE}.tar.gz"
-if [ "${HERMES_USE_SYSTEM_PYTHON:-1}" = "1" ]; then
+if [ "${HERMES_USE_SYSTEM_PYTHON:-0}" = "1" ]; then
     # 复用系统 Python（飞牛应用中心的 3.12）：不打包 CPython，运行期用
     # NAS 上现成的 python3 建 venv。构建机只需能跑 python3 来抽依赖清单/写 stamp。
-    echo "[build] 系统 Python 模式（默认）：跳过打包 CPython，安装时在 NAS 上建 venv"
+    echo "[build] 系统 Python 模式（HERMES_USE_SYSTEM_PYTHON=1）：跳过打包 CPython，安装时在 NAS 上建 venv"
     PYBIN="$(command -v python3 || command -v python)"
     [ -n "${PYBIN}" ] || { echo "✗ 本机找不到 python3（构建脚本自用）"; exit 1; }
     "${PYBIN}" --version
@@ -209,7 +218,7 @@ PY
 [ -s "${DEPS_TXT}" ] || { echo "✗ 依赖清单抽取失败（${DEPS_TXT}）"; exit 1; }
 echo "[build] 依赖条数：$(grep -c . "${DEPS_TXT}")"
 
-if [ "${HERMES_USE_SYSTEM_PYTHON:-1}" = "1" ]; then
+if [ "${HERMES_USE_SYSTEM_PYTHON:-0}" = "1" ]; then
     echo "[build] 系统 Python 模式：跳过构建期依赖安装（依赖清单已随包，安装时 uv 装）"
 else
 echo "[build] 安装 Python 依赖（core + [web]）→ site-packages"
@@ -495,7 +504,7 @@ if grep -rn -e '{port}' -e '{display_name}' "${APP_DIR}/ui" > /dev/null 2>&1; th
     echo "✗ ui/ 里仍有 {port} / {display_name} 占位符 → 桌面图标会点了没反应"
     exit 1
 fi
-if [ "${HERMES_USE_SYSTEM_PYTHON:-1}" = "1" ]; then
+if [ "${HERMES_USE_SYSTEM_PYTHON:-0}" = "1" ]; then
     [ -f "${RT}/.use-system-python" ] || { echo "✗ 系统 Python 模式缺标记文件"; exit 1; }
     [ -f "${RT}/deps.txt" ] || { echo "✗ 系统 Python 模式缺依赖清单 runtime/deps.txt"; exit 1; }
 else

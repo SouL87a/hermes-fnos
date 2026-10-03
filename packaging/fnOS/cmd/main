@@ -3,11 +3,12 @@
 ### Hermes Agent —— 飞牛 fnOS 服务生命周期
 ###
 ### 原生应用，两种运行时模式（构建时定）：
-###  - 系统 Python 模式（默认）：安装时在 NAS 上建 venv（${TRIM_PKGVAR}/venv），
-###    解释器取自应用中心「Python 3.12」，依赖装进该 venv。
-###  - 自带 CPython 模式：依赖预装进包内 python-build-standalone 的 site-packages，
-###    运行期零联网；不用 venv（venv 的 pyvenv.cfg/符号链接带构建机绝对路径，
-###    装到 NAS 后路径变化会失效）。
+###  - 自带 CPython 模式（默认）：依赖预装进包内 python-build-standalone 的
+###    site-packages，运行期零联网；不用 venv（venv 的 pyvenv.cfg/符号链接带构建机
+###    绝对路径，装到 NAS 后路径变化会失效）。自带 SQLite 较新，WAL 正常。
+###  - 系统 Python 模式：安装时在 NAS 上建 venv（${TRIM_PKGVAR}/venv），
+###    解释器取自应用中心「Python 3.12」，依赖装进该 venv。（系统 libsqlite3 偏旧
+###    → WAL 会被 Hermes 降级成 DELETE，doctor 报假 FTS 损坏，故不作默认。）
 ### 两种模式都不需要在运行期 pip；web_dist 已预构建（--skip-build）。
 ### 形态：hermes dashboard（FastAPI+uvicorn，仅绑 127.0.0.1）+
 ###        gateway-proxy.py（监听 Unix Socket，反代到回环端口）。
@@ -51,10 +52,10 @@ SRC_DIR="${APP_DIR}/runtime/hermes"
 ### 都是错的路径。凡是需要引用本脚本自身的地方，一律用下面这两个变量。
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 APP_CTL_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
-### 两种运行时模式：
-###  - 打包模式（默认）：自带 CPython，PY=runtime/python/bin/python3，依赖在其 site-packages。
-###  - 系统 Python 模式：构建时放了 .use-system-python 标记，安装时在 NAS 上建
-###    venv（${TRIM_PKGVAR}/venv，路径是本机的、可移植性没问题），依赖装在里面。
+### 两种运行时模式（由构建时的标记文件决定）：
+###  - 自带 CPython（默认）：PY=runtime/python/bin/python3，依赖在其 site-packages。
+###  - 系统 Python 模式：存在 .use-system-python 标记时用 NAS 上现建的
+###    venv（${TRIM_PKGVAR}/venv，路径是本机的、可移植性没问题）。
 if [ -f "${APP_DIR}/runtime/.use-system-python" ]; then
     PY="${TRIM_PKGVAR}/venv/bin/python3"
 else
