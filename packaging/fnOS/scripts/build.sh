@@ -432,24 +432,30 @@ cp "${HERE}/web-build.mjs" "${RT}/web-build.mjs"
 if [ "${SKIP_TUI:-0}" = "1" ] && [ -f "${SRC}/hermes_cli/tui_dist/entry.js" ]; then
     echo "[build] --skip-tui：复用已有 tui_dist"
 else
+    # TUI 构建入口随上游布局而变：
+    #   canary/main → scripts/build/tui.mjs（自定义，--source/--out 参数）
+    #   stable      → ui-tui/scripts/build.mjs（在工作区内构建到 ui-tui/dist）
+    mkdir -p "${SRC}/hermes_cli/tui_dist"
     if [ -f "${SRC}/scripts/build/tui.mjs" ]; then
-        echo "[build] 构建 TUI bundle（上游 scripts/build/tui.mjs）"
-        # --out 必须在源码树外（上游 productOutput 校验：树内路径会被当作构建输入）
+        echo "[build] 构建 TUI bundle（scripts/build/tui.mjs）"
         TUI_OUT="${PKG_DIR}/.cache/tui-out"
         rm -rf "${TUI_OUT}"
         ( cd "${SRC}" && node scripts/build/tui.mjs --source "${SRC}" \
             --out "${TUI_OUT}" ) \
           || { echo "✗ TUI 构建失败"; exit 1; }
-        mkdir -p "${SRC}/hermes_cli/tui_dist"
         if [ -f "${TUI_OUT}/dist/entry.js" ]; then
             cp "${TUI_OUT}/dist/entry.js" "${SRC}/hermes_cli/tui_dist/entry.js"
-        elif [ -f "${SRC}/ui-tui/dist/entry.js" ]; then
-            cp "${SRC}/ui-tui/dist/entry.js" "${SRC}/hermes_cli/tui_dist/entry.js"
-        else
-            echo "✗ TUI 构建未产出 entry.js"; exit 1
         fi
+    elif [ -f "${SRC}/ui-tui/scripts/build.mjs" ]; then
+        echo "[build] 构建 TUI bundle（ui-tui/scripts/build.mjs）"
+        ( cd "${SRC}/ui-tui" && node scripts/build.mjs ) \
+          || echo "⚠ TUI 构建失败（不阻断，对话页终端将不可用）"
     else
-        echo "⚠ 上游无 scripts/build/tui.mjs，跳过 TUI 构建（对话页终端将不可用）"
+        echo "⚠ 上游无 TUI 构建脚本，跳过（对话页终端将不可用）"
+    fi
+    # 兜底：把 ui-tui/dist/entry.js 复制到 hermes_cli/tui_dist/（上游查找位置之一）
+    if [ ! -f "${SRC}/hermes_cli/tui_dist/entry.js" ] && [ -f "${SRC}/ui-tui/dist/entry.js" ]; then
+        cp "${SRC}/ui-tui/dist/entry.js" "${SRC}/hermes_cli/tui_dist/entry.js"
     fi
 fi
 if [ -f "${SRC}/hermes_cli/tui_dist/entry.js" ]; then

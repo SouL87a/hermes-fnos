@@ -1,102 +1,98 @@
-// Hermes 前端构建 —— 跳过 TypeScript 全量类型检查，只跑 vite 打包。
+// Hermes 前端构建 —— 直接调 vite，并注入 fnOS 网关前缀（base）。
 //
-// 为什么需要这个：上游 scripts/build/web.mjs 在打包前会跑一遍 tsc solution
-// builder 做**全量类型检查**。该检查只做校验、不产出任何文件，对 web_dist 无
-// 影响；但大型 React 项目上极慢（实测十几分钟，且进程内跑、无输出、易被误判卡死）。
-// 这里复用上游的 frontend-common / freshness 辅助函数，保证产物布局与上游一致。
+// 为什么不用上游的构建入口：
+//   · canary/main 走 scripts/build/web.mjs（自定义、带图标/freshness 机制）；
+//   · stable（如 v2026.9.24）根本没有 scripts/build/，web 的 build 就是
+//     `tsc -b && vite build`，而 tsc 全量类型检查很慢且对产物无影响。
+//   为了让本包对两种上游布局都成立，这里直接 import vite 并调用 build()，
+//   只依赖 vite 本身与 web/vite.config.ts。
 //
 // 由 build.sh 复制到源码树根后执行（node .hermes-web-build.mjs）。
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
-import path from 'node:path'
-import { pathToFileURL } from 'node:url'
-import { productOutput, workspaceTool, withProduct } from './scripts/build/frontend-common.mjs'
-import { recordProduct, buildInputs } from './scripts/build/freshness.mjs'
+import path from "node:path"
+import { pathToFileURL } from "node:url"
+import { createRequire } from "node:module"
 
 const source = process.cwd()
-const out = path.join(source, 'hermes_cli/web_dist')
+const root = path.join(source, "web")
+const out = path.join(source, "hermes_cli", "web_dist")
+const BASE = process.env.HERMES_WEB_BASE || "/app/hermes/"
 
-const publicIcons = path.join(source, 'web/public')
-if (!existsSync(path.join(publicIcons, 'favicon.ico'))) {
-  throw new Error(`缺少图标：${path.join(publicIcons, 'favicon.ico')}`)
+if (!existsSync(path.join(root, "package.json"))) {
+  throw new Error(`不是 web 工作区：${root}`)
 }
 
-const root = path.join(source, 'web')
-const inputs = buildInputs(source, 'web', { icons: publicIcons })
-const { build } = await import(pathToFileURL(workspaceTool(source, 'web', 'vite')).href)
+// 从 web 工作区解析 vite（npm workspaces 会提升到根 node_modules，两种都试）
+function resolveVite() {
+  for (const base of [root, source]) {
+    try {
+      const req = createRequire(path.join(base, "noop.js"))
+      return req.resolve("vite")
+    } catch { /* 继续试下一个 */ }
+  }
+  throw new Error("找不到 vite（请先 npm install --workspace web）")
+}
 
-await withProduct(out, async (productDir, scratchDir) => {
-  const publicDir = path.join(scratchDir, 'public')
-  mkdirSync(publicDir, { recursive: true })
-  if (existsSync(path.join(root, 'public'))) {
-    cpSync(path.join(root, 'public'), publicDir, { recursive: true })
-  }
-  cpSync(publicIcons, publicDir, { recursive: true })
-  await build({
-    root,
-    configFile: path.join(root, 'vite.config.ts'),
-    configLoader: 'runner',
-    cacheDir: path.join(scratchDir, 'vite-cache'),
-    publicDir,
-    // ⚠ 关键：设置 Vite 的 base 为 fnOS 网关前缀。
-    //
-    // 上游 vite.config.ts 没有配 base，产物里 base 被编译成 "/"：
-    //   react-vendor 里  Xt = function(e){ return `/` + e }
-    //   index-*.js 里    import(`./ChatPage-xxx.js`)  ← 相对路径，靠 Xt 拼接
-    // 于是懒加载路由（对话 / SYSTEM）请求 /assets/...（站点根）→ 404 → 黑屏。
-    //
-    // 注意：路由与 API 走的是运行时 window.__HERMES_BASE_PATH__（由服务端依据
-    // X-Forwarded-Prefix 注入），那部分是好的；坏的只有静态资源 base，
-    // 而它只能在**编译时**确定 —— 所以必须在这里传。
-    base: process.env.HERMES_WEB_BASE || '/app/hermes/',
-    build: { outDir: productDir, emptyOutDir: true },
-  })
-  if (!existsSync(path.join(productDir, 'index.html'))) {
-    throw new Error('Web 构建未产出 index.html')
-  }
-  recordProduct({ source, product: 'web', out: productDir, inputs })
-}, { source })
+// public 目录：stable 下 web/public 已有 favicon/fonts，直接用它
+const publicDir = path.join(root, "public")
+if (!existsSync(publicDir)) mkdirSync(publicDir, { recursive: true })
+
+const vitePath = resolveVite()
+const { build } = await import(pathToFileURL(vitePath).href)
+
+await build({
+  root,
+  configFile: path.join(root, "vite.config.ts"),
+  // configLoader: 'bundle'（vite 默认）—— stable 的 vite.config.ts 里既有
+  // require/__dirname（CJS 风格）又有顶层 await，'runner' 会报
+  // ERR_AMBIGUOUS_MODULE_SYNTAX；'bundle' 先把配置打包再执行，两种都吃。
+  configLoader: "bundle",
+  publicDir,
+  // ⚠ 关键：注入 fnOS 网关前缀。
+  // 上游 vite.config.ts 没配 base → 产物里 base 编译成 "/"，
+  // JS 里的懒加载 chunk 会请求 /assets/...（站点根）→ 404 → 黑屏。
+  base: BASE,
+  build: {
+    outDir: out,
+    emptyOutDir: true,
+  },
+})
+
+if (!existsSync(path.join(out, "index.html"))) {
+  throw new Error("Vite 未产出 index.html")
+}
+
+console.log(`[web-build] vite 构建完成，base=${BASE}`)
 
 // ── 修复：xterm.css 静态引入 index.html ──────────────────────
-//
-// 背景：ChatPage / HermesConsoleModal 里 `import "@xterm/xterm/css/xterm.css"`，
-// 而上游 vite.config.ts 有一条 codeSplitting 规则把 @xterm/* 强制拆成独立
-// `xterm` chunk。于是这份 CSS 由 JS 的 __vitePreload 动态建 <link>，而该 helper
-// 用 `url.endsWith(".css")` 判断是否按样式表加载 —— URL 一旦带查询串
-// （如缓存破坏用的 ?v=2），判断失败 → link 变成 rel="modulepreload" → 只预取
-// 不应用 → xterm.css 从未生效 → 终端顶部出现一行乱码（xterm 的字符测量元素
-// 未被 CSS 隐藏）。
-//
-// 这里在 index.html 里**静态**引入该 chunk（方案 C）：走浏览器原生的
-// <link rel="stylesheet">，彻底绕开 __vitePreload 那条脆弱路径。
-// 幂等：已存在则跳过。注意 href 用 "/assets/" 开头 —— gateway-proxy 的
-// rewrite_html_prefix 会按前缀改写成 "/app/hermes/assets/"。
-const assetsDir = path.join(out, 'assets')
-const indexPath = path.join(out, 'index.html')
-let html = readFileSync(indexPath, 'utf8')
+// 上游 codeSplitting 把 @xterm/* 拆成独立 chunk，其 CSS 由 __vitePreload 动态加载；
+// 该 helper 用 endsWith('.css') 判断，URL 带 query 即失效 → rel=modulepreload
+// → 样式不应用 → 终端顶部一行乱码。静态引入可绕开这条脆弱路径。
+const assetsDir = path.join(out, "assets")
+const indexPath = path.join(out, "index.html")
+let html = readFileSync(indexPath, "utf8")
 
-if (!html.includes('hermes-xterm-css-fix')) {
+if (!html.includes("hermes-xterm-css-fix")) {
   const xtermCssFiles = existsSync(assetsDir)
     ? readdirSync(assetsDir).filter(f => /^xterm-.*\.css$/.test(f))
     : []
   if (xtermCssFiles.length > 0) {
-    // ⚠ 直接用**带前缀的**路径，不要写 "/assets/" 后靠服务端兜底改写 ——
-    // 兜底列表是逐条列举的，将来新 chunk 落进去就可能静默 404。
-    // 这里的 base 与 index.html 里其它资源保持一致。
-    const base = (process.env.HERMES_WEB_BASE || '/app/hermes/').replace(/\/+$/, '')
+    const base = BASE.replace(/\/+$/, "")
     const tags = xtermCssFiles
       .map(f => `<link rel="stylesheet" crossorigin href="${base}/assets/${f}" data-hermes-xterm-css-fix>`)
-      .join('\n    ')
-    html = html.replace('</head>', `  ${tags}\n  </head>`)
-    writeFileSync(indexPath, html)
-    console.log(`[web-build] xterm CSS 已静态引入 index.html: ${base}/assets/${xtermCssFiles.join(', ')}`)
-  } else {
-    console.log('[web-build] 无独立 xterm CSS chunk（已并入入口或不存在）')
+      .join("\n    ")
+    html = html.replace("</head>", `  ${tags}\n  </head>`)
+    writeFileSync(indexPath, html, "utf8")
+    console.log(`[web-build] xterm CSS 已静态引入: ${xtermCssFiles.join(", ")}`)
   }
 }
 
-// 自检：资源 URL 不应带查询串（否则 __vitePreload 的 .css 判断会失效）
-if (html.includes('?v=')) {
-  console.warn('[web-build] ⚠ index.html 里出现 ?v= 查询串（会破坏 CSS 懒加载判断）')
+// 自检
+if (html.includes("?v=")) {
+  console.warn("[web-build] ⚠ index.html 里出现 ?v= 查询串（会破坏 CSS 懒加载判断）")
+}
+if (!html.includes(`${BASE.replace(/\/+$/, "")}/assets/`)) {
+  throw new Error(`产物未带 ${BASE} 前缀 —— base 注入失败，装上去会黑屏`)
 }
 
-console.log('WEB_DIST_OK')
+console.log("WEB_DIST_OK")

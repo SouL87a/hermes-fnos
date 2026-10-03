@@ -36,23 +36,42 @@ if [ -f "${RUNTIME}/.use-system-python" ]; then
     VENV_DIR="${TRIM_PKGVAR}/venv"
     echo "系统 Python 模式：创建 venv 并安装依赖（需联网）…" >> "${TRIM_PKGVAR}/info.log"
 
+    ### Python 解释器候选（按优先级）：
+    ###   1. 应用中心的 python312（实测 = Python 3.12.4，真名就是 python312）
+    ###   2. 系统 /usr/bin/python3（实测 3.11.2）
+    ###   3. PATH 上的 python3
+    ### 版本必须落在上游 stable 的 >=3.11,<3.14 内。
+    ### ⚠ 不能只看 /usr/bin/python3 —— 它可能是 3.11.2，虽能过版本校验，
+    ###   但用户明明装了 python312 却用不上（第三轮实机报告指出）。
     SYS_PY=""
-    for cand in /usr/bin/python3 /usr/local/bin/python3 "$(command -v python3 2>/dev/null)"; do
-        [ -n "${cand}" ] && [ -x "${cand}" ] && { SYS_PY="${cand}"; break; }
+    PY_CANDS="/vol1/@appcenter/python312/bin/python3"
+    for d in /vol*/@appcenter/python3*/bin/python3; do
+        [ -e "${d}" ] && PY_CANDS="${PY_CANDS} ${d}"
+    done
+    PY_CANDS="${PY_CANDS} /var/apps/python312/target/bin/python3"
+    PY_CANDS="${PY_CANDS} /usr/bin/python3 /usr/local/bin/python3"
+    _path_py="$(command -v python3 2>/dev/null)"
+    [ -n "${_path_py}" ] && PY_CANDS="${PY_CANDS} ${_path_py}"
+
+    for cand in ${PY_CANDS}; do
+        [ -n "${cand}" ] && [ -x "${cand}" ] || continue
+        # 版本校验：上游 stable 要求 >=3.11,<3.14
+        if "${cand}" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] < (3,14) else 1)' 2>/dev/null; then
+            SYS_PY="${cand}"
+            break
+        fi
     done
     if [ -z "${SYS_PY}" ]; then
-        echo "未找到系统 python3，请先在飞牛安装 Python 3.11+（应用中心）" > "${TRIM_TEMP_LOGFILE}"
+        echo "未找到合适的 Python（需 3.11–3.13）。请在飞牛应用中心安装「Python 3.12」后重试。" > "${TRIM_TEMP_LOGFILE}"
         exit 1
     fi
-    # 版本校验：上游要求 >=3.11,<3.15
-    if ! "${SYS_PY}" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] < (3,15) else 1)'; then
-        echo "系统 Python 版本不符（需 3.11–3.14）：$("${SYS_PY}" --version 2>&1)" > "${TRIM_TEMP_LOGFILE}"
-        exit 1
-    fi
+    echo "系统 Python 模式：使用 ${SYS_PY} ($("${SYS_PY}" --version 2>&1))" >> "${TRIM_PKGVAR}/info.log"
 
-    # uv：优先系统/包内已有的，否则联网装
+    # uv：优先用 PM store 里已有的（实测 /vol1/@appdata/hermes/tools/uv-*/uv），
+    # 其次包内/系统，最后才联网安装 —— 尽量避开安装期硬联网。
     UV=""
-    for cand in "${TRIM_PKGVAR}/bin/uv" "$(command -v uv 2>/dev/null)"; do
+    for cand in "${RUNTIME}/bin/uv" "${TRIM_PKGVAR}/bin/uv" \
+                /vol*/@appdata/hermes/tools/uv-*/uv "$(command -v uv 2>/dev/null)"; do
         [ -n "${cand}" ] && [ -x "${cand}" ] && { UV="${cand}"; break; }
     done
     if [ -z "${UV}" ]; then
