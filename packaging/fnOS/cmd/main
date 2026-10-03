@@ -160,7 +160,19 @@ GATEWAY_WANT_FILE="${TRIM_PKGVAR}/gateway.want"   # 存在=期望运行；删除
 ###
 ### gateway_want 存在 → 持续拉起；被删除 → 循环退出（用于正常停止）。
 gateway_supervisor_loop() {
-    local ws="$1" node_env="$2"
+    local ws="$1"
+    ### node_env 不靠参数传递：runuser 分支只传了 ws，参数化会在那条路径上丢失
+    ### HERMES_NODE（上游 _tui_node_bin 会回退到 pm.ensure 卡 240 秒）。循环体自行解析。
+    local node_env="" _nb
+    if _nb="$(find_node_bin)"; then node_env="HERMES_NODE='${_nb}' \\"; fi
+    ### 退出时带走自己 spawn 的 gateway 子进程。
+    ### 为什么必须：单例保护 / stop 会 kill 掉本 supervisor，但若它正卡在 `wait`，
+    ### 那个 gateway 会成孤儿、继续占着 profile → 新 supervisor 拉的 gateway 永远
+    ### exit 75。让 supervisor 自清子进程，kill 掉 supervisor 即等于 kill 掉它的 gateway。
+    local gwpid=""
+    _gw_cleanup() { [ -n "${gwpid}" ] && kill -TERM "${gwpid}" 2>/dev/null || true; }
+    trap '_gw_cleanup; exit 0' TERM INT
+
     local GW_CMD
     GW_CMD="cd '${SRC_DIR}' && exec env \
 HOME='${DATA_DIR}' \
@@ -175,9 +187,15 @@ HERMES_BUNDLED_LOCALES='${SRC_DIR}/locales' \
 HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
 HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
+HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
 ${node_env}
 '${PY}' -m ${MODULE} gateway run --external-supervisor"
 
+    ### 退避：上游用 exit 75 表示"已有实例在服务同一 profile，请 manager 稍后重试"
+    ### （gateway/restart.py 的 GATEWAY_SERVICE_RESTART_EXIT_CODE）。若本 supervisor
+    ### 因任何原因变成非唯一（历史上就出现过双 supervisor），固定 1s 重试会把它放大成
+    ### 每秒级重启风暴。按退出码退避：75/0 走指数退避，其余（真崩溃）保持 1s 快速自愈。
+    local backoff=1
     while [ -f "${GATEWAY_WANT_FILE}" ]; do
         log_msg "supervisor: 启动 gateway"
         if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
@@ -185,27 +203,89 @@ ${node_env}
         else
             runuser -u "${TRIM_USERNAME}" -- bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
         fi
-        local gwpid=$!
+        gwpid=$!   # 赋给外层变量，trap 才能看到（不要用 local，否则脱离 trap 作用域）
         printf '%s' "${gwpid}" > "${GATEWAY_PID_FILE}"
+        local started_at; started_at="$(date +%s)"
         wait "${gwpid}" 2>/dev/null
         local rc=$?
         # 被主动停止（want 文件已删）→ 退出循环
         [ -f "${GATEWAY_WANT_FILE}" ] || break
-        log_msg "supervisor: gateway 退出 (code=${rc})，1s 后重启"
-        sleep 1
+        # 稳定跑满 60s 后复位退避（说明上次是偶发，不是持续冲突）
+        [ $(( $(date +%s) - started_at )) -ge 60 ] && backoff=1
+        case "${rc}" in
+            75|0)
+                # 已有实例在服务同一 profile / 抢单例失败 → 退避重试
+                log_msg "supervisor: gateway 退出 (code=${rc})，${backoff}s 后重试"
+                sleep "${backoff}"
+                backoff=$(( backoff < 30 ? backoff * 2 : 30 )) ;;
+            *)
+                log_msg "supervisor: gateway 退出 (code=${rc})，1s 后重启"
+                sleep 1 ;;
+        esac
     done
     rm -f "${GATEWAY_PID_FILE}"
     log_msg "supervisor: 退出"
 }
 
+### 列出所有 supervisor 循环体的 PID（去重），**排除自身与父进程**。
+### 覆盖两种 cmdline 形态：
+###  - 新版：exec 后的 `${SELF_PATH} __gateway_supervisor <ws>`
+###  - 旧版：以应用用户运行时 `gateway_supervisor_loop ... &` 只 fork 不 exec，
+###    子 shell 沿用调用者 cmdline（`cmd/main gateway-restart` / `gateway-start`）→
+###    必须按这些子命令匹配，否则 stop / 单例清理都杀不掉它，故障无法自愈（缺陷 B）。
+### ⚠ 排除自身：本函数会被 `restart_gateway`（自身 cmdline = `cmd/main gateway-restart`）
+###   调用，按该 pattern 匹配会把自己也算进去 → 自检误报 / pkill 自杀。
+supervisor_pids() {
+    local pat pid
+    for pat in \
+        "${SELF_PATH} __gateway_supervisor" \
+        "cmd/main __gateway_supervisor" \
+        "${SELF_PATH} gateway-restart" \
+        "${SELF_PATH} gateway-start" \
+        "cmd/main gateway-restart" \
+        "cmd/main gateway-start"; do
+        for pid in $(pgrep -f -- "${pat}" 2>/dev/null); do
+            [ "${pid}" = "$$" ] && continue
+            [ "${pid}" = "${PPID}" ] && continue
+            printf '%s\n' "${pid}"
+        done
+    done | sort -u
+}
+
+kill_supervisors() {
+    local pid
+    for pid in $(supervisor_pids); do
+        kill -"${1:-TERM}" "${pid}" 2>/dev/null || true
+    done
+}
+
 start_gateway_supervisor() {
-    local ws="$1" node_env="$2"
+    local ws="$1"
+
+    ### 单例保护（缺陷 A）：本函数"调用即新建"，而 gateway-restart 会被面板连点 /
+    ### 前端超时重试触发多次 → 起出多份 supervisor → 各拉一个 gateway 抢单例 →
+    ### 后起者必 exit 75 → 无限重启风暴。所以起之前先清掉已有实例。
+    ### ⚠ 清理必须放在写 want 文件【之前】：否则旧 supervisor 正卡在 `wait` 时若看到
+    ###   want 复活，会再拉一个 gateway（虽随后被我们杀掉，但那个 gateway 会成孤儿）。
+    if [ -n "$(supervisor_pids)" ]; then
+        log_msg "supervisor 已在运行，先清理旧实例再重启"
+        kill_supervisors TERM
+        sleep 1
+        kill_supervisors KILL
+    fi
     : > "${GATEWAY_WANT_FILE}"
+
+    ### 两个分支都必须 exec：fork 的子 shell 会沿用调用者 cmdline，stop 的兜底
+    ### pkill 匹配不到（缺陷 B），且 pgrep 单例检查也会误判。exec 后 cmdline 稳定为
+    ### `${SELF_PATH} __gateway_supervisor <ws>`，可被精确命中。
+    ### ⚠ `200>&-` 必须加：调用方（restart_gateway）持有 flock fd 200，fork 出的子进程
+    ###   会继承该 fd → 长命的 supervisor 会一直持有锁 → 之后每次 gateway-restart 都
+    ###   拿不到锁、静默 no-op（网关再也重启不了）。子进程主动关闭该 fd 即释放锁。
     if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
-        gateway_supervisor_loop "${ws}" "${node_env}" >> "${LOG_FILE}" 2>&1 &
+        bash -c "exec '${SELF_PATH}' __gateway_supervisor '${ws}'" >> "${LOG_FILE}" 2>&1 200>&- &
     else
         runuser -u "${TRIM_USERNAME}" -- bash -c \
-            "exec '${SELF_PATH}' __gateway_supervisor '${ws}'" >> "${LOG_FILE}" 2>&1 &
+            "exec '${SELF_PATH}' __gateway_supervisor '${ws}'" >> "${LOG_FILE}" 2>&1 200>&- &
     fi
     log_msg "启动消息网关 supervisor (pid=$!)"
 }
@@ -266,6 +346,7 @@ HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
 HERMES_WEB_DIST='${WEB_DIST}' \
 HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
+HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
 ${NODE_ENV}
 '${PY}' -m ${MODULE} dashboard --host 127.0.0.1 --port '${PORT}' --no-open --skip-build"
 
@@ -308,7 +389,7 @@ HERMES_GATEWAY_DEBUG='1' \
     # 由本脚本当 supervisor（--external-supervisor 的语义就是"退出后交还给
     # manager 重启"）：gateway 退出就拉起，这样 dashboard 的「重启网关」才有意义
     # （见下面 supervisor 循环）。
-    start_gateway_supervisor "${ws}" "${NODE_ENV}"
+    start_gateway_supervisor "${ws}"
 
     # 就绪：TCP 回环监听 + Unix Socket
     local i=0
@@ -373,10 +454,10 @@ stop_process() {
         pkill -KILL -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
     fi
     # supervisor 循环体本身（bash 跑 gateway_supervisor_loop）也按 cmd/main 路径兜底。
-    # 用 SELF_PATH（真实路径）—— APP_DIR/cmd/main 不存在，永不命中。
-    pkill -TERM -f -- "${SELF_PATH} __gateway_supervisor" 2>/dev/null || true
-    # 兼容：万一被别处用不同路径调用（符号链接等），放宽匹配子串
-    pkill -TERM -f -- "cmd/main __gateway_supervisor" 2>/dev/null || true
+    # kill_supervisors 同时覆盖 exec 形态与历史遗留的 fork 子 shell（缺陷 B）。
+    kill_supervisors
+    sleep 1
+    kill_supervisors   # 二次确保 fork 子 shell 也被清掉
     rm -f "${GATEWAY_SOCKET}"
 
     log_msg "process stopped"
@@ -421,12 +502,26 @@ do_update() {
 ### 单独重启消息网关（供代理的重启端点调用）：
 ### 删 want 文件让 supervisor 循环退出，再写回 want 文件 + 杀掉当前 gateway，
 ### supervisor 会自动拉起新的。不动 dashboard / 代理。
-restart_gateway() {
-    local ws node_env="" nb
-    ws="$(resolve_workspace)"
-    if nb="$(find_node_bin)"; then node_env="HERMES_NODE='${nb}' \\"; fi
+### 防重入锁（缺陷 E）：gateway-{restart,start,stop} 全程无锁、restart 耗时可达
+### 15s+，面板连点或前端超时重试会并发进入 → 起出多份 supervisor。flock 串行化。
+### ⚠ 无 flock 时退化为"无锁"而非"直接返回"：否则漏装 util-linux 的机器上整个
+### 操作会变成静默 no-op。每次调用是独立进程，复用同一个 fd 200 没问题。
+acquire_gateway_lock() {
+    command -v flock > /dev/null 2>&1 || return 0
+    mkdir -p "${TRIM_PKGVAR}"
+    exec 200>"${TRIM_PKGVAR}/gateway-restart.lock" || return 0
+    flock -n 200 || return 1
+    return 0
+}
 
-    # 停：删 want → 杀 gateway → 等 supervisor 退出
+restart_gateway() {
+    acquire_gateway_lock || { log_msg "gateway-restart 已在执行中，忽略本次重复调用"; return 0; }
+
+    local ws
+    ws="$(resolve_workspace)"
+
+    # 停：删 want → 杀 gateway → 等 supervisor 退出。
+    # node_env 不再在这里算：supervisor 循环体自行解析 HERMES_NODE（修缺陷 D）。
     rm -f "${GATEWAY_WANT_FILE}"
     local gpid
     gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
@@ -440,28 +535,29 @@ restart_gateway() {
     done
     pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
 
-    # 起：写回 want → 重启 supervisor
-    start_gateway_supervisor "${ws}" "${node_env}"
+    # 起：写回 want → 重启 supervisor（start_gateway_supervisor 自带单例清理）
+    start_gateway_supervisor "${ws}"
     log_msg "gateway restart 完成"
     return 0
 }
 
 ### 仅启动消息网关（不停 dashboard / 代理）。供代理的 /api/gateway/start 调用。
 start_gateway_only() {
-    local ws node_env="" nb
+    acquire_gateway_lock || { log_msg "gateway 操作已在执行中，忽略本次 start"; return 0; }
+    local ws
     ws="$(resolve_workspace)"
-    if nb="$(find_node_bin)"; then node_env="HERMES_NODE='${nb}' \\"; fi
     if [ -f "${GATEWAY_WANT_FILE}" ] && pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
         log_msg "gateway 已在运行"
         return 0
     fi
-    start_gateway_supervisor "${ws}" "${node_env}"
+    start_gateway_supervisor "${ws}"
     log_msg "gateway start 完成"
     return 0
 }
 
 ### 仅停止消息网关（不停 dashboard / 代理）。供代理的 /api/gateway/stop 调用。
 stop_gateway_only() {
+    acquire_gateway_lock || { log_msg "gateway 操作已在执行中，忽略本次 stop"; return 0; }
     rm -f "${GATEWAY_WANT_FILE}"
     local gpid
     gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
@@ -474,6 +570,9 @@ stop_gateway_only() {
         i=$((i + 1))
     done
     pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
+    # 显式清 supervisor：want 已删、gateway 已杀，它没有需要优雅清理的东西；
+    # 且它可能正卡在退避 sleep（TERM 的 trap 要等 sleep 结束才跑，最长 30s）→ 用 KILL 立即生效。
+    kill_supervisors KILL
     rm -f "${GATEWAY_PID_FILE}"
     log_msg "gateway stop 完成"
     return 0
