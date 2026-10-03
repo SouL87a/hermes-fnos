@@ -65,6 +65,14 @@ WEB_DIST="${APP_DIR}/runtime/web_dist"
 GATEWAY_SOCKET="${APP_DIR}/hermes.sock"
 GATEWAY_PROXY="${APP_DIR}/gateway-proxy.py"
 DATA_DIR="${TRIM_PKGVAR}"
+### 可选依赖的懒安装目标（TTS/STT/Bedrock 等首次使用时才装）。
+### 为什么必须显式给：自带 CPython 不是 venv，而 Hermes 的懒安装默认走
+### `uv pip install`（uv 无 venv 时会拒绝："No virtual environment found"），
+### 且它会强制设 VIRTUAL_ENV=<解释器上级>，连 UV_SYSTEM_PYTHON 都压不住、还会
+### 试图写只读的 TRIM_APPDEST（实测均失败）。设了这个变量后，上游改走
+### `uv pip install --target <此目录>`（上游明确为"非 venv 部署"设计，带 ABI 戳
+### 校验）—— 不需要 venv，且落在可写的数据目录。实测 --target 路径 exit=0。
+LAZY_SITE="${DATA_DIR}/site-packages"
 
 ### 进程识别：绝对路径匹配，不误伤其他 python。
 ### ⚠ 系统 Python 模式下 dashboard 的 argv[0] 是 ${TRIM_PKGVAR}/venv/bin/python3，
@@ -177,7 +185,7 @@ gateway_supervisor_loop() {
     local GW_CMD
     GW_CMD="cd '${SRC_DIR}' && exec env \
 HOME='${DATA_DIR}' \
-PYTHONPATH='${SRC_DIR}' \
+PYTHONPATH='${SRC_DIR}:${LAZY_SITE}' \
 PYTHONUNBUFFERED=1 \
 PYTHONDONTWRITEBYTECODE=1 \
 HERMES_HOME='${DATA_DIR}' \
@@ -188,6 +196,7 @@ HERMES_BUNDLED_LOCALES='${SRC_DIR}/locales' \
 HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
 HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
+HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
 HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
 ${node_env}
 '${PY}' -m ${MODULE} gateway run --external-supervisor"
@@ -314,7 +323,7 @@ start_process() {
 
     local ws
     ws="$(resolve_workspace)"
-    mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "$(dirname "${PID_FILE}")"
+    mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "${LAZY_SITE}" "$(dirname "${PID_FILE}")"
     rm -f "${GATEWAY_SOCKET}"
 
     log_msg "Starting Hermes dashboard (gateway + loopback port) ..."
@@ -335,7 +344,7 @@ start_process() {
     local CMD
     CMD="cd '${SRC_DIR}' && exec env \
 HOME='${DATA_DIR}' \
-PYTHONPATH='${SRC_DIR}' \
+PYTHONPATH='${SRC_DIR}:${LAZY_SITE}' \
 PYTHONUNBUFFERED=1 \
 PYTHONDONTWRITEBYTECODE=1 \
 HERMES_HOME='${DATA_DIR}' \
@@ -347,6 +356,7 @@ HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
 HERMES_WEB_DIST='${WEB_DIST}' \
 HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
+HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
 HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
 ${NODE_ENV}
 '${PY}' -m ${MODULE} dashboard --host 127.0.0.1 --port '${PORT}' --no-open --skip-build"
