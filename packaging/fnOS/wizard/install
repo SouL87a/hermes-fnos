@@ -27,5 +27,14 @@
         ]
       }
     ]
+  },
+  {
+    "stepTitle": "浏览器自动化（可选，按需装）",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "本包不含 Chromium（约 150–400 MB，多数人用不到），所以「浏览器 / 网页自动化」类工具默认不可用——doctor 里 browser-cdp / computer_use 显示「system dependency not met」属预期，不是故障。\n\n需要时再装：打开 Hermes 控制台 → 执行 hermes tools → 选 Browser Automation → 按提示安装 Chromium。装完浏览器类工具即可用。\n\n不装不影响主模型对话、定时任务等核心功能。"
+      }
+    ]
   }
 ]
