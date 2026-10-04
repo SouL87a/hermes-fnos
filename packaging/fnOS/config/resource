@@ -11,7 +11,9 @@
   },
   "usr-local-linker": {
     "bin": [
-      "bin/hermes-update"
+      "bin/hermes",
+      "bin/hermes-update",
+      "bin/rg"
     ]
   }
 }

@@ -495,6 +495,80 @@ PY="${DATA}/venv/bin/python3"
 exec env HERMES_APP_ROOT="${APP_DIR}" HERMES_DATA_ROOT="${DATA}" "${PY}" "${APP_DIR}/hermes-update.py" "$@"
 WRAP
 chmod 755 "${APP_DIR}/bin/hermes-update"
+# hermes CLI：usr-local-linker 会把 app/bin/hermes 链接进 PATH，
+# 于是 SSH 里可直接 `hermes doctor` / `hermes setup` / `hermes model` …
+# 不加它，doctor 输出里的所有「run 'hermes …'」建议都不可执行（command not found）。
+# 环境变量与 cmd/main 组装的 dashboard/gateway 启动环境保持一致（同一套 HERMES_*）。
+cat > "${APP_DIR}/bin/hermes" <<'WRAP'
+#!/bin/bash
+# Hermes CLI（fnOS）。转发到包内 launcher，环境与 cmd/main 一致。
+APP_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+DATA="${TRIM_PKGVAR:-/var/apps/hermes/var}"
+SRC="${APP_DIR}/runtime/hermes"
+# 解释器优先级：系统 Python 模式（NAS 上建的 venv）→ 自带 CPython → PATH
+PY="${DATA}/venv/bin/python3"
+[ -x "${PY}" ] || PY="${APP_DIR}/runtime/python/bin/python3"
+[ -x "${PY}" ] || PY="$(command -v python3)"
+# node：TUI 终端需要。优先应用中心的 nodejs（v22/v24），跨卷兜底。
+NODE=""
+for d in /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node \
+         /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node; do
+    [ -x "${d}" ] && { NODE="${d}"; break; }
+done
+[ -n "${NODE}" ] || NODE="$(command -v node 2>/dev/null || true)"
+# 先 export（env 会继承环境，避免在 env 参数位用 ${VAR:+…} 的引号陷阱）
+[ -n "${NODE}" ] && export HERMES_NODE="${NODE}"
+exec env \
+  HOME="${DATA}" \
+  PYTHONPATH="${SRC}:${DATA}/site-packages" \
+  PYTHONUNBUFFERED=1 \
+  PYTHONDONTWRITEBYTECODE=1 \
+  HERMES_HOME="${DATA}" \
+  HERMES_BUNDLED_SKILLS="${SRC}/skills" \
+  HERMES_OPTIONAL_SKILLS="${SRC}/optional-skills" \
+  HERMES_BUNDLED_PLUGINS="${SRC}/plugins" \
+  HERMES_BUNDLED_LOCALES="${SRC}/locales" \
+  HERMES_OPTIONAL_MCPS="${SRC}/optional-mcps" \
+  HERMES_WEB_DIST="${APP_DIR}/runtime/web_dist" \
+  HERMES_LAZY_INSTALL_TARGET="${DATA}/site-packages" \
+  "${PY}" -m hermes_cli.main "$@"
+WRAP
+chmod 755 "${APP_DIR}/bin/hermes"
+
+# ripgrep：Hermes 的 search_files 工具靠 PATH 上的 `rg`（shutil.which("rg")），
+# 缺它退化成 grep、大仓库搜索变慢。上游 install.sh 默认会装；本包打进 bin/，
+# 经 usr-local-linker 落到 /usr/local/bin。静态 musl 版，无 glibc 依赖。
+# 失败不阻断构建（rg 是可选加速项）—— 见下方按需从 resource 里摘掉 bin/rg。
+if [ "${HERMES_SKIP_RIPGREP:-0}" != "1" ]; then
+    case "${PBS_TRIPLE}" in
+        x86_64-unknown-linux-gnu)  RG_TRIPLE="x86_64-unknown-linux-musl" ;;
+        aarch64-unknown-linux-gnu) RG_TRIPLE="aarch64-unknown-linux-musl" ;;
+        *)                         RG_TRIPLE="" ;;
+    esac
+    RG_TGZ="${PBS_CACHE}/ripgrep-${RG_TRIPLE}.tar.gz"
+    if [ -n "${RG_TRIPLE}" ] && [ ! -f "${RG_TGZ}" ]; then
+        RG_URL="https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-${RG_TRIPLE}.tar.gz"
+        # 国内可设 HERMES_GH_MIRROR 走加速（与 PBS 下载同一开关）
+        RG_URL="${HERMES_GH_MIRROR:+${HERMES_GH_MIRROR}/}${RG_URL}"
+        echo "[build] 下载 ripgrep（可选）→ ${RG_URL}"
+        curl -fL --retry 3 -o "${RG_TGZ}.part" "${RG_URL}" 2>/dev/null \
+            && mv "${RG_TGZ}.part" "${RG_TGZ}" \
+            || { rm -f "${RG_TGZ}.part"; echo "[build] ⚠ ripgrep 下载失败（跳过）"; }
+    fi
+    if [ -f "${RG_TGZ}" ]; then
+        RG_TMP="$(mktemp -d)"
+        tar -xzf "${RG_TGZ}" -C "${RG_TMP}" 2>/dev/null || true
+        RG_BIN="$(find "${RG_TMP}" -type f -name rg 2>/dev/null | head -n 1)"
+        if [ -n "${RG_BIN}" ]; then
+            cp "${RG_BIN}" "${APP_DIR}/bin/rg"
+            chmod 755 "${APP_DIR}/bin/rg"
+            echo "[build] ✓ 打包 ripgrep → bin/rg ($("${APP_DIR}/bin/rg" --version 2>/dev/null | head -1 || echo '?'))"
+        else
+            echo "[build] ⚠ ripgrep 解包异常（跳过）"
+        fi
+        rm -rf "${RG_TMP}"
+    fi
+fi
 # 包根图标（fnOS 规范）
 cp "${PKG_DIR}/ui-images/icon_64.png"  "${STAGE}/ICON.PNG"
 cp "${PKG_DIR}/ui-images/icon_256.png" "${STAGE}/ICON_256.PNG"
@@ -522,6 +596,24 @@ cp -r "${PKG_DIR}/cmd"    "${STAGE}/cmd"
 cp -r "${PKG_DIR}/config" "${STAGE}/config"
 cp -r "${PKG_DIR}/wizard" "${STAGE}/wizard"
 chmod 755 "${STAGE}/cmd/"*
+
+# config/resource 里 usr-local-linker 列了 bin/hermes、bin/hermes-update、bin/rg。
+# rg 是可选下载（见步骤 5），失败时它不在 app 里 —— 此时把 "bin/rg" 从 resource
+# 摘掉，避免 linker 指向不存在的文件。hermes/hermes-update 恒存在，不动。
+# python3 在构建机必然可用（build.sh 前置就用它抽 deps.txt/写 stamp）。
+if [ ! -f "${APP_DIR}/bin/rg" ] && grep -q '"bin/rg"' "${STAGE}/config/resource"; then
+    "${PYBIN}" - "${STAGE}/config/resource" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding="utf-8"))
+bins = (d.get("usr-local-linker") or {}).get("bin") or []
+if "bin/rg" in bins:
+    bins.remove("bin/rg")
+    d["usr-local-linker"]["bin"] = bins
+open(p, "w", encoding="utf-8").write(json.dumps(d, ensure_ascii=False, indent=2) + "\n")
+PY
+    echo "[build] ⚠ 未打包 ripgrep → 已从 config/resource 移除 bin/rg"
+fi
 
 # ── 8. 打包 ──────────────────────────────────────────────────
 FINAL="${DIST}/hermes-${VERSION}.fpk"

@@ -104,7 +104,7 @@ jobs:
           tar -xzf "$FPK" app.tgz
           A="$(tar -tzf app.tgz)"
           for need in ./ui/config ./ui/images/icon_64.png ./gateway-proxy.py ./hermes-update.py \
-                      ./bin/hermes-update ./runtime/deps.txt \
+                      ./bin/hermes ./bin/hermes-update ./runtime/deps.txt \
                       ./runtime/web_dist/index.html ./runtime/web-build.mjs \
                       ./runtime/hermes/hermes_cli/__init__.py; do
             echo "$A" | grep -qx "$need" || { echo "✗ app.tgz 缺少 $need"; exit 1; }
@@ -131,6 +131,24 @@ jobs:
             ./runtime/python/bin/python3 -c "import sqlite3,sys; print('  自带 CPython SQLite:', sqlite3.sqlite_version); i=sqlite3.sqlite_version_info; sys.exit(1 if not (i<(3,7,0) or i>=(3,51,3) or (3,50,7)<=i<(3,51,0) or (3,44,6)<=i<(3,45,0)) else 0)" \
               || { echo '✗ SQLite 命中 WAL-reset 门 —— state.db 会降级 DELETE，doctor 报假 FTS 损坏'; exit 1; }
             echo '✓ SQLite 过 WAL-reset 门（WAL 可用）'
+          fi
+
+          # bin/hermes CLI shim：实跑 `bin/hermes --version`，断言 doctor 里所有
+          # "run 'hermes …'" 建议真的可执行（P0）。也确认它经 usr-local-linker 落 PATH。
+          # （runtime/python 已在上方 SQLite 检查时解出，这里复用。）
+          if echo "$A" | grep -qx "./bin/hermes"; then
+            tar -xzf app.tgz ./bin ./runtime/hermes ./runtime/web_dist
+            chmod +x ./bin/hermes
+            mkdir -p var
+            TRIM_PKGVAR="$PWD/var" ./bin/hermes --version \
+              || { echo '✗ bin/hermes --version 失败'; exit 1; }
+            # 声明在 config/resource 的 usr-local-linker.bin 里才会落 /usr/local/bin/
+            # （匹配 '"bin/hermes"' 不会误中 '"bin/hermes-update"'，因后者 hermes 后是 - 不是 "）
+            tar -xzOf "$FPK" config/resource | grep -q '"bin/hermes"' \
+              || { echo '✗ config/resource 未声明 bin/hermes（不会落 /usr/local/bin）'; exit 1; }
+            echo '✓ bin/hermes 可执行 + 已在 config/resource 声明'
+          else
+            echo '✗ app.tgz 缺少 bin/hermes（doctor 建议将不可执行）'; exit 1
           fi
 
           # 构建信息戳（commit/发行方）。⚠ 版本号不来自它：上游读源码树的
