@@ -88,7 +88,14 @@ def read_config() -> dict[str, Any]:
 
 
 def channel() -> str:
-    return str(os.environ.get("HERMES_UPDATE_CHANNEL") or read_config().get("channel") or "main").strip()
+    """更新通道。默认 **stable**（正式版 tag），与 upstream.version 钉的口径一致。
+
+    ⚠ 原默认是 "main" —— 那会让「检查更新」去比 main 分支（预发布/前沿），
+    与本包「用上游正式版」的定位矛盾（upstream.version 注释也写明按 stable
+    跟随）。要跟 main/canary 可显式设 HERMES_UPDATE_CHANNEL 或 update.json 的
+    channel。
+    """
+    return str(os.environ.get("HERMES_UPDATE_CHANNEL") or read_config().get("channel") or "stable").strip()
 
 
 def repo_url() -> str:
