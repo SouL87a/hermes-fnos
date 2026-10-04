@@ -604,6 +604,13 @@ done < <(printf '%s\n' "${BROWSER_BASE}/browsers/"*/chrome | sort -Vr)
 [ -n "${CHROME_BIN}" ] || { [ -x "${BROWSER_BASE}/chrome-current" ] && CHROME_BIN="${BROWSER_BASE}/chrome-current"; }
 [ -n "${CHROME_BIN}" ] && export AGENT_BROWSER_EXECUTABLE_PATH="${CHROME_BIN}"
 
+# TMPDIR 指向 ${WS}/tmp（工作区内）—— 自动 TTS 等把产物写进 tempdir 的流程，
+# 其路径必须落在 HERMES_WRITE_SAFE_ROOT 内，否则被写安全闸门拒绝（真机报告：
+# 自动语音回复永久失效，且失败被静默吞掉）。upstream 的 apply_scratch_tmp_env
+# 只在 TMPDIR "未设置" 时才覆盖 —— 这里显式设好即可，且它认得这是外部设置。
+mkdir -p "${WS}/tmp" 2>/dev/null || true
+export TMPDIR="${WS}/tmp" TMP="${WS}/tmp" TEMP="${WS}/tmp"
+
 # 转交 CLI。环境与 cmd/main 启动应用时保持同一套 HERMES_*
 exec env \
     HOME="${DATA_DIR}" \

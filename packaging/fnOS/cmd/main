@@ -245,6 +245,7 @@ HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
 HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
 HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
+TMPDIR='${ws}/tmp' TMP='${ws}/tmp' TEMP='${ws}/tmp' \
 ${gw_node}
 ${gw_browser}
 '${PY}' -m ${MODULE} gateway run --external-supervisor"
@@ -333,6 +334,9 @@ kill_supervisors() {
 
 start_gateway_supervisor() {
     local ws="$1"
+    # TMPDIR 指向 ${ws}/tmp（自动 TTS 等 tempdir 使用者要在写安全根内，见 env 块注释）。
+    # 本函数也能被 restart_gateway 单独调用，故在此也确保目录存在。
+    mkdir -p "${ws}/tmp" 2>/dev/null || true
 
     ### 单例保护（缺陷 A）：本函数"调用即新建"，而 gateway-restart 会被面板连点 /
     ### 前端超时重试触发多次 → 起出多份 supervisor → 各拉一个 gateway 抢单例 →
@@ -385,7 +389,7 @@ start_process() {
 
     local ws
     ws="$(resolve_workspace)"
-    mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "${LAZY_SITE}" "$(dirname "${PID_FILE}")"
+    mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "${ws}/tmp" "${LAZY_SITE}" "$(dirname "${PID_FILE}")"
     rm -f "${GATEWAY_SOCKET}"
 
     log_msg "Starting Hermes dashboard (gateway + loopback port) ..."
@@ -424,6 +428,7 @@ HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
 HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
 HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
+TMPDIR='${ws}/tmp' TMP='${ws}/tmp' TEMP='${ws}/tmp' \
 ${NODE_ENV}
 ${BROWSER_ENV}
 '${PY}' -m ${MODULE} dashboard --host 127.0.0.1 --port '${PORT}' --no-open --skip-build"

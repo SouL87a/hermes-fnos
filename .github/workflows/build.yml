@@ -216,6 +216,24 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then TAG="${GITHUB_REF_NAME}"; else TAG="v${VERSION}"; fi
+
+          # ⚠ dispatch 触发时，TAG=v<version> 通常【已存在】且可能指向旧提交 ——
+          # 那样 release 会「新 fpk 贴在旧页面上」：资产是最新的，但 Source code
+          # 与创建时间停在旧 commit（真机反馈）。非 tag 触发时把 TAG 重指到当前
+          # HEAD，保证 release 与它对应的代码一致。tag 触发时不需动（它本身就是那个 tag）。
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            CUR="$(git rev-parse "refs/tags/${TAG}" 2>/dev/null || true)"
+            if [ "${CUR}" != "${GITHUB_SHA}" ]; then
+              echo "重指 tag ${TAG}: ${CUR:-<不存在>} → ${GITHUB_SHA}"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git config user.name  "github-actions[bot]"
+              git tag -f "${TAG}" "${GITHUB_SHA}"
+              git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" "refs/tags/${TAG}"
+            else
+              echo "tag ${TAG} 已指向当前 HEAD，无需重指"
+            fi
+          fi
+
           FPK="${fpk_path:?}"; BASENAME="$(basename "$FPK")"
           SUM="$(sha256sum "$FPK" | awk '{print $1}')"
           NOTES="$(mktemp)"
