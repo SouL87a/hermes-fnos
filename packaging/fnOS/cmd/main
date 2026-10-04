@@ -133,13 +133,14 @@ port_listening() {
     grep -q ":$(printf '%04X' "${PORT}")" /proc/net/tcp 2>/dev/null
 }
 
-### 查找 node —— 对话页的 TUI 终端需要它。
+### 查找 node —— 对话页的 TUI 终端、以及 npx 驱动的流程（装浏览器 / MCP 依赖）需要它。
 ### 为什么必须显式给：上游找 node 时优先读 $HERMES_NODE；未设时它会走自己的运行时
-### 定位路径，在离线/受限环境会**长时间无输出**（实测报告缺陷 4）。应用中心装了
-### nodejs_v22 就有可用 node，直接指过去最稳。
+### 定位路径，在离线/受限环境会**长时间无输出**（实测报告缺陷 4）。
+### 优先级：Hermes 托管的 node（<data>/node/bin/node，Hermes 自己的 dep_ensure 也优先它）
+### → 应用中心的 nodejs → PATH → 跨卷兜底。
 find_node_bin() {
     local d
-    # 优先应用中心的 nodejs（v22/v24），跨卷兜底
+    [ -x "${DATA_DIR}/node/bin/node" ] && { printf '%s' "${DATA_DIR}/node/bin/node"; return 0; }
     for d in /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node \
              /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node; do
         [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
@@ -149,6 +150,43 @@ find_node_bin() {
         [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
     done
     return 1
+}
+
+### 构造 node 环境：HERMES_NODE + 把 node 目录前置进 PATH。
+### ⚠ 只设 HERMES_NODE 不够 —— npm/npx 的 shim 首行是 `#!/usr/bin/env node`，
+### env 只认 PATH，与 HERMES_NODE 无关。不把 node 目录加进 PATH，npx 驱动的流程
+### （装浏览器 / 装 MCP 依赖）会 `env: 'node': No such file or directory`，
+### 且上游会假报成功（实测报告问题 A/C）。输出形如 `HERMES_NODE='…' PATH='…'` 的
+### key='value' 串（供拼进 `exec env` 用），或空串。
+node_env() {
+    local nb
+    nb="$(find_node_bin)" || return 0
+    local ndir; ndir="$(dirname "${nb}")"
+    local newpath
+    case ":${PATH}:" in
+        *":${ndir}:"*) newpath="${PATH}" ;;
+        *)             newpath="${ndir}:${PATH}" ;;
+    esac
+    printf "HERMES_NODE='%s' PATH='%s'" "${nb}" "${newpath}"
+}
+
+### 浏览器（Chromium）环境：把 AGENT_BROWSER_EXECUTABLE_PATH 指向已安装的 chrome。
+### 为什么需要（实测报告问题 B）：`agent-browser install` 把 Chromium 装到
+### <data>/.agent-browser/browsers/chrome-*/chrome，而 Hermes 的就绪检测
+### （tools/browser_tool_install.py::_chromium_installed）只扫
+### AGENT_BROWSER_EXECUTABLE_PATH → PATH 上的 google-chrome/chromium → Playwright 的
+### <home>/.cache/ms-playwright。装的位置与找的位置不一致 → 装成功仍报「Chromium 缺失」。
+### 上游检测把本变量列第一顺位，且它指向不存在的路径时不会 fail-hard（继续往后判），
+### 所以由我们按实际安装位置指向最稳。用 glob 取最新版本目录（agent-browser 升级后
+### 自动跟上，无需人工维护软链）。未安装则输出空串。
+browser_env() {
+    local base="${DATA_DIR}/.agent-browser" p="" cand
+    for cand in "${base}/browsers/"*/chrome; do
+        [ -x "${cand}" ] && p="${cand}"
+    done
+    # 兜底：用户手工建的稳定软链（若无 chrome-* 目录）
+    [ -n "${p}" ] || { [ -x "${base}/chrome-current" ] && p="${base}/chrome-current"; }
+    [ -n "${p}" ] && printf "AGENT_BROWSER_EXECUTABLE_PATH='%s'" "${p}"
 }
 
 ### 面板入口说明（写给排查的人）：
@@ -170,10 +208,13 @@ GATEWAY_WANT_FILE="${TRIM_PKGVAR}/gateway.want"   # 存在=期望运行；删除
 ### gateway_want 存在 → 持续拉起；被删除 → 循环退出（用于正常停止）。
 gateway_supervisor_loop() {
     local ws="$1"
-    ### node_env 不靠参数传递：runuser 分支只传了 ws，参数化会在那条路径上丢失
-    ### HERMES_NODE。循环体自行解析（见 find_node_bin 的说明）。
-    local node_env="" _nb
-    if _nb="$(find_node_bin)"; then node_env="HERMES_NODE='${_nb}' \\"; fi
+    ### node 环境不靠参数传递：runuser 分支只传了 ws，参数化会在那条路径上丢失。
+    ### 循环体自行用 node_env() 解析（HERMES_NODE + PATH，见其说明）。
+    local gw_node="" _ne
+    _ne="$(node_env)" && [ -n "${_ne}" ] && gw_node="${_ne} \\"
+    # 浏览器环境（Chromium 路径）：同一个 gateway 进程要跑 browser_exec，也需要它。
+    local gw_browser="" _be
+    _be="$(browser_env)" && [ -n "${_be}" ] && gw_browser="${_be} \\"
     ### 退出时带走自己 spawn 的 gateway 子进程。
     ### 为什么必须：单例保护 / stop 会 kill 掉本 supervisor，但若它正卡在 `wait`，
     ### 那个 gateway 会成孤儿、继续占着 profile → 新 supervisor 拉的 gateway 永远
@@ -198,7 +239,8 @@ HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
 HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
 HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
-${node_env}
+${gw_node}
+${gw_browser}
 '${PY}' -m ${MODULE} gateway run --external-supervisor"
 
     ### 退避：上游用 exit 75 表示"已有实例在服务同一 profile，请 manager 稍后重试"
@@ -346,14 +388,18 @@ start_process() {
     # 主服务：dashboard 仅绑回环，避免触发非回环的强制鉴权门。
     # 资源定位用上游官方的 HERMES_BUNDLED_* 机制（比靠 PROJECT_ROOT 推导更稳，
     # 与官方 fnOS 包的 hermes-env 一致）：源码树即资源根。
-    # TUI 终端用的 node：显式给出，避免上游自己找 node 时长时间无输出
-    local NODE_BIN NODE_ENV=""
-    if NODE_BIN="$(find_node_bin)"; then
-        NODE_ENV="HERMES_NODE='${NODE_BIN}' \\"
-        log_msg "TUI node: ${NODE_BIN}"
+    # TUI 终端 + npx 驱动的流程（装浏览器 / MCP 依赖）用的 node。
+    # node_env() 同时给 HERMES_NODE 和 PATH（后者才是 npx shim 的 shebang 所需）。
+    local NODE_ENV="" _ne
+    if _ne="$(node_env)" && [ -n "${_ne}" ]; then
+        NODE_ENV="${_ne} \\"
+        log_msg "TUI node: $(find_node_bin)"
     else
-        log_msg "警告：未找到 node —— 对话页终端将不可用（请在应用中心安装 Node.js）"
+        log_msg "警告：未找到 node —— 对话页终端不可用，且浏览器/MCP 依赖无法 npx 安装"
     fi
+    # 浏览器环境（Chromium 路径，见 browser_env 说明）
+    local BROWSER_ENV="" _be
+    _be="$(browser_env)" && [ -n "${_be}" ] && BROWSER_ENV="${_be} \\"
 
     local CMD
     CMD="cd '${SRC_DIR}' && exec env \
@@ -373,6 +419,7 @@ HERMES_MANAGED_BY='trim-hermes-fnos' \
 HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
 HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
 ${NODE_ENV}
+${BROWSER_ENV}
 '${PY}' -m ${MODULE} dashboard --host 127.0.0.1 --port '${PORT}' --no-open --skip-build"
 
     if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then

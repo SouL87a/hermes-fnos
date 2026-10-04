@@ -566,7 +566,8 @@ PY="${DATA_DIR}/venv/bin/python3"
 
 # node：与 cmd/main 的 find_node_bin() 同逻辑（TUI 终端要用）
 NODE=""
-for d in /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node \
+for d in "${DATA_DIR}/node/bin/node" \
+         /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node \
          /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node; do
     [ -x "${d}" ] && { NODE="${d}"; break; }
 done
@@ -574,8 +575,27 @@ if [ -z "${NODE}" ]; then
     d="$(command -v node 2>/dev/null || true)"
     [ -n "${d}" ] && [ -x "${d}" ] && NODE="${d}"
 fi
-# 先 export（env 会继承环境，避开在 env 参数位用 ${VAR:+…} 的引号陷阱）
-[ -n "${NODE}" ] && export HERMES_NODE="${NODE}"
+# ⚠ 必须把 node 的目录加进 PATH，不能只设 HERMES_NODE：
+#   HERMES_NODE 只告诉 Hermes「node 在哪」，而那些 npm/npx shim 的首行是
+#   `#!/usr/bin/env node` —— env 走的是 PATH，跟 HERMES_NODE 无关。npx 驱动的
+#   流程（装浏览器 / 装 MCP 依赖）否则会 `env: 'node': No such file or directory`
+#   （真机实测，且上游会假报成功）。
+if [ -n "${NODE}" ]; then
+    NODE_DIR="$(dirname "${NODE}")"
+    case ":${PATH}:" in
+        *":${NODE_DIR}:"*) : ;;
+        *) export PATH="${NODE_DIR}:${PATH}" ;;
+    esac
+    export HERMES_NODE="${NODE}"
+fi
+
+# 浏览器（Chromium）路径：与 cmd/main 的 browser_env() 同逻辑。
+# agent-browser 装到 <data>/.agent-browser/browsers/chrome-*/chrome，而 Hermes 的
+# 就绪检测默认只扫 Playwright 的 <home>/.cache/ms-playwright → 装成功仍报「缺失」。
+# 本变量是该检测的第一顺位，按实际位置指向最稳（glob 取最新，升级自动跟上）。
+for _c in "${DATA_DIR}/.agent-browser/browsers/"*/chrome "${DATA_DIR}/.agent-browser/chrome-current"; do
+    [ -x "${_c}" ] && export AGENT_BROWSER_EXECUTABLE_PATH="${_c}"
+done
 
 # 转交 CLI。环境与 cmd/main 启动应用时保持同一套 HERMES_*
 exec env \
