@@ -237,23 +237,40 @@ def resolve_target(git: str) -> tuple[str, str, str]:
 def _ls_remote_map(git: str) -> dict[str, str]:
     """一次拿全量远端 refs → {refname: sha}。避免多次往返与 shell 转义问题。
 
-    超时 20s（原 180s）：`check` 会被 dashboard 的 /system 首屏同步调用，
-    而本机访问 github.com 实测 2~180s 不等 —— 180s 的超时会让页面转圈长达
-    3 分钟（第三轮审计实测）。check 的定位是"快速看有没有新版本"，超时就
-    如实报错，由调用方（代理）转成 update_available=null，不能拖住页面。
-    GIT_TERMINAL_PROMPT=0：禁止 git 在凭据缺失时等交互输入（会挂到超时）。
+    超时 60s（真机实测报告）：代理到 github.com 的 HTTP 通道正常，但 git 的
+    ls-remote 会间歇性卡住（实测 1/3 概率落在 25s+ 长尾，成功率约 5/8）。
+    原 20s 正好落进长尾 → 随机失败。60s 覆盖长尾，并在失败时重试 1 次。
+    （dashboard 的 /system 已改为后台线程查 + 缓存，不再同步等 —— 见
+      gateway-proxy.py 的 _kick_update_check_background，故放宽超时不会拖页面。）
+
+    低速率兜底：http.lowSpeedLimit/lowSpeedTime 让 git 在"连上了但几乎不走数据"
+    时自己重连，而不是干等满超时。GIT_TERMINAL_PROMPT=0：禁止凭据交互挂起。
     """
     _c, _e = git_cmd(git, "ls-remote", "origin")
     _e = {**_e, "GIT_TERMINAL_PROMPT": "0"}
-    ls = run(_c, timeout=20, env_extra=_e)
-    if ls.returncode != 0:
-        raise RuntimeError(f"git ls-remote 失败：{ls.stdout.strip()[:200]}")
-    out: dict[str, str] = {}
-    for line in ls.stdout.splitlines():
-        parts = line.split("\t") if "\t" in line else line.split()
-        if len(parts) >= 2:
-            out[parts[1].strip()] = parts[0].strip()
-    return out
+    # 低速率兜底（git 全局 -c 选项需在子命令前，放到 argv 前部）
+    _c = [*_c[:1], "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=30", *_c[1:]]
+
+    last_err = ""
+    for attempt in (1, 2):
+        try:
+            ls = run(_c, timeout=60, env_extra=_e)
+        except subprocess.TimeoutExpired:
+            # ⚠ timeout 抛的是异常，不是非零 returncode —— 不接住就轮不到重试
+            last_err = "超时（60s）"
+            ls = None
+        if ls is not None and ls.returncode == 0:
+            out: dict[str, str] = {}
+            for line in ls.stdout.splitlines():
+                parts = line.split("\t") if "\t" in line else line.split()
+                if len(parts) >= 2:
+                    out[parts[1].strip()] = parts[0].strip()
+            return out
+        if ls is not None:
+            last_err = ls.stdout.strip()[:200]
+        if attempt == 1:
+            time.sleep(1)   # 抖动多为瞬时，稍等重试一次
+    raise RuntimeError(f"git ls-remote 失败（已重试）：{last_err}")
 
 
 def remote_commit(git: str, kind: str, ref: str) -> str:

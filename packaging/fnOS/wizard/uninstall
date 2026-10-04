@@ -1,0 +1,21 @@
+[
+  {
+    "stepTitle": "卸载 Hermes Agent",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "请选择本应用数据的清理方式。\n\n「保留数据」：会话记忆、技能、配置、模型与 API Key、工作区文件全部保留 —— 下次重新安装后可直接继续使用（升级/重装也走这条）。\n\n「完全删除」：连同上述全部数据一并删除，不可恢复。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_delete_data",
+        "label": "数据清理方式",
+        "initValue": "false",
+        "options": [
+          { "label": "保留数据（推荐 — 下次安装可继续使用）", "value": "false" },
+          { "label": "完全删除（会话记忆、技能、配置、工作区全部删除，不可恢复）", "value": "true" }
+        ]
+      }
+    ]
+  }
+]

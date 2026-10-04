@@ -1,7 +1,39 @@
 #!/bin/bash
-# 卸载后兜底：确保没有残留进程（应用目录可能已被移除，走固定标记路径）。
+# 卸载后回调。
+#
+# 数据去留由「卸载向导」的 wizard_delete_data 决定（wizard/uninstall）：
+#   "true"  → 完全删除：应用私有数据 + 工作区共享目录
+#   "false" → 保留（默认）：下次安装可继续使用；升级/重装也走这条
+#
+# 应用私有数据在 ${TRIM_PKGVAR}（= /vol1/@appdata/hermes：venv、会话 DB、
+# config.yaml、.env、site-packages、.agent-browser、node …）。
+# 工作区在共享目录 /@appshare/hermes/workspace（用户可见、可手动放文件）——
+# 只在【用户明确选完全删除】时才动它，默认保留。
+
 APP="hermes"
+
+# ① 兜底清进程（应用目录可能已被移除，走固定标记路径）。
 for pid in $(pgrep -f "/@appcenter/${APP}/" 2>/dev/null; pgrep -f "/var/apps/${APP}/" 2>/dev/null); do
     kill -KILL "${pid}" 2>/dev/null || true
 done
+
+# ② 数据清理（按向导选择）。
+if [ "${wizard_delete_data:-false}" = "true" ]; then
+    # 应用私有数据目录：整删。
+    [ -n "${TRIM_PKGVAR}" ] && rm -rf "${TRIM_PKGVAR}" 2>/dev/null || true
+    # 工作区共享目录（连同其父 —— 该父是本应用创建的共享点）。只删本应用自己的
+    # /@appshare/hermes，绝不碰其它共享。
+    for d in /vol*/@appshare/${APP}/workspace /vol*/@appshare/${APP}; do
+        [ -d "${d}" ] && rm -rf "${d}" 2>/dev/null || true
+    done
+    # TRIM_DATA_SHARE_PATHS 里若含该共享路径，也一并尝试。
+    if [ -n "${TRIM_DATA_SHARE_PATHS}" ]; then
+        _ifs_save="${IFS}"; IFS=':'
+        for p in ${TRIM_DATA_SHARE_PATHS}; do
+            case "${p}" in */${APP}/workspace|*/${APP}) rm -rf "${p}" 2>/dev/null || true ;; esac
+        done
+        IFS="${_ifs_save}"
+    fi
+fi
+
 exit 0

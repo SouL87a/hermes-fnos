@@ -1,4 +1,11 @@
 #!/bin/bash
 # 卸载前：停服务。
-# 用户数据的去留由系统「卸载向导」询问用户（保留/删除 TRIM_PKGVAR）。
+# ⚠ cmd/main 由 fnOS 装在 /var/apps/<app>/cmd/（不在应用内容树 TRIM_APPDEST 里），
+#   见 cmd/main 顶部注释 —— 别用 ${TRIM_APPDEST}/cmd/main（那是空路径）。
+# 数据去留由向导 wizard/uninstall 询问（字段 wizard_delete_data），
+# 由 uninstall_callback 执行清理（"true" 删除 / "false" 保留）。
+APP="hermes"
+for m in /var/apps/${APP}/cmd/main "${TRIM_APPDEST}/cmd/main"; do
+    [ -x "${m}" ] && { TRIM_PKGVAR="${TRIM_PKGVAR}" bash "${m}" stop 2>/dev/null || true; break; }
+done
 exit 0

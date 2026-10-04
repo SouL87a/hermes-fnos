@@ -96,7 +96,7 @@ jobs:
           echo "$LIST" | head -12
 
           # fpk 顶层：注意 ui/ 在 app.tgz 内，不在顶层
-          for need in manifest ICON.PNG ICON_256.PNG app.tgz cmd/main cmd/install_callback cmd/config_callback config/privilege config/resource wizard/install wizard/config; do
+          for need in manifest ICON.PNG ICON_256.PNG app.tgz cmd/main cmd/install_callback cmd/config_callback cmd/uninstall_callback config/privilege config/resource wizard/install wizard/config wizard/uninstall; do
             echo "$LIST" | grep -qx "$need" || { echo "✗ fpk 顶层缺少 $need"; exit 1; }
           done
 

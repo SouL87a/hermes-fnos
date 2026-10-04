@@ -234,14 +234,20 @@ def _is_admin(headers, from_root: bool = False) -> bool:
 # 打 github.com —— 大陆网络实测成功率约 30%，失败时固定卡满超时。
 #
 # 三条关键设计（少了任一条这个按钮就会拖垮系统页）：
-#  ① 硬超时 3s：GitHub 不通时最多等 3 秒（原 15s→加缓冲变 20s，仍太慢）；
+#  ① 硬超时（见下 UPDATE_CHECK_TIMEOUT）：**只兜底、不用于掐短**。check 已改为
+#     后台线程执行（_kick_update_check_background），不再在请求路径上，所以这个
+#     超时可以放宽到覆盖 git 的长尾，让 hermes-update.py 内部的 60s 超时 + 重试
+#     有机会生效（原先 3s 会先把内部 20s 砍掉，重试永远轮不到）。
 #  ② **失败/超时结果也要缓存**（短 TTL）：否则「GitHub 不通」期间每次进
 #     /system 都要重付一次超时 —— 这正是上一版最致命的遗漏；
 #  ③ 成功结果用长 TTL（10 分钟），失败结果用短 TTL（90 秒）以便稍后自愈。
-UPDATE_CHECK_TIMEOUT = float(os.environ.get("HERMES_UPDATE_CHECK_TIMEOUT", "3"))
+UPDATE_CHECK_TIMEOUT = float(os.environ.get("HERMES_UPDATE_CHECK_TIMEOUT", "150"))
 UPDATE_CHECK_TTL = float(os.environ.get("HERMES_UPDATE_CHECK_TTL", "600"))
 UPDATE_CHECK_FAIL_TTL = float(os.environ.get("HERMES_UPDATE_CHECK_FAIL_TTL", "90"))
 _update_check_cache: dict = {"at": 0.0, "payload": None, "ttl": 0.0}
+# 上一次【成功】的检查结果：本次失败（网络抖动）时回退展示它，避免 UI 从
+# 「可更新到 xxx」瞬间变成「无数据」（真机报告 §2.3）。
+_update_check_last_ok: dict = {"payload": None}
 
 
 def _update_check_cached_or_none() -> dict | None:
@@ -301,8 +307,21 @@ def _run_update_check_cached() -> dict:
             f"可更新到 {d.get('ref')}" if d.get("available") else "已是最新版本"
         ),
     }
-    # 成功与失败都缓存 —— 失败用短 TTL，避免"GitHub 不通"期间反复付超时。
     import time as _t
+    if ok:
+        _update_check_last_ok["payload"] = payload
+    else:
+        # 本次失败（网络抖动）→ 若有上次成功结果，回退展示它并标注「上次结果」，
+        # 避免 UI 从「可更新到 xxx」瞬间变成「无数据」（报告 §2.3）。
+        last = _update_check_last_ok["payload"]
+        if last:
+            payload = {
+                **last,
+                "update_available": last.get("update_available"),
+                "stale": True,
+                "message": (last.get("message") or "") + "（上次检查结果，本次查询超时）",
+            }
+    # 成功与失败都缓存 —— 失败用短 TTL，避免"GitHub 不通"期间反复付超时。
     _update_check_cache["at"] = _t.time()
     _update_check_cache["payload"] = payload
     _update_check_cache["ttl"] = UPDATE_CHECK_TTL if ok else UPDATE_CHECK_FAIL_TTL
