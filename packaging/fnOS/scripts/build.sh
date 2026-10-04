@@ -589,13 +589,20 @@ if [ -n "${NODE}" ]; then
     export HERMES_NODE="${NODE}"
 fi
 
-# 浏览器（Chromium）路径：与 cmd/main 的 browser_env() 同逻辑。
+# 浏览器（Chromium）路径：与 cmd/main 的 browser_env() 同逻辑（策略一致）。
 # agent-browser 装到 <data>/.agent-browser/browsers/chrome-*/chrome，而 Hermes 的
 # 就绪检测默认只扫 Playwright 的 <home>/.cache/ms-playwright → 装成功仍报「缺失」。
-# 本变量是该检测的第一顺位，按实际位置指向最稳（glob 取最新，升级自动跟上）。
-for _c in "${DATA_DIR}/.agent-browser/browsers/"*/chrome "${DATA_DIR}/.agent-browser/chrome-current"; do
-    [ -x "${_c}" ] && export AGENT_BROWSER_EXECUTABLE_PATH="${_c}"
-done
+# 本变量是该检测的第一顺位。⚠ 用 sort -V 按版本号取最新（裸 glob 是字典序，
+# chrome-99.x 会盖过 chrome-155.x）；版本目录优先，chrome-current 软链兜底。
+BROWSER_BASE="${DATA_DIR}/.agent-browser"
+CHROME_BIN=""
+# while read + 进程替换（保空格；`for in $(ls …)` 会按空白分词拆碎含空格路径）。
+# glob 不匹配时列出字面量，由 [ -x ] 过滤。
+while IFS= read -r _c; do
+    [ -x "${_c}" ] && { CHROME_BIN="${_c}"; break; }
+done < <(printf '%s\n' "${BROWSER_BASE}/browsers/"*/chrome | sort -Vr)
+[ -n "${CHROME_BIN}" ] || { [ -x "${BROWSER_BASE}/chrome-current" ] && CHROME_BIN="${BROWSER_BASE}/chrome-current"; }
+[ -n "${CHROME_BIN}" ] && export AGENT_BROWSER_EXECUTABLE_PATH="${CHROME_BIN}"
 
 # 转交 CLI。环境与 cmd/main 启动应用时保持同一套 HERMES_*
 exec env \

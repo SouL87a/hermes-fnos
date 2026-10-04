@@ -21,3 +21,6 @@ __pycache__/
 报告-*.md
 诊断-*.md
 
+
+# 本地发布触发脚本（凭证走 git helper，不入库）
+.trigger-release.sh

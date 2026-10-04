@@ -181,9 +181,15 @@ node_env() {
 ### 自动跟上，无需人工维护软链）。未安装则输出空串。
 browser_env() {
     local base="${DATA_DIR}/.agent-browser" p="" cand
-    for cand in "${base}/browsers/"*/chrome; do
-        [ -x "${cand}" ] && p="${cand}"
-    done
+    # ⚠ 两个坑：
+    #  1) 必须按【版本号】排序取最新，不能用裸 glob 的"最后一项"——那是字典序，
+    #     chrome-99.x 会排在 chrome-155.x 之后（"9" > "1"），多版本并存时选到旧版。
+    #  2) 用 `while read` + 进程替换，不能用 `for in $(ls …)` —— 后者按空白分词，
+    #     路径含空格时会被拆碎（`[ -x ]` 判定失败）。glob 不匹配时列出字面量，
+    #     下面的 `[ -x ]` 自然过滤掉。
+    while IFS= read -r cand; do
+        [ -x "${cand}" ] && { p="${cand}"; break; }
+    done < <(printf '%s\n' "${base}/browsers/"*/chrome | sort -Vr)
     # 兜底：用户手工建的稳定软链（若无 chrome-* 目录）
     [ -n "${p}" ] || { [ -x "${base}/chrome-current" ] && p="${base}/chrome-current"; }
     [ -n "${p}" ] && printf "AGENT_BROWSER_EXECUTABLE_PATH='%s'" "${p}"
