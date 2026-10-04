@@ -499,39 +499,102 @@ chmod 755 "${APP_DIR}/bin/hermes-update"
 # 于是 SSH 里可直接 `hermes doctor` / `hermes setup` / `hermes model` …
 # 不加它，doctor 输出里的所有「run 'hermes …'」建议都不可执行（command not found）。
 # 环境变量与 cmd/main 组装的 dashboard/gateway 启动环境保持一致（同一套 HERMES_*）。
+# ⚠ 路径/解释器/node/工作区 的解析必须逐条对齐 cmd/main（不能硬编码）：
+#   裸 SSH 会话里没有 fnOS 注入的 TRIM_* 变量 —— 尤其工作区，若不单独探
+#   /vol*/@appshare/hermes/workspace，HERMES_WRITE_SAFE_ROOT 会错算成
+#   ${DATA}/workspace，让 CLI 的写安全边界指到错误目录（真机实测发现）。
 cat > "${APP_DIR}/bin/hermes" <<'WRAP'
 #!/bin/bash
-# Hermes CLI（fnOS）。转发到包内 launcher，环境与 cmd/main 一致。
-APP_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-DATA="${TRIM_PKGVAR:-/var/apps/hermes/var}"
-SRC="${APP_DIR}/runtime/hermes"
-# 解释器优先级：系统 Python 模式（NAS 上建的 venv）→ 自带 CPython → PATH
-PY="${DATA}/venv/bin/python3"
+# Hermes CLI —— fnOS 打包版。
+# 目的：让 `hermes <子命令>`（doctor/setup/skills/status/cron/tools/auth/mcp…）可用。
+# 上游 install.sh 靠 venv console script 生成该入口；本包是「自带 CPython +
+# python -m hermes_cli.main」，没有 venv，故补上。机制同 bin/hermes-update
+# （fnOS 把 fpk 的 bin/ 里每个文件软链到 /usr/local/bin）。
+# 路径/解释器/node/工作区解析逐条对齐 cmd/main → 跨卷、跨 node 版本、
+# 跨「系统 Python ↔ 自带 CPython」模式切换都成立。
+set -u
+APP="hermes"
+
+# 应用目录：TRIM_APPDEST → /var/apps 统一视图 → 脚本自身位置
+if [ -n "${TRIM_APPDEST:-}" ] && [ -d "${TRIM_APPDEST}" ]; then
+    APP_DIR="$(readlink -f "${TRIM_APPDEST}")"
+elif [ -d "/var/apps/${APP}/target" ]; then
+    APP_DIR="$(readlink -f "/var/apps/${APP}/target")"
+else
+    APP_DIR="$(readlink -f "$(dirname "$(readlink -f "$0")")/..")"
+fi
+
+# 数据目录（跨重装持久）
+if [ -n "${TRIM_PKGVAR:-}" ]; then
+    DATA_DIR="${TRIM_PKGVAR}"
+elif [ -d "/var/apps/${APP}/var" ]; then
+    DATA_DIR="$(readlink -f "/var/apps/${APP}/var")"
+else
+    DATA_DIR="${APP_DIR}/../var"
+fi
+
+SRC_DIR="${APP_DIR}/runtime/hermes"
+WEB_DIST="${APP_DIR}/runtime/web_dist"
+LAZY_SITE="${DATA_DIR}/site-packages"
+
+# 工作区：与 cmd/main 的 resolve_workspace() 同逻辑
+WS=""
+if [ -n "${TRIM_DATA_SHARE_PATHS:-}" ]; then
+    _ifs_save="${IFS}"; IFS=':'
+    for p in ${TRIM_DATA_SHARE_PATHS}; do
+        case "${p}" in */hermes/workspace) WS="${p}"; break ;; esac
+    done
+    if [ -z "${WS}" ]; then
+        for p in ${TRIM_DATA_SHARE_PATHS}; do
+            [ -n "${p}" ] && { WS="${p}"; break; }
+        done
+    fi
+    IFS="${_ifs_save}"
+fi
+if [ -z "${WS}" ]; then
+    # 裸 SSH 会话没有 TRIM_DATA_SHARE_PATHS，直接探 share 路径
+    for d in /vol*/@appshare/${APP}/workspace; do
+        [ -d "${d}" ] && { WS="${d}"; break; }
+    done
+fi
+[ -n "${WS}" ] || WS="${DATA_DIR}/workspace"
+
+# 解释器：系统 Python 模式（NAS 上建的 venv）→ 包内自带 CPython → PATH
+PY="${DATA_DIR}/venv/bin/python3"
 [ -x "${PY}" ] || PY="${APP_DIR}/runtime/python/bin/python3"
 [ -x "${PY}" ] || PY="$(command -v python3)"
-# node：TUI 终端需要。优先应用中心的 nodejs（v22/v24），跨卷兜底。
+
+# node：与 cmd/main 的 find_node_bin() 同逻辑（TUI 终端要用）
 NODE=""
 for d in /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node \
          /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node; do
     [ -x "${d}" ] && { NODE="${d}"; break; }
 done
-[ -n "${NODE}" ] || NODE="$(command -v node 2>/dev/null || true)"
-# 先 export（env 会继承环境，避免在 env 参数位用 ${VAR:+…} 的引号陷阱）
+if [ -z "${NODE}" ]; then
+    d="$(command -v node 2>/dev/null || true)"
+    [ -n "${d}" ] && [ -x "${d}" ] && NODE="${d}"
+fi
+# 先 export（env 会继承环境，避开在 env 参数位用 ${VAR:+…} 的引号陷阱）
 [ -n "${NODE}" ] && export HERMES_NODE="${NODE}"
+
+# 转交 CLI。环境与 cmd/main 启动应用时保持同一套 HERMES_*
 exec env \
-  HOME="${DATA}" \
-  PYTHONPATH="${SRC}:${DATA}/site-packages" \
-  PYTHONUNBUFFERED=1 \
-  PYTHONDONTWRITEBYTECODE=1 \
-  HERMES_HOME="${DATA}" \
-  HERMES_BUNDLED_SKILLS="${SRC}/skills" \
-  HERMES_OPTIONAL_SKILLS="${SRC}/optional-skills" \
-  HERMES_BUNDLED_PLUGINS="${SRC}/plugins" \
-  HERMES_BUNDLED_LOCALES="${SRC}/locales" \
-  HERMES_OPTIONAL_MCPS="${SRC}/optional-mcps" \
-  HERMES_WEB_DIST="${APP_DIR}/runtime/web_dist" \
-  HERMES_LAZY_INSTALL_TARGET="${DATA}/site-packages" \
-  "${PY}" -m hermes_cli.main "$@"
+    HOME="${DATA_DIR}" \
+    PYTHONPATH="${SRC_DIR}:${LAZY_SITE}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HERMES_HOME="${DATA_DIR}" \
+    HERMES_BUNDLED_SKILLS="${SRC_DIR}/skills" \
+    HERMES_OPTIONAL_SKILLS="${SRC_DIR}/optional-skills" \
+    HERMES_BUNDLED_PLUGINS="${SRC_DIR}/plugins" \
+    HERMES_BUNDLED_LOCALES="${SRC_DIR}/locales" \
+    HERMES_OPTIONAL_MCPS="${SRC_DIR}/optional-mcps" \
+    HERMES_WEB_DIST="${WEB_DIST}" \
+    HERMES_WRITE_SAFE_ROOT="${WS}" \
+    HERMES_MANAGED_BY="trim-hermes-fnos" \
+    HERMES_LAZY_INSTALL_TARGET="${LAZY_SITE}" \
+    HERMES_TUI_WS_ORPHAN_REAP_GRACE_S="300" \
+    "${PY}" -m hermes_cli.main "$@"
 WRAP
 chmod 755 "${APP_DIR}/bin/hermes"
 
