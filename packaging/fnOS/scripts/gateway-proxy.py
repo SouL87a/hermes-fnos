@@ -228,19 +228,19 @@ def _is_admin(headers, from_root: bool = False) -> bool:
     return False
 
 
-# ── 更新检查：超时 + 缓存（含失败缓存）───────────────────────
-# 为什么：dashboard 的 /system 首屏把 checkHermesUpdate 和 9 个本地接口绑在同一个
-# Promise.allSettled 里，只有全部 settle 才关转圈。而 check 要跑 `git ls-remote`
-# 打 github.com —— 大陆网络实测成功率约 30%，失败时固定卡满超时。
+# ── 更新检查：缓存 + 只在用户主动时联网 ──────────────────────
+# 上游前端（web/src/pages/SystemPage.tsx）用 `?force=true` 区分两种调用：
+#   · 首屏 loadAll 调 checkHermesUpdate(false) → 无 force → 我们【只读缓存、
+#     不联网】（无缓存就回「未检查」）。这修掉了「每进一次 /system 都自动检测
+#     更新」—— 那本不该发生，用户也没要求。
+#   · "检查更新"按钮调 checkHermesUpdate(true) → force=true → 同步真查一次。
 #
-# 三条关键设计（少了任一条这个按钮就会拖垮系统页）：
-#  ① 硬超时（见下 UPDATE_CHECK_TIMEOUT）：**只兜底、不用于掐短**。check 已改为
-#     后台线程执行（_kick_update_check_background），不再在请求路径上，所以这个
-#     超时可以放宽到覆盖 git 的长尾，让 hermes-update.py 内部的 60s 超时 + 重试
-#     有机会生效（原先 3s 会先把内部 20s 砍掉，重试永远轮不到）。
-#  ② **失败/超时结果也要缓存**（短 TTL）：否则「GitHub 不通」期间每次进
-#     /system 都要重付一次超时 —— 这正是上一版最致命的遗漏；
-#  ③ 成功结果用长 TTL（10 分钟），失败结果用短 TTL（90 秒）以便稍后自愈。
+# 两条关键设计：
+#  ① 硬超时 UPDATE_CHECK_TIMEOUT：只用于 force（按钮）路径的兜底，要盖过
+#     hermes-update.py 内部的 60s + 重试，让用户拿到真结果（原先 3s 会先把
+#     内部 20s 砍掉，重试永远轮不到）。
+#  ② 结果缓存：成功长 TTL（10 分钟）、失败短 TTL（90 秒）以便稍后自愈；
+#     这样首屏命中缓存能显示"有更新"，无需每次联网。
 UPDATE_CHECK_TIMEOUT = float(os.environ.get("HERMES_UPDATE_CHECK_TIMEOUT", "150"))
 UPDATE_CHECK_TTL = float(os.environ.get("HERMES_UPDATE_CHECK_TTL", "600"))
 UPDATE_CHECK_FAIL_TTL = float(os.environ.get("HERMES_UPDATE_CHECK_FAIL_TTL", "90"))
@@ -259,27 +259,12 @@ def _update_check_cached_or_none() -> dict | None:
     return None
 
 
-_check_inflight = {"running": False}
-
-
-def _kick_update_check_background() -> None:
-    """后台跑一次检查（不阻塞请求）。同一时刻只跑一个。"""
-    import threading
-    if _check_inflight["running"]:
-        return
-    def _work() -> None:
-        _check_inflight["running"] = True
-        try:
-            _run_update_check_cached()
-        except Exception as exc:  # noqa: BLE001
-            log(f"background update check failed: {exc!r}")
-        finally:
-            _check_inflight["running"] = False
-    threading.Thread(target=_work, daemon=True).start()
-
-
 def _run_update_check_cached() -> dict:
-    """同步执行一次检查并写缓存（供后台线程 / 诊断调用，不在请求路径上）。"""
+    """同步执行一次检查并写缓存。被两条路径调用：
+      · 后台线程（旧路径，已不用于首屏）；
+      · "检查更新"按钮（force=true，走 run_in_executor 同步等结果）。
+    硬超时 UPDATE_CHECK_TIMEOUT（默认 150s）要盖过 hermes-update.py 内部的
+    60s+重试，让用户点按钮能拿到**真结果**而不是超时错误。"""
     d: dict = {}
     ok = False
     try:
@@ -294,12 +279,21 @@ def _run_update_check_cached() -> dict:
     except Exception as exc:  # noqa: BLE001
         d = {"ok": False, "message": f"检查超时或失败：{exc}"}
 
+    # behind 的取值必须让前端「检查更新」按钮的判定链正确弹 toast
+    # （SystemPage: update_available → success；behind===0 → "已是最新" success；
+    #   否则落到 message → error）。我们的 hermes-update.py 不算 behind，所以：
+    #   · 成功且已最新 → 0（前端弹 "You're on the latest version" ✅，而不是把
+    #     "已是最新"当成错误弹出来）
+    #   · 成功且有更新 → None（前端走 update_available 分支弹 "Update available"）
+    #   · 失败/超时   → None（"未知"，避免把没查到说成已最新）
+    if ok and not d.get("available"):
+        behind_val: object = 0
+    else:
+        behind_val = None
     payload = {
         "install_method": "fnos-fpk",
         "current_version": d.get("current_version") or "unknown",
-        "behind": None,
-        # 检查失败/超时 → None（前端按"未知"处理），而不是 false，
-        # 避免把"没查到"说成"已是最新"。
+        "behind": behind_val,
         "update_available": (bool(d.get("available")) if ok else None),
         "can_apply": True,
         "update_command": "hermes-update apply",
@@ -611,27 +605,37 @@ async def handle_native_update_proxy(method: str, path: str, headers, writer, fr
 
     loop = asyncio.get_running_loop()
 
-    if path.endswith("/check"):
-        # /system 首屏会**同步**调它，且和 9 个本地接口绑在同一个
-        # Promise.allSettled 里 —— 只有全部 settle 才关转圈。
-        # 所以这里绝不阻塞等待网络：
-        #   命中缓存 → 立即返回真实结果；
-        #   未命中   → **后台线程去查**，本次立即返回 update_available=null
-        #              （前端按"未知"显示，不阻塞），下次访问即命中缓存。
-        # 这样无论 GitHub 通不通，系统页都是瞬时打开。
+    if path.split("?")[0].endswith("/check"):
+        # 上游前端用 `?force=true` 区分两种调用（web/src/pages/SystemPage.tsx）：
+        #   · 首屏 loadAll 调 checkHermesUpdate(false) → 无 force →
+        #     只应读缓存，**不发起网络检查**（否则每进一次 /system 都查一次）
+        #   · "检查更新"按钮调 checkHermesUpdate(true) → 带 force=true →
+        #     强制真查一次（命中缓存也重查）
+        # 我们此前忽略了这个参数，未命中缓存就无条件后台查 —— 正是「每次打开
+        # /system 都在检测更新」的根因。现按 force 区分。
+        force = "force=true" in path
         cached = _update_check_cached_or_none()
-        if cached is not None:
+        if cached is not None and not force:
+            # 首屏命中缓存 → 立即返回，不联网。
             respond(200, cached)
+        elif force:
+            # "检查更新"按钮：用户主动点，同步真查一次（在 executor 里跑，不卡事件
+            # 循环）。前端拿到的是**真结果**并据此弹 toast，所以不能回"正在后台查"
+            # —— 那会被当成错误提示（SystemPage 的既定判定链）。
+            result = await loop.run_in_executor(None, _run_update_check_cached)
+            respond(200, result)
         else:
-            _kick_update_check_background()
+            # 首屏、无缓存、且非强制 → **不联网**，回「未检查」。
+            # 想看就点"检查更新"按钮（带 force=true）。这修掉了「每进一次 /system
+            # 都自动检测更新」——那本不该发生。
             respond(200, {
                 "install_method": "fnos-fpk",
                 "current_version": "unknown",
                 "behind": None,
-                "update_available": None,   # 未知：后台正在查
+                "update_available": None,
                 "can_apply": True,
                 "update_command": "hermes-update apply",
-                "message": "正在后台检查更新…",
+                "message": "未检查更新（点「检查更新」按钮，或 SSH 执行 hermes-update check）",
             })
     else:
         code, body = await loop.run_in_executor(None, _run_update, "apply")
