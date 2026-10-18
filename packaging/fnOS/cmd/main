@@ -26,9 +26,6 @@ MODULE="hermes_cli.main"
 PORT="${TRIM_SERVICE_PORT:-9119}"
 GATEWAY_PREFIX="/app/hermes"
 
-LOG_FILE="${TRIM_PKGVAR}/info.log"
-PID_FILE="${TRIM_PKGVAR}/app.pid"
-
 ### TRIM_APPDEST 兜底：必须落到 target 链接指向的真目录。
 ### /var/apps/<app> 本身是真目录，readlink -f 不穿透它 —— 拿它当 APPDEST 会拼出
 ### 不存在的路径，status/stop 会静默失效。
@@ -42,6 +39,12 @@ fi
 : "${TRIM_PKGVAR:=/var/apps/${APP}/var}"
 : "${TRIM_USERNAME:=${APP}}"
 : "${TRIM_GROUPNAME:=${TRIM_USERNAME}}"
+
+### ⚠ 必须在 TRIM_PKGVAR 兜底【之后】定义 —— 否则变量未注入时会解析成
+### /info.log、/app.pid（根目录，不可写）→ 每次写日志都
+### "Permission denied"，且会在 / 下留垃圾（实机见过 10-02 的 /info.log）。
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
 
 APP_DIR="${TRIM_APPDEST}"
 SRC_DIR="${APP_DIR}/runtime/hermes"
