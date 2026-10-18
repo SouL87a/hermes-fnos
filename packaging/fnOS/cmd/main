@@ -575,6 +575,13 @@ start_process() {
     # PM 依赖环境守卫：facts.json 存在会让 PM 用 core-only venv 顶掉包内完整
     # site-packages（qqbot 等适配器失效）。见 ensure_pm_env_ignored 注释。
     ensure_pm_env_ignored
+    # doctor 需要 ~/.local/bin/hermes（$HOME = HERMES_HOME = DATA_DIR）。
+    # 本包走 /usr/local/bin/hermes（usr-local-linker），但上游 doctor 只认
+    # ~/.local/bin → 每跑一次 doctor 就报一条 issue。放个软链即可（无需 root）。
+    [ -d "${DATA_DIR}/.local/bin" ] || mkdir -p "${DATA_DIR}/.local/bin" 2>/dev/null || true
+    if [ -x "${APP_DIR}/bin/hermes" ] && [ ! -e "${DATA_DIR}/.local/bin/hermes" ]; then
+        ln -s "${APP_DIR}/bin/hermes" "${DATA_DIR}/.local/bin/hermes" 2>/dev/null || true
+    fi
     rm -f "${GATEWAY_SOCKET}"
 
     log_msg "Starting Hermes dashboard (gateway + loopback port) ..."
