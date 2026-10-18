@@ -164,19 +164,22 @@ def git_cmd(git: str, *args: str) -> tuple[list[str], dict[str, str]]:
 def find_node_tool(name: str) -> str | None:
     """node/npm 可能在自带运行时、fnOS 应用中心的 nodejs、或 PATH 里。
 
-    ⚠ 必须包含应用中心 nodejs 的路径：fnOS 上 node 由 nodejs_v22 应用提供，
-    位于 /vol*/@appcenter/nodejs_v22/bin，既不在自带 runtime 也不在 PATH
+    ⚠ 必须包含应用中心 nodejs 的路径：fnOS 上 node 由应用中心提供，位于
+    /vol*/@appcenter/nodejs_vNN/bin，既不在自带 runtime 也不在 PATH
     （第三轮审计实测：apply 因此跳过前端重建，留下"旧前端 × 新后端"错配）。
+    v24 优先（Hermes v0.22 engines 支持 ^22.22 || ^24.11 || >=26；v24 生命期更长）。
     """
     import glob as _glob
     cands = [
         RUNTIME / "python" / "node" / "bin" / name,
         APP_ROOT / "runtime" / "node" / "bin" / name,
-        Path("/var/apps/nodejs_v22/target/bin") / name,
         Path("/var/apps/nodejs_v24/target/bin") / name,
+        Path("/var/apps/nodejs_v22/target/bin") / name,
     ]
-    # 全卷 glob 兜底（应用可能装在任意存储空间）
-    cands += [Path(p) for p in _glob.glob(f"/vol*/@appcenter/nodejs_v*/bin/{name}")]
+    # 全卷 glob 兜底（应用可能装在任意存储空间）；显式按 v24→v26→v22 排，避免
+    # 字典序把 v22 排到前面。
+    for ver in ("v24", "v25", "v26", "v22"):
+        cands += [Path(p) for p in _glob.glob(f"/vol*/@appcenter/nodejs_{ver}/bin/{name}")]
     for cand in cands:
         if cand.exists() and os.access(cand, os.X_OK):
             return str(cand)

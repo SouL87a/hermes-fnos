@@ -74,6 +74,36 @@ DATA_DIR="${TRIM_PKGVAR}"
 ### 校验）—— 不需要 venv，且落在可写的数据目录。实测 --target 路径 exit=0。
 LAZY_SITE="${DATA_DIR}/site-packages"
 
+### PM（上游包管理器）依赖环境守卫。
+### ⚠ 实机事故（v0.22.2）：上游把 pm 模块加回来了，且 hermes_bootstrap 每次启动都调
+### pm.environments.activate_dependencies()。只要 <data>/installs/<key>/facts.json 存在，
+### 它就会【无条件清空 sys.path 上所有 site-packages 项】，改用 facts.json 记录的
+### venv —— 而我们的事实文件里 extras=[]（PM sync 时 feature_list 为空），该 venv
+### 缺 messaging 全栈（aiohttp/telegram/discord/slack…）→ 所有可选平台适配器失效：
+### 「No adapter available for enabled qqbot」。
+### 本包的依赖完整预装在包内 CPython 的 site-packages（86 个发行包），不应被这个
+### core-only venv 顶掉。故启动前把 installs/<key> 归档，让 committed_venv() 返回
+### None → 走 _require_own_dependencies()（非 store python 直接 return，保留原
+### sys.path）。
+### 归档而非删除：留作排查/回退。每次启动都查，因为任何 PM sync 都会重建它。
+ensure_pm_env_ignored() {
+    local root="${DATA_DIR}/installs"
+    [ -d "${root}" ] || return 0
+    local d archived=0
+    for d in "${root}"/*/; do
+        [ -d "${d}" ] || continue
+        [ -f "${d}facts.json" ] || continue
+        local bak="${d%/}.disabled-$(date +%Y%m%d%H%M%S)"
+        if mv "${d%/}" "${bak}" 2>/dev/null; then
+            archived=1
+        fi
+    done
+    if [ "${archived}" = "1" ]; then
+        log_msg "PM 依赖环境已归档（避免它用 core-only venv 覆盖包内完整 site-packages）"
+    fi
+    return 0
+}
+
 ### 懒安装目录的 ABI 守卫。
 ### ⚠ 惨痛教训（v0.22.2 升级实机）：LAZY_SITE 被放在 PYTHONPATH 里，且【优先于】
 ### 包内解释器自己的 site-packages。上一个版本（CPython 3.12）的懒安装目录里
@@ -189,12 +219,16 @@ port_listening() {
 find_node_bin() {
     local d
     [ -x "${DATA_DIR}/node/bin/node" ] && { printf '%s' "${DATA_DIR}/node/bin/node"; return 0; }
-    for d in /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node \
-             /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node; do
+    # v24 优先：Hermes v0.22 的 engines 为 "^22.22.0 || ^24.11.0 || >=26.0.0"，
+    # 两版都支持，但 v24 生命周期更长（参考的 OpenClaw 系包也用 v24）。
+    for d in /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node \
+             /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node; do
         [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
     done
     d="$(command -v node 2>/dev/null)" && [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
-    for d in /vol*/@appcenter/nodejs_v*/bin/node; do
+    # 跨卷兜底：先 v24 再 v22（glob 是字典序，v22 会排在 v24 前，故分两轮）。
+    for d in /vol*/@appcenter/nodejs_v24/bin/node /vol*/@appcenter/nodejs_v25/bin/node \
+             /vol*/@appcenter/nodejs_v26/bin/node /vol*/@appcenter/nodejs_v22/bin/node; do
         [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
     done
     return 1
@@ -441,6 +475,9 @@ start_process() {
     # 懒安装目录 ABI 守卫：Python 大版本变更后，旧目录里的 cp3xx 扩展会让
     # import 崩（pydantic_core 等），必须先归档。见 ensure_lazy_site_abi 注释。
     ensure_lazy_site_abi
+    # PM 依赖环境守卫：facts.json 存在会让 PM 用 core-only venv 顶掉包内完整
+    # site-packages（qqbot 等适配器失效）。见 ensure_pm_env_ignored 注释。
+    ensure_pm_env_ignored
     rm -f "${GATEWAY_SOCKET}"
 
     log_msg "Starting Hermes dashboard (gateway + loopback port) ..."

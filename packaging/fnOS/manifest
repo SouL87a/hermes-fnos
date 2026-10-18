@@ -17,5 +17,5 @@ gatewayPrefix         = /app/hermes
 gatewaySocket         = hermes.sock
 checkport             = false
 ctl_stop              = true
-install_dep_apps      = nodejs_v22
+install_dep_apps      = nodejs_v24
 changelog             = 自带 Python 运行时（含新版 SQLite，WAL 正常），安装后即可用；跑 hermes dashboard 并挂飞牛统一网关（Unix Socket + X-Forwarded-Prefix 前缀反代）。

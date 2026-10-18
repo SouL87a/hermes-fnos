@@ -185,7 +185,7 @@ else
             rm -f "${PBS_TGZ}.part"
             echo "✗ 下载 CPython 失败。请确认 PBS_TAG/PY_VERSION 组合存在："
             echo "  https://github.com/astral-sh/python-build-standalone/releases"
-            echo "  可用 HERMES_PBS_TAG=YYYYMMDD HERMES_PY_VERSION=3.12.x 覆盖。"
+            echo "  可用 HERMES_PBS_TAG=YYYYMMDD HERMES_PY_VERSION=3.14.x 覆盖。"
             exit 1
         fi
         mv "${PBS_TGZ}.part" "${PBS_TGZ}"
@@ -573,8 +573,8 @@ PY="${DATA_DIR}/venv/bin/python3"
 # node：与 cmd/main 的 find_node_bin() 同逻辑（TUI 终端要用）
 NODE=""
 for d in "${DATA_DIR}/node/bin/node" \
-         /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node \
-         /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node; do
+         /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node \
+         /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node; do
     [ -x "${d}" ] && { NODE="${d}"; break; }
 done
 if [ -z "${NODE}" ]; then
