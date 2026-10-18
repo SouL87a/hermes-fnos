@@ -618,7 +618,14 @@ mkdir -p "${WS}/tmp" 2>/dev/null || true
 export TMPDIR="${WS}/tmp" TMP="${WS}/tmp" TEMP="${WS}/tmp"
 
 # 转交 CLI。环境与 cmd/main 启动应用时保持同一套 HERMES_*
-exec env \
+# stderr 过滤：上游 v0.22 的 check_runtime() 拿 pm store 的 21 个产品做漂移比对，
+# 而本包工具由应用中心/系统提供（rg 在 /usr/local/bin、node 在 nodejs_v24、
+# ffmpeg 在 /usr/bin），store 里只登记 python/uv → 每条命令都打一行
+# "install out of sync (ffmpeg/node/npm/ripgrep …)"。工具实际都在，纯噪声。
+# 这里只滤掉这一行，其余输出（含真实错误）原样透传。
+_err="$(mktemp 2>/dev/null || echo "${DATA_DIR}/.hermes-shim-err.$$")"
+trap 'rm -f "${_err}"' EXIT
+env \
     HOME="${DATA_DIR}" \
     PYTHONPATH="${SRC_DIR}:${LAZY_SITE}" \
     PYTHONUNBUFFERED=1 \
@@ -634,7 +641,10 @@ exec env \
     HERMES_MANAGED_BY="trim-hermes-fnos" \
     HERMES_LAZY_INSTALL_TARGET="${LAZY_SITE}" \
     HERMES_TUI_WS_ORPHAN_REAP_GRACE_S="300" \
-    "${PY}" -m hermes_cli.main "$@"
+    "${PY}" -m hermes_cli.main "$@" 2>"${_err}"
+_rc=$?
+grep -v '^⚠ install out of sync' "${_err}" >&2 || true
+exit "${_rc}"
 WRAP
 chmod 755 "${APP_DIR}/bin/hermes"
 

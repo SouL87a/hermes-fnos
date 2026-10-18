@@ -93,14 +93,111 @@ ensure_pm_env_ignored() {
     for d in "${root}"/*/; do
         [ -d "${d}" ] || continue
         [ -f "${d}facts.json" ] || continue
+        # ⚠ 归档前先把「插件/懒安装依赖」迁移到 LAZY_SITE，否则 mem0 这类
+        #   插件依赖会跟整个 PM venv 一起消失（实机事故：mem0 backend 初始化失败）。
+        #   PM venv = 核心依赖(缺 messaging) + 插件依赖；我们只保住后者。
+        migrate_pm_venv_extras "${d%/}" || true
         local bak="${d%/}.disabled-$(date +%Y%m%d%H%M%S)"
         if mv "${d%/}" "${bak}" 2>/dev/null; then
             archived=1
         fi
     done
     if [ "${archived}" = "1" ]; then
-        log_msg "PM 依赖环境已归档（避免它用 core-only venv 覆盖包内完整 site-packages）"
+        log_msg "PM 依赖环境已归档（避免核心依赖被 core-only venv 覆盖；插件依赖已迁移到 ${LAZY_SITE}）"
     fi
+    return 0
+}
+
+### 把 PM venv 里「包内 site-packages 没有的」发行包迁到 LAZY_SITE。
+### 为什么：PM venv 同时承载核心依赖与插件依赖，整体归档会丢后者；而包内
+### site-packages 已含全部核心依赖，所以只补差集即可。按 dist-info 名判重，
+### 已存在的（含更高版本）跳过 —— 绝不让 pip 升级核心包（LAZY_SITE 在
+### PYTHONPATH 里优先于包内，升级核心包会遮蔽）。
+### 纯复制、不解析依赖关系（PM 装时已解析过）。
+migrate_pm_venv_extras() {
+    local state_dir="$1"
+    local vendir
+    vendir="$(find "${state_dir}/environments" -maxdepth 3 -type d -name site-packages 2>/dev/null | head -n 1)"
+    [ -n "${vendir}" ] && [ -d "${vendir}" ] || return 0
+    local bundled="${APP_DIR}/runtime/python/lib/python3.14/site-packages"
+    [ -d "${bundled}" ] || bundled="$(find "${APP_DIR}/runtime/python" -maxdepth 5 -type d -name site-packages 2>/dev/null | head -n 1)"
+    [ -n "${bundled}" ] && [ -d "${bundled}" ] || return 0
+    mkdir -p "${LAZY_SITE}" 2>/dev/null || true
+    "${PY}" - "${vendir}" "${bundled}" "${LAZY_SITE}" <<'PYEOF' >> "${LOG_FILE}" 2>&1
+import os, re, shutil, sys
+from pathlib import Path
+
+src, bundled, dst = map(Path, sys.argv[1:4])
+# 规范化发行包名（PEP 503）：Foo_Bar-1.0.dist-info -> foo-bar
+def norm(n: str) -> str:
+    return re.sub(r"[-_.]+", "-", n).lower()
+
+def dists(root: Path) -> dict:
+    out = {}
+    try:
+        for e in root.iterdir():
+            if e.is_dir() and e.name.endswith(".dist-info"):
+                out[norm(e.name[: -len(".dist-info")].rsplit("-", 1)[0])] = e.name
+    except OSError:
+        pass
+    return out
+
+have_bundled = dists(bundled)
+have_lazy = dists(dst)
+migrated, skipped = [], []
+for e in src.iterdir():
+    if not e.is_dir():
+        continue
+    name = e.name
+    if name.endswith(".dist-info"):
+        base = norm(name[: -len(".dist-info")].rsplit("-", 1)[0])
+    else:
+        continue
+    if base in have_bundled or base in have_lazy:
+        skipped.append(base)
+        continue
+    if (dst / name).exists():
+        skipped.append(base)
+        continue
+    shutil.copytree(e, dst / name, symlinks=True, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
+    # __pycache__/RECORD 之外的顶层内容：dist-info 已复制，跳过重复
+    migrated.append(base)
+
+# 复制非 dist-info 的顶层文件/目录（纯 python 包体、.so、data 等）。
+# 用 RECORD 精确对照比按名字猜更稳，但为免复杂，这里只复制 dist-info 里列出、
+# dst 尚不存在的条目。
+migrated_files = 0
+for base in migrated:
+    # 找到该 base 对应的 dist-info（可能在 src 里）
+    di = None
+    for e in src.iterdir():
+        if e.is_dir() and norm(e.name[: -len(".dist-info")].rsplit("-", 1)[0]) == base and e.name.endswith(".dist-info"):
+            di = e
+            break
+    if di is None:
+        continue
+    rec = di / "RECORD"
+    if not rec.is_file():
+        continue
+    for line in rec.read_text(encoding="utf-8", errors="replace").splitlines():
+        rel = line.split(",", 1)[0].strip()
+        if not rel or rel.startswith("..") or rel.startswith("/"):
+            continue
+        s, t = src / rel, dst / rel
+        if t.exists() or not s.exists():
+            continue
+        t.parent.mkdir(parents=True, exist_ok=True)
+        if s.is_symlink():
+            try: t.symlink_to(os.readlink(s))
+            except OSError: pass
+        elif s.is_file():
+            shutil.copy2(s, t)
+            migrated_files += 1
+
+print(f"  [pm-migrate] 新增 {len(migrated)} 个发行包、{migrated_files} 个文件, 跳过 {len(skipped)} 个已存在")
+if migrated:
+    print("    ", ", ".join(sorted(migrated)[:12]) + (" …" if len(migrated) > 12 else ""))
+PYEOF
     return 0
 }
 
