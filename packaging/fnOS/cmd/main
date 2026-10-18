@@ -36,13 +36,19 @@ if [ -z "${TRIM_APPDEST}" ]; then
         TRIM_APPDEST="$(readlink -f "/var/apps/${APP}")"
     fi
 fi
-: "${TRIM_PKGVAR:=/var/apps/${APP}/var}"
-: "${TRIM_USERNAME:=${APP}}"
-: "${TRIM_GROUPNAME:=${TRIM_USERNAME}}"
+### ⚠ 兜底值必须 export —— 不只是本脚本用：
+### cmd/main 拉起的 dashboard / gateway-proxy 会继承环境；用户在 dashboard 点
+### 「重启网关」时，proxy 以 subprocess 调用 `cmd/main gateway-restart`，
+### 【继承的是 proxy 的环境】。若兜底值没导出，proxy 里 TRIM_PKGVAR 为空 →
+### 子进程再次退化到 /info.log（实机：line 165/443 Permission denied，且
+### 杀掉了网关却起不来）。实测：不带 export 的子进程拿不到 :="兜底值"。
+export TRIM_APPDEST
+export TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/${APP}/var}"
+export TRIM_USERNAME="${TRIM_USERNAME:-${APP}}"
+export TRIM_GROUPNAME="${TRIM_GROUPNAME:-${TRIM_USERNAME}}"
 
-### ⚠ 必须在 TRIM_PKGVAR 兜底【之后】定义 —— 否则变量未注入时会解析成
-### /info.log、/app.pid（根目录，不可写）→ 每次写日志都
-### "Permission denied"，且会在 / 下留垃圾（实机见过 10-02 的 /info.log）。
+### 必须在上面兜底【之后】定义（原先是反的 → 未注入时 LOG_FILE=/info.log，
+### 在根目录写日志失败/留垃圾）。
 LOG_FILE="${TRIM_PKGVAR}/info.log"
 PID_FILE="${TRIM_PKGVAR}/app.pid"
 
@@ -520,6 +526,15 @@ start_gateway_supervisor() {
     # 本函数也能被 restart_gateway 单独调用，故在此也确保目录存在。
     mkdir -p "${ws}/tmp" 2>/dev/null || true
 
+    ### 日志可写是后续所有重定向的前提。不可写就立刻失败 —— 否则 supervisor
+    ### 的重定向失败会被后台子 shell 吞掉，父进程照常打印 pid（假成功），
+    ### 而网关其实从未启动（实机报告 §4.3）。
+    if ! { : >> "${LOG_FILE}"; } 2>/dev/null; then
+        echo "日志不可写：${LOG_FILE}" >&2
+        echo "日志不可写：${LOG_FILE}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+        return 1
+    fi
+
     ### 单例保护（缺陷 A）：本函数"调用即新建"，而 gateway-restart 会被面板连点 /
     ### 前端超时重试触发多次 → 起出多份 supervisor → 各拉一个 gateway 抢单例 →
     ### 后起者必 exit 75 → 无限重启风暴。所以起之前先清掉已有实例。
@@ -545,7 +560,16 @@ start_gateway_supervisor() {
         runuser -u "${TRIM_USERNAME}" -- bash -c \
             "exec '${SELF_PATH}' __gateway_supervisor '${ws}'" >> "${LOG_FILE}" 2>&1 200>&- &
     fi
-    log_msg "启动消息网关 supervisor (pid=$!)"
+    local spid=$!
+    ### 不要立刻宣告成功：后台子 shell 可能因重定向/权限/exec 失败秒退。
+    ### 稍等再确认它真活着，否则返回非 0（调用方据此报失败，而不是假成功）。
+    sleep 1
+    if ! kill -0 "${spid}" 2>/dev/null; then
+        log_msg "启动消息网关 supervisor 失败（pid=${spid} 已退出）"
+        return 1
+    fi
+    log_msg "启动消息网关 supervisor (pid=${spid})"
+    return 0
 }
 
 start_process() {
@@ -667,7 +691,10 @@ HERMES_GATEWAY_DEBUG='1' \
     # 由本脚本当 supervisor（--external-supervisor 的语义就是"退出后交还给
     # manager 重启"）：gateway 退出就拉起，这样 dashboard 的「重启网关」才有意义
     # （见下面 supervisor 循环）。
-    start_gateway_supervisor "${ws}"
+    if ! start_gateway_supervisor "${ws}"; then
+        # 不阻断 dashboard 启动，但必须留下明确记录（否则表现为"应用正常、通道离线"）。
+        log_msg "警告：消息网关 supervisor 启动失败 —— 消息平台将不可用，请查看日志"
+    fi
 
     # 就绪：TCP 回环监听 + Unix Socket
     local i=0
@@ -814,9 +841,24 @@ restart_gateway() {
     pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
 
     # 起：写回 want → 重启 supervisor（start_gateway_supervisor 自带单例清理）
-    start_gateway_supervisor "${ws}"
-    log_msg "gateway restart 完成"
-    return 0
+    start_gateway_supervisor "${ws}" || {
+        log_msg "gateway restart 失败：supervisor 未启动"
+        return 1
+    }
+    # 不再无条件宣告成功：等 gateway 进程真正出现（最多 10s）。
+    # 原先这里直接 return 0，而 supervisor 可能因日志不可写等秒退 →
+    # 面板显示「已重启」但通道实际离线（实机报告 §4.3，最危险的一处）。
+    local n=0
+    while [ "${n}" -lt 10 ]; do
+        if pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
+            log_msg "gateway restart 完成"
+            return 0
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+    log_msg "gateway restart 失败：10s 内未见 gateway 进程"
+    return 1
 }
 
 ### 仅启动消息网关（不停 dashboard / 代理）。供代理的 /api/gateway/start 调用。
@@ -828,7 +870,10 @@ start_gateway_only() {
         log_msg "gateway 已在运行"
         return 0
     fi
-    start_gateway_supervisor "${ws}"
+    start_gateway_supervisor "${ws}" || {
+        log_msg "gateway start 失败：supervisor 未启动"
+        return 1
+    }
     log_msg "gateway start 完成"
     return 0
 }
