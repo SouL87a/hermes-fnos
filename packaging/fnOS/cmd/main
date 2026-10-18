@@ -74,6 +74,54 @@ DATA_DIR="${TRIM_PKGVAR}"
 ### 校验）—— 不需要 venv，且落在可写的数据目录。实测 --target 路径 exit=0。
 LAZY_SITE="${DATA_DIR}/site-packages"
 
+### 懒安装目录的 ABI 守卫。
+### ⚠ 惨痛教训（v0.22.2 升级实机）：LAZY_SITE 被放在 PYTHONPATH 里，且【优先于】
+### 包内解释器自己的 site-packages。上一个版本（CPython 3.12）的懒安装目录里
+### 残留着 cp312 编译的扩展（如 pydantic_core/_pydantic_core.cpython-312-*.so）。
+### 换成 CPython 3.14 后，这些目录仍在 PYTHONPATH 前部 → import 到 cp312 的包
+### → `ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'`
+### → dashboard 起不来（Bad Gateway）、gateway 的 agent 也全线失败。
+### 上游只在【下次懒安装时】才校验 ABI 戳（_ensure_target_ready），不会在启动时
+### 清理 —— 所以必须由我们在启动前处理：ABI 不匹配就把整个目录归档移走
+### （不删，留作排查/回退），让解释器用包内自带的 site-packages。
+### 当前解释器的 ABI 标记，形如 `cpython-314-x86_64-linux-gnu`（不含前后缀）。
+lazy_abi() {
+    "${PY}" -c 'import sysconfig; s=sysconfig.get_config_var("EXT_SUFFIX") or ""; print(s[1:-3] if s.startswith(".") and s.endswith(".so") else s)' 2>/dev/null
+}
+
+ensure_lazy_site_abi() {
+    [ -d "${LAZY_SITE}" ] || { mkdir -p "${LAZY_SITE}" 2>/dev/null || true; return 0; }
+    local want stamp have
+    want="$(lazy_abi)"
+    [ -n "${want}" ] || return 0
+    stamp="${LAZY_SITE}/.abi-stamp"
+    if [ -f "${stamp}" ]; then
+        have="$(tr -d '[:space:]' < "${stamp}" 2>/dev/null)"
+        [ "${have}" = "${want}" ] && return 0
+    else
+        # 没有戳：目录可能来自旧版本（或首次创建）→ 看里面有没有同构的 .so 能判断。
+        # 抽不到 ABI（abi3 稳定 ABI / 异常命名）→ 放行（宁可保留也不误删用户目录）。
+        local so abi=""
+        so="$(find "${LAZY_SITE}" -maxdepth 3 -name '*.so' 2>/dev/null | head -n 1)"
+        if [ -z "${so}" ]; then
+            printf '%s\n' "${want}" > "${stamp}" 2>/dev/null || true
+            return 0
+        fi
+        abi="$(basename "${so}" | sed -nE 's/^.*\.(cpython-[0-9]+[^.]*)\.so$/\1/p')"
+        if [ -z "${abi}" ] || [ "${abi}" = "${want}" ]; then
+            printf '%s\n' "${want}" > "${stamp}" 2>/dev/null || true
+            return 0
+        fi
+        have="${abi}"
+    fi
+    local bak="${LAZY_SITE}.abi-mismatch-$(date +%Y%m%d%H%M%S)"
+    log_msg "懒安装目录 ABI 不匹配（旧=${have:-?} 新=${want}）→ 归档到 ${bak} 并重建"
+    mv "${LAZY_SITE}" "${bak}" 2>/dev/null || rm -rf "${LAZY_SITE}" 2>/dev/null || true
+    mkdir -p "${LAZY_SITE}" 2>/dev/null || true
+    printf '%s\n' "${want}" > "${LAZY_SITE}/.abi-stamp" 2>/dev/null || true
+    return 0
+}
+
 ### 进程识别：绝对路径匹配，不误伤其他 python。
 ### ⚠ 系统 Python 模式下 dashboard 的 argv[0] 是 ${TRIM_PKGVAR}/venv/bin/python3，
 ### 【不含】${APP_DIR}/runtime（实测该进程 cmdline 只有 venv 解释器 + 参数）。
@@ -390,6 +438,9 @@ start_process() {
     local ws
     ws="$(resolve_workspace)"
     mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "${ws}/tmp" "${LAZY_SITE}" "$(dirname "${PID_FILE}")"
+    # 懒安装目录 ABI 守卫：Python 大版本变更后，旧目录里的 cp3xx 扩展会让
+    # import 崩（pydantic_core 等），必须先归档。见 ensure_lazy_site_abi 注释。
+    ensure_lazy_site_abi
     rm -f "${GATEWAY_SOCKET}"
 
     log_msg "Starting Hermes dashboard (gateway + loopback port) ..."
