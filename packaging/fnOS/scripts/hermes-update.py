@@ -59,6 +59,7 @@ LOCK_FILE = DATA_ROOT / "update.lock"
 CONFIG_FILE = DATA_ROOT / "update.json"
 
 DEFAULT_REPO = "https://github.com/NousResearch/hermes-agent.git"
+DEFAULT_REPO_SLUG = "NousResearch/hermes-agent"
 
 
 # ── 状态 ─────────────────────────────────────────────────────
@@ -100,6 +101,22 @@ def channel() -> str:
 
 def repo_url() -> str:
     return str(os.environ.get("HERMES_UPDATE_REPO") or read_config().get("repo") or DEFAULT_REPO).strip()
+
+
+def repo_slug() -> str:
+    """把 git 远端地址规范成 ``owner/repo``（供 GitHub API 用）。
+
+    ``repo_url()`` 可能是 ``https://github.com/o/r.git``、
+    ``git@github.com:o/r.git`` 或 ``https://github.com/o/r`` —— 直接拼进
+    ``api.github.com/repos/<slug>/releases`` 只有最后一种能用，其余会 404。
+    """
+    url = repo_url()
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/\s]+?)(?:\.git)?/?$", url)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    # 非 GitHub（自建 Gitea 等）：取路径最后两段
+    parts = [p for p in re.split(r"[/:]", url) if p and p not in ("https", "http", "ssh", "git")]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else DEFAULT_REPO_SLUG
 
 
 # ── 进程/工具 ────────────────────────────────────────────────
@@ -211,11 +228,52 @@ def _pyproject_version(tree: Path) -> str | None:
 
 
 # ── 远端解析 ─────────────────────────────────────────────────
+def _latest_release_via_api(repo: str) -> str | None:
+    """用 GitHub Releases API 拿最新【非 prerelease】的 tag 名。
+
+    为什么需要它（而不是只靠 ls-remote + 数字排序）：上游的 stable tag 有
+    两套命名 —— 日期式 v2026.9.24 与 semver 式 v0.22.2 —— 跨方案比数字会把
+    0.22 判成比 2026.9 还小（实锤：v0.22.2 已发布但旧逻辑会认为 v2026.9.24
+    仍是"最新"）。Releases API 按发布时间倒序且带 prerelease 标记，天然正确。
+
+    返回 None（网络失败/无 release）则由调用方退回 ls-remote 老逻辑。
+    """
+    import urllib.request
+    url = f"https://api.github.com/repos/{repo}/releases?per_page=20"
+    last_err = ""
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
+                                                        "User-Agent": "hermes-fnos-update"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                # resp.read() 在慢/抖链路上可能 IncompleteRead（真机网络实测）——
+                # 按 chunk 收齐再解析；失败则下一轮重试。
+                chunks = []
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            data = json.loads(b"".join(chunks).decode("utf-8", "replace"))
+            for rel in data if isinstance(data, list) else []:
+                if not rel.get("prerelease") and rel.get("tag_name"):
+                    return str(rel["tag_name"])
+            return None
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"{type(exc).__name__}: {exc}"
+            if attempt == 1:
+                time.sleep(2)
+    if last_err:
+        print(f"[hermes-update] releases API 不可达（{last_err}），退回 ls-remote 判定",
+              file=sys.stderr, flush=True)
+    return None
+
+
 def resolve_target(git: str) -> tuple[str, str, str]:
     """返回 (kind, ref, label)。kind ∈ {branch, tag}。
 
     channel=main  → 分支 main
-    channel=stable→ 最新稳定 tag（v2026.x.y 形式）
+    channel=stable→ 最新稳定 release（GitHub API 优先；失败退 ls-remote 正则）
     channel=canary→ 最新 canary tag
     其它           → 当作分支名
     """
@@ -227,8 +285,22 @@ def resolve_target(git: str) -> tuple[str, str, str]:
     if ch == "canary":
         cand = [t for t in tags if "canary" in t]
     elif ch == "stable":
-        # 稳定 tag 形如 v2026.9.24（不含 canary）
-        cand = [t for t in tags if "canary" not in t and re.match(r"^v?\d{4}\.\d", t)]
+        # 首选：Releases API（发布时间序，跨 v2026.x / v0.22.x 命名都正确）
+        api_tag = _latest_release_via_api(repo_slug())
+        if api_tag and api_tag in tags:
+            return "tag", api_tag, api_tag
+        # 兜底：ls-remote 正则（API 不可达时）。⚠ 上游有两套命名 —— 日期式
+        # v2026.9.24 与 semver 式 v0.22.2 —— 跨方案比数字会把 0.22 判成比
+        # 2026.9 小。所以按【本机当前版本的命名方案】过滤同类再比，绝不混排。
+        cur = local_version().get("ref", "")
+        is_date_scheme = bool(re.match(r"^v?\d{4}\.", cur))
+        cand = [t for t in tags if "canary" not in t and not t.startswith("abandoned-")
+                and re.match(r"^v?\d+(\.\d+)+$", t)]
+        if is_date_scheme:
+            same = [t for t in cand if re.match(r"^v?\d{4}\.", t)]
+        else:
+            same = [t for t in cand if not re.match(r"^v?\d{4}\.", t)]
+        cand = same or cand   # 同类为空则退回全集（不至于选不出）
     else:
         cand = [t for t in tags if t == ch]
     if not cand:
@@ -390,16 +462,20 @@ def rebuild_web() -> tuple[bool, str]:
     env["HERMES_WEB_BASE"] = os.environ.get("HERMES_WEB_BASE", "/app/hermes/")
     try:
         # --ignore-scripts：避开会联网挂死的 postinstall（与 build.sh 同因）
+        # ⚠ 必须把 env 传进去（env_extra）——npm 的 shim 首行是 `#!/usr/bin/env node`，
+        #   env 只认 PATH；不传则上面拼的 node 目录白拼，npm 直接
+        #   "env: 'node': No such file or directory"（真机报「更新失败」的根因）。
         proc = run([npm, "install", "--no-audit", "--no-fund", "--ignore-scripts",
-                    "--workspace", "web"], cwd=SRC, timeout=1800)
+                    "--workspace", "web"], cwd=SRC, timeout=1800, env_extra=env)
         if proc.returncode != 0:
             return False, "npm install 失败：" + "\n".join(proc.stdout.splitlines()[-20:])
 
         # web-build.mjs 以 cwd 为源码树根，复制过去执行（与 build.sh 同款用法）
+        # env 同样要传：构建脚本内部再 spawn npm/vite 等工具时同样依赖 PATH。
         staged = SRC / ".hermes-web-build.mjs"
         shutil.copyfile(builder, staged)
         try:
-            proc = run([node, str(staged)], cwd=SRC, timeout=1800)
+            proc = run([node, str(staged)], cwd=SRC, timeout=1800, env_extra=env)
         finally:
             staged.unlink(missing_ok=True)
         if proc.returncode != 0:
