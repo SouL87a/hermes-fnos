@@ -5,7 +5,7 @@
 # 产物：packaging/fnOS/dist/hermes-<version>.fpk
 #
 # payload 不是上游的现成 runtime（上游只给安装脚本，靠 uv 现拉），而是本地装配：
-#   1. python-build-standalone 的 CPython 3.12（可重定位、自带 SQLite 3.53.1，随包分发）
+#   1. python-build-standalone 的 CPython 3.14（可重定位、自带 SQLite 3.53.1，随包分发）
 #   2. 依赖装进该 CPython 的 site-packages（构建时联网一次，运行期零联网）
 #   3. 前端预构建（npm build → hermes_cli/web_dist）
 #   4. 上游源码树（钉住 upstream.version 的提交）
@@ -76,8 +76,9 @@ fi
 # ── 版本号：跟随上游 ─────────────────────────────────────────
 # fpk 版本 = 上游 ref 的版本（与 dashboard 左下角、install-stamp 一致），
 # 这样应用中心显示的版本能直接反映"当前是哪个 Hermes"。
+#   v0.22.2                        → 0.22.2      （2026-10-08 起的 semver 命名）
 #   v0.21.4+canary.20261001T070239Z → 0.21.4
-#   v2026.9.24                     → 2026.9.24
+#   v2026.9.24                     → 2026.9.24   （旧日期式命名）
 # 覆盖顺序：HERMES_VERSION 环境变量 > 上游 ref 推导 > fnos.version 兜底。
 UPSTREAM_REF_V="$(grep -vE '^\s*#|^\s*$' "${REPO}/upstream.version" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
 VERSION="${HERMES_VERSION:-}"
@@ -138,7 +139,7 @@ mkdir -p "${STAGE}" "${APP_DIR}" "${DIST}" "${RT}"
 #     的 WAL-reset 门（安全窗口 [3.44.6,3.45.0) ∪ [3.50.7,3.51.0) ∪ ≥3.51.3）
 #     → state.db 降级成 journal_mode=DELETE（写并发/持久性变差），且 doctor 的
 #     FTS 探针用 3.42+ 才有的 `flush` 命令 → 它报「FTS 损坏」是假阳性。
-#     PBS 自带 CPython 静态内嵌 SQLite —— 实测 cpython-3.12.14 = **3.53.1**，达标。
+#     PBS 自带 CPython 静态内嵌 SQLite —— 实测 cpython-3.14.7 = **3.53.1**，达标。
 #   · 安装期零联网：不必在 NAS 上 uv 建 venv 装依赖（代理/镜像那套复杂度一并消失）。
 #   · 不绑应用中心 Python 路径：用户卸载/升级 python312 不会让 venv 失效。
 #   代价：包体积大一个数量级（~127MB → ~500MB）。
@@ -146,9 +147,14 @@ mkdir -p "${STAGE}" "${APP_DIR}" "${DIST}" "${RT}"
 # 想改回「复用系统 Python」：设 HERMES_USE_SYSTEM_PYTHON=1（商店装 Python 3.12，
 #   安装时在 NAS 上建 venv 装依赖 —— 会重新受系统 SQLite 3.40.1 拖累）。
 #
-# ⚠ 上游 stable（v2026.9.24）要求 >=3.11,<3.14 → 只能 3.11 / 3.12 / 3.13（3.14 超范围）。
-#   3.12.14 是上游实测主力版本：48 个依赖全部有 cp312 manylinux wheel、零源码编译。
-PY_VERSION="${HERMES_PY_VERSION:-3.12.14}"
+# ⚠ 为什么是 3.14（v0.22.2 起）：
+#   上游从 v0.21.6 的「新 stable 发布管线」起，把 **全部核心依赖都钉了
+#   `python_version >= '3.14'` 环境标记**（45 条全带），而 requires-python 仍写
+#   >=3.11,<3.15 —— 元数据自相矛盾。用 3.12 构建时这些依赖会被标记过滤掉，
+#   只剩下零散传递依赖（实测只装上 37/56，cryptography/PIL/psutil 全缺，校验失败）。
+#   故必须用 3.14。实测 cpython-3.14.7：56 个依赖全部有 cp314 wheel（零源码编译），
+#   cryptography/PIL/psutil/fastapi/... 均可导入。
+PY_VERSION="${HERMES_PY_VERSION:-3.14.7}"
 PBS_TAG="${HERMES_PBS_TAG:-20260929}"     # 自带模式下的 PBS 标签
 PBS_CACHE="${PKG_DIR}/.cache"
 mkdir -p "${PBS_CACHE}"

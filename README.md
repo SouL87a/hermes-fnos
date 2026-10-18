@@ -18,7 +18,7 @@
 
 | 组件 | 官方 `trim.hermes` | 本仓库 |
 |---|---|---|
-| 运行时 | Python 3.11.15（焊死） | **CPython 3.12.14**（自带，可随上游演进） |
+| 运行时 | Python 3.11.15（焊死） | **CPython 3.14.7**（自带，可随上游演进） |
 | 网关适配 | Go 静态二进制（含版本锁，**改不了**） | **Python `gateway-proxy.py`**（明文，无锁） |
 | 更新 | 拦截（返回"去应用中心更新"） | **真实在线更新**（git 拉取 + 重装依赖） |
 
@@ -51,7 +51,7 @@ hermes-update version   # 打印当前版本
 
 | channel | 含义 |
 |---|---|
-| `stable`（默认） | 跟最新稳定 tag（如 `v2026.9.24`）—— 正式版，与 `upstream.version` 口径一致 |
+| `stable`（默认） | 跟最新稳定 release（如 `v0.22.2`）—— 正式版，与 `upstream.version` 口径一致 |
 | `main` | 跟 main 分支最新提交（前沿，可能未发正式版） |
 | `canary` | 跟最新 canary tag（预发布快照） |
 
@@ -65,7 +65,7 @@ ZCode 能"纯打包"是因为它复用应用中心的 `nodejs_v22`；**Hermes �
 
 | | ZCode（NAS-ZCode） | Hermes（本仓库） |
 |---|---|---|
-| 运行时 | 纯 Node，复用商店 `nodejs_v22` | **自带 CPython 3.12**（python-build-standalone） |
+| 运行时 | 纯 Node，复用商店 `nodejs_v22` | **自带 CPython 3.14**（python-build-standalone） |
 | 依赖 | 官方预编译 runtime 包 | 构建时用 uv 装进 CPython 的 site-packages，随包分发 |
 | 前端 | 上游自带 `--web` | 构建时 `npm --workspace web build` → `web_dist/` |
 | 网关接入 | 代理改写 HTML 根路径 | **原生前缀反代**：代理发 `X-Forwarded-Prefix` 即可，无需改写 HTML |
@@ -73,25 +73,22 @@ ZCode 能"纯打包"是因为它复用应用中心的 `nodejs_v22`；**Hermes �
 
 ## 关于 Python 版本
 
-**本仓库用上游 stable 的 `v2026.9.24`**（`requires-python = ">=3.11,<3.14"`），自带 `python-build-standalone` 的 **CPython 3.12.14**。
+**本仓库用上游 stable 的 `v0.22.2`**（`requires-python = ">=3.11,<3.15"`），自带 `python-build-standalone` 的 **CPython 3.14.7**。
 
-为什么是 3.12 而不是 3.14：
-- stable 要求 `>=3.11,<3.14`，**3.14 超出范围**（canary 才要求 `<3.15`）；
-- 3.12 是上游 stable 的实测主力版本，`>=3.11,<3.14` 里离下限/上限都有余量；
-- 全部 48 个依赖都有 cp312 manylinux wheel → 构建零源码编译（跨架构可移植性靠这个）。
+为什么是 3.14：上游从 `v0.21.6` 的「新 stable 发布管线」起，**把全部 45 条核心依赖都钉了 `python_version >= '3.14'` 环境标记**（同时 `requires-python` 仍写 `>=3.11` —— 元数据自相矛盾）。用 3.12 构建时这些依赖会被标记过滤掉，只剩零散传递依赖（实测只装上 37/56，`cryptography`/`PIL`/`psutil` 全缺，构建校验失败）。所以必须用 3.14。实测 `cpython-3.14.7`：56 个依赖全部有 cp314 wheel（零源码编译），关键模块均可导入。
 
-**另一个关键点 —— SQLite**：Python 自带的 `sqlite3` 只是个壳，真正的能力来自它链接的 `libsqlite3`。应用中心的 Python 3.12 链的是系统库 **3.40.1**，会命中 Hermes 的 WAL-reset 门（安全窗口 `[3.44.6,3.45.0) ∪ [3.50.7,3.51.0) ∪ ≥3.51.3`）→ `state.db` 降级为 `journal_mode=DELETE`，且 doctor 的 FTS 探针（用了 3.42+ 才有的 `flush`）会**误报**「state.db FTS 损坏」。`python-build-standalone` 的 CPython 静态内嵌较新的 SQLite，**实测 3.12.14 = 3.53.1**，过门、WAL 正常。这正是默认走自带模式的核心原因。
+> 上游 tag 命名也已变更：2026-10-08 起从日期式 `v2026.M.D` 改回 semver `vX.Y.Z`（`v0.21.6` 的 release notes 称 "the new stable release pipeline"）。在线的「检查更新」已改为优先走 Releases API（按发布时间），不依赖命名规则。
+
+**另一个关键点 —— SQLite**：Python 自带的 `sqlite3` 只是个壳，真正的能力来自它链接的 `libsqlite3`。应用中心的 Python 链的是系统库 **3.40.1**，会命中 Hermes 的 WAL-reset 门（安全窗口 `[3.44.6,3.45.0) ∪ [3.50.7,3.51.0) ∪ ≥3.51.3`）→ `state.db` 降级为 `journal_mode=DELETE`，且 doctor 的 FTS 探针（用了 3.42+ 才有的 `flush`）会**误报**「state.db FTS 损坏」。`python-build-standalone` 的 CPython 静态内嵌较新的 SQLite，**实测 3.14.7 = 3.53.1**，过门、WAL 正常。这正是默认走自带模式的核心原因。
 
 ### 运行时模式（默认自带，可选复用系统）
 
 | 模式 | 触发 | 说明 |
 |---|---|---|
-| **自带 CPython 3.12**（默认） | 直接构建 | 随包分发 CPython 3.12.14（PBS），运行期**零联网、零 pip**，不依赖 NAS 上装了什么。**自带 SQLite 3.53.1**，WAL 正常、doctor 无假 FTS 报错 |
-| 复用系统 Python | `HERMES_USE_SYSTEM_PYTHON=1` | 用系统 python3（需 3.11–3.13），包体积小（~127MB）；但**依赖要在安装时联网装**（uv 在 NAS 上建 venv），且系统 libsqlite3 偏旧（Debian 12 = 3.40.1）→ state.db 降级 DELETE、doctor 报假 FTS 损坏 |
+| **自带 CPython 3.14**（默认） | 直接构建 | 随包分发 CPython 3.14.7（PBS），运行期**零联网、零 pip**，不依赖 NAS 上装了什么。**自带 SQLite 3.53.1**，WAL 正常、doctor 无假 FTS 报错 |
+| 复用系统 Python | `HERMES_USE_SYSTEM_PYTHON=1` | ⚠ **v0.22.x 起不可用**：核心依赖全钉在 3.14，系统 Python（3.11/3.12）会把它们全过滤掉。档保留该模式供旧版 fpk 回退，且系统 libsqlite3 偏旧（Debian 12 = 3.40.1）→ state.db 降级 DELETE |
 
-> 上游 stable 要求 `Python >=3.11,<3.14` → 自带模式只能选 3.11 / 3.12 / 3.13（**3.14 超出范围**）。默认 3.12.14 = 上游实测主力版本，48 个依赖全部有 cp312 manylinux wheel、零源码编译。
->
-> 可用 `HERMES_PY_VERSION=3.13.15`（实测 SQLite 同为 3.53.1）或 `HERMES_PBS_TAG=YYYYMMDD` 覆盖。
+> 可用 `HERMES_PY_VERSION=3.14.x` 或 `HERMES_PBS_TAG=YYYYMMDD` 覆盖。
 
 ## 安装
 
@@ -167,7 +164,7 @@ upstream.version              # 钉住的上游 ref
 ```
 app/
 ├── runtime/
-│   ├── python/       # CPython 3.12（可重定位，自带 SQLite 3.53.1）
+│   ├── python/       # CPython 3.14（可重定位，自带 SQLite 3.53.1）
 │   ├── hermes-git.git/  # 上游 .git（移出工作树，供在线更新 + 堵 hermes update 自伤）
 │   ├── hermes/       # 上游源码树（含 .git，供在线更新）
 │   ├── web_dist/     # 预构建前端
@@ -184,7 +181,7 @@ app/
 
 | 验证项 | 结果 |
 |---|---|
-| CPython 3.12.14 下载/解包 | ✅ 自带 pip |
+| CPython 3.14.7 下载/解包 | ✅ 自带 pip |
 | **依赖全部安装，零源码编译** | ✅ 48 个依赖全有 cp312 manylinux wheel（`--only-binary=:all:`） |
 | cp312 wheel | ✅ `cryptography` / `pydantic-core` / `pillow` / `psutil` / `ruamel-yaml` 全有 |
 | **SQLite** | ✅ 自带 **3.53.1**，过 Hermes 的 WAL-reset 门（CI 里会实跑断言） |
