@@ -73,20 +73,27 @@ if [ "$(uname -s)" = "Darwin" ]; then
     echo "  请改用 Linux 或 WSL 构建。"
 fi
 
-# ── 版本号：跟随上游 ─────────────────────────────────────────
-# fpk 版本 = 上游 ref 的版本（与 dashboard 左下角、install-stamp 一致），
-# 这样应用中心显示的版本能直接反映"当前是哪个 Hermes"。
-#   v0.22.2                        → 0.22.2      （2026-10-08 起的 semver 命名）
+# ── 版本号 ───────────────────────────────────────────────────
+# 覆盖顺序：HERMES_VERSION env > fnos.version > 上游 ref 推导。
+#
+# fnos.version 用于「同一上游版本的重打包」：上游仍是 v0.22.2，但我们修了
+# 打包缺陷 → 写 0.22.2-1，让 fnOS 判定为升级（Debian 的 upstream-revision
+# 规则，0.22.2-1 > 0.22.2），用户可直接覆盖安装而不必卸载。
+#   fnos.version: 0.22.2-1  → fpk 版本 0.22.2-1
+# 未提供 fnos.version 时跟随上游 tag（去掉 v 与 +canary 后缀，保留 -N）：
+#   v0.22.2                        → 0.22.2
+#   v0.22.2-1                      → 0.22.2-1
 #   v0.21.4+canary.20261001T070239Z → 0.21.4
-#   v2026.9.24                     → 2026.9.24   （旧日期式命名）
-# 覆盖顺序：HERMES_VERSION 环境变量 > 上游 ref 推导 > fnos.version 兜底。
+#   v2026.9.24                     → 2026.9.24
 UPSTREAM_REF_V="$(grep -vE '^\s*#|^\s*$' "${REPO}/upstream.version" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
 VERSION="${HERMES_VERSION:-}"
-if [ -z "${VERSION}" ] && [ -n "${UPSTREAM_REF_V}" ]; then
-    VERSION="$(printf '%s' "${UPSTREAM_REF_V}" | sed -E 's/^v//; s/[+-].*$//')"
-fi
 if [ -z "${VERSION}" ] && [ -f "${REPO}/fnos.version" ]; then
     VERSION="$(grep -vE '^\s*#|^\s*$' "${REPO}/fnos.version" | head -n 1 | tr -d '[:space:]')"
+    [ -n "${VERSION}" ] && echo "[build] 使用 fnos.version 指定的打包版本：${VERSION}"
+fi
+if [ -z "${VERSION}" ] && [ -n "${UPSTREAM_REF_V}" ]; then
+    # 只剥 v 前缀与 +build 元数据，保留 -N 修订号
+    VERSION="$(printf '%s' "${UPSTREAM_REF_V}" | sed -E 's/^v//; s/\+.*$//')"
 fi
 [ -z "${VERSION}" ] && VERSION="0.0.0"
 echo "[build] 版本 ${VERSION}（跟随上游 ${UPSTREAM_REF_V:-?}）"
@@ -570,16 +577,33 @@ PY="${DATA_DIR}/venv/bin/python3"
 [ -x "${PY}" ] || PY="${APP_DIR}/runtime/python/bin/python3"
 [ -x "${PY}" ] || PY="$(command -v python3)"
 
-# node：与 cmd/main 的 find_node_bin() 同逻辑（TUI 终端要用）
+# node：与 cmd/main 的 find_node_bin() 同逻辑（TUI 终端要用）。
+# ⚠ 按【版本】分层（v24 → v22），每档覆盖 /var/apps 与跨卷 @appcenter 两种形态；
+#   v22 档校验 engines 下限（^22.22.0，应用中心的 22.18.0 会被跳过）。
+#   <data>/node 是 Hermes 按需下载的托管 node（通常过时），只作兜底。
 NODE=""
-for d in "${DATA_DIR}/node/bin/node" \
-         /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node \
-         /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node; do
-    [ -x "${d}" ] && { NODE="${d}"; break; }
+for _mj in 24 22; do
+    [ -n "${NODE}" ] && break
+    for d in /var/apps/nodejs_v${_mj}/target/bin/node \
+             /var/apps/nodejs_v${_mj}/bin/node \
+             /vol*/@appcenter/nodejs_v${_mj}/bin/node; do
+        [ -x "${d}" ] || continue
+        if [ "${_mj}" = "22" ]; then
+            _ver="$("${d}" -v 2>/dev/null)"
+            [ "$(printf '%s\nv22.22.0\n' "${_ver}" | sort -V | tail -n 1)" = "${_ver}" ] || continue
+        fi
+        NODE="${d}"; break
+    done
 done
+if [ -z "${NODE}" ] && [ -x "${DATA_DIR}/node/bin/node" ]; then NODE="${DATA_DIR}/node/bin/node"; fi
 if [ -z "${NODE}" ]; then
     d="$(command -v node 2>/dev/null || true)"
     [ -n "${d}" ] && [ -x "${d}" ] && NODE="${d}"
+fi
+if [ -z "${NODE}" ]; then
+    for d in /vol*/@appcenter/nodejs_v25/bin/node /vol*/@appcenter/nodejs_v26/bin/node; do
+        [ -x "${d}" ] && { NODE="${d}"; break; }
+    done
 fi
 # ⚠ 必须把 node 的目录加进 PATH，不能只设 HERMES_NODE：
 #   HERMES_NODE 只告诉 Hermes「node 在哪」，而那些 npm/npx shim 的首行是

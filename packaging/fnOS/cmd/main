@@ -322,19 +322,34 @@ port_listening() {
 ### 定位路径，在离线/受限环境会**长时间无输出**（实测报告缺陷 4）。
 ### 优先级：Hermes 托管的 node（<data>/node/bin/node，Hermes 自己的 dep_ensure 也优先它）
 ### → 应用中心的 nodejs → PATH → 跨卷兜底。
+### 优先级（v24 优先，与 manifest 的 install_dep_apps=nodejs_v24 一致）：
+###   1) 应用中心 nodejs v24 → v22（每档都覆盖 /var/apps 与跨卷 @appcenter 两种形态）
+###   2) Hermes 托管的 <data>/node（兜底；旧布局/用户自装）
+###   3) PATH → 跨卷 v25/v26
+### ⚠ 两处必须按【版本】分层，不能按【路径】分层（实机报告 node-priority-fix）：
+###   · 跨卷的 v24 若排在 /var/apps 的 v22 之后，就会「降级」选到 v22；
+###   · 应用中心 v22 实测是 22.18.0，**低于** engines 下限 22.22.0，必须校验。
+### ⚠ <data>/node 不能放第一顺位：它是 Hermes 按需下载的（实测 v22.23.3），
+###   版本随上游 lock 变化且通常过时；放首位会让"v24 优先"形同虚设。
 find_node_bin() {
-    local d
-    [ -x "${DATA_DIR}/node/bin/node" ] && { printf '%s' "${DATA_DIR}/node/bin/node"; return 0; }
-    # v24 优先：Hermes v0.22 的 engines 为 "^22.22.0 || ^24.11.0 || >=26.0.0"，
-    # 两版都支持，但 v24 生命周期更长（参考的 OpenClaw 系包也用 v24）。
-    for d in /var/apps/nodejs_v24/target/bin/node /var/apps/nodejs_v24/bin/node \
-             /var/apps/nodejs_v22/target/bin/node /var/apps/nodejs_v22/bin/node; do
-        [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
+    local d mj ver
+    for mj in 24 22; do
+        for d in /var/apps/nodejs_v${mj}/target/bin/node \
+                 /var/apps/nodejs_v${mj}/bin/node \
+                 /vol*/@appcenter/nodejs_v${mj}/bin/node; do
+            [ -x "${d}" ] || continue
+            # v22 档必须满足 engines（^22.22.0）；应用中心的 22.18.0 会被跳过。
+            if [ "${mj}" = "22" ]; then
+                ver="$("${d}" -v 2>/dev/null)"
+                [ "$(printf '%s\nv22.22.0\n' "${ver}" | sort -V | tail -n 1)" = "${ver}" ] || continue
+            fi
+            printf '%s' "${d}"; return 0
+        done
     done
+    # 兜底：Hermes 托管 node（应用中心没有满足 versions 的版本时才用）。
+    [ -x "${DATA_DIR}/node/bin/node" ] && { printf '%s' "${DATA_DIR}/node/bin/node"; return 0; }
     d="$(command -v node 2>/dev/null)" && [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
-    # 跨卷兜底：先 v24 再 v22（glob 是字典序，v22 会排在 v24 前，故分两轮）。
-    for d in /vol*/@appcenter/nodejs_v24/bin/node /vol*/@appcenter/nodejs_v25/bin/node \
-             /vol*/@appcenter/nodejs_v26/bin/node /vol*/@appcenter/nodejs_v22/bin/node; do
+    for d in /vol*/@appcenter/nodejs_v25/bin/node /vol*/@appcenter/nodejs_v26/bin/node; do
         [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
     done
     return 1

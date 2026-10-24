@@ -170,15 +170,16 @@ def find_node_tool(name: str) -> str | None:
     v24 优先（Hermes v0.22 engines 支持 ^22.22 || ^24.11 || >=26；v24 生命期更长）。
     """
     import glob as _glob
-    cands = [
-        RUNTIME / "python" / "node" / "bin" / name,
-        APP_ROOT / "runtime" / "node" / "bin" / name,
-        Path("/var/apps/nodejs_v24/target/bin") / name,
-        Path("/var/apps/nodejs_v22/target/bin") / name,
-    ]
-    # 全卷 glob 兜底（应用可能装在任意存储空间）；显式按 v24→v26→v22 排，避免
-    # 字典序把 v22 排到前面。
-    for ver in ("v24", "v25", "v26", "v22"):
+    cands = [RUNTIME / "python" / "node" / "bin" / name,
+             APP_ROOT / "runtime" / "node" / "bin" / name]
+    # 按【版本】分层：每档同时覆盖 /var/apps 与跨卷 @appcenter 两种形态，
+    # 否则跨卷的 v24 会排在 /var/apps 的 v22 之后（等于降级）。
+    for ver in ("v24", "v22"):
+        cands += [Path(f"/var/apps/nodejs_{ver}/target/bin") / name,
+                  Path(f"/var/apps/nodejs_{ver}/bin") / name]
+        cands += [Path(p) for p in _glob.glob(f"/vol*/@appcenter/nodejs_{ver}/bin/{name}")]
+    # 更高版本（若将来安装）作为兜底
+    for ver in ("v25", "v26"):
         cands += [Path(p) for p in _glob.glob(f"/vol*/@appcenter/nodejs_{ver}/bin/{name}")]
     for cand in cands:
         if cand.exists() and os.access(cand, os.X_OK):
