@@ -59,6 +59,20 @@ hermes-update version   # 打印当前版本
 
 > 更新需要 NAS 能访问 GitHub。国内网络慢时可设 `HERMES_PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple` 加速依赖安装。
 
+### 装新 fpk 时（应用中心升级）
+
+> ⚠ **已知平台缺陷**：飞牛应用中心的「本地应用覆盖升级」在部分机器上会在
+> "停止应用后、写入新内容前"中止，界面只显示「执行脚本出错且原因未知」，
+> 应用停在 stopped、内容仍是旧构建。**同一份 fpk 全新安装则完全正常**
+> （已在 NAS 实机对照验证）。
+>
+> **建议的升级方式**：应用中心 → 卸载 → **选「保留数据」** → 安装新 fpk。
+> 数据在 `/vol1/@appdata/hermes`，卸载保留数据不会丢；重装后自动回填。
+>
+> **排查升级失败时**：看 `<数据目录>/log/upgrade.log`。
+> `upgrade_init` / `upgrade_callback` 会各写一行（含时间戳、旧版本、
+> runtime 是否存在）；若连第一行都没有，说明平台没走到升级钩子。
+
 ## 为什么必须自带 Python
 
 ZCode 能"纯打包"是因为它复用应用中心的 `nodejs_v22`；**Hermes 没有商店可用的 Python 运行时**，所以必须自带一整套：

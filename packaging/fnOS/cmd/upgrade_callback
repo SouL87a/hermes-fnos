@@ -11,6 +11,19 @@ if [ -z "${TRIM_APPDEST}" ]; then
     fi
 fi
 
+### 自证日志 + 失败留痕（见 upgrade_init 的说明）。
+mkdir -p "${TRIM_PKGVAR}/log" 2>/dev/null || true
+_hermes_err_trap() {
+    local rc=$? line=$1 cmd=$2
+    local msg="[upgrade_callback] 第 ${line} 行失败 (rc=${rc}): ${cmd}"
+    echo "${msg}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+    echo "$(date -Is) ${msg}" >> "${TRIM_PKGVAR}/log/upgrade.log" 2>/dev/null || true
+}
+trap '_hermes_err_trap ${LINENO} "${BASH_COMMAND}"' ERR
+
+echo "$(date -Is) upgrade_callback: RUNTIME=${TRIM_APPDEST}/runtime 存在=$([ -d "${TRIM_APPDEST}/runtime" ] && echo yes || echo no)" \
+    >> "${TRIM_PKGVAR}/log/upgrade.log" 2>/dev/null || true
+
 RUNTIME="${TRIM_APPDEST}/runtime"
 [ -d "${RUNTIME}/python/bin" ] && find "${RUNTIME}/python/bin" -type f -exec chmod +x {} \; 2>/dev/null || true
 if [ -d "${RUNTIME}/python/lib" ]; then
@@ -20,5 +33,14 @@ if [ -d "${RUNTIME}/python/lib" ]; then
 fi
 [ -f "${TRIM_APPDEST}/gateway-proxy.py" ] && chmod +x "${TRIM_APPDEST}/gateway-proxy.py" 2>/dev/null || true
 
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+### ⚠ 不再 `chown -R "${TRIM_PKGVAR}"`：
+### 实测该目录有 168,510 个条目 / 12 GB，全量递归要十几秒到一分钟，
+### 若平台对 callback 设超时会中途被杀 → 判升级失败（实机报告 C3）。
+### 只修顶层目录属主（新解出的应用文件已在 TRIM_APPDEST，与数据目录无关）。
+chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+for d in log workspace state; do
+    [ -d "${TRIM_PKGVAR}/${d}" ] && \
+        chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}/${d}" 2>/dev/null || true
+done
+echo "$(date -Is) upgrade_callback: 完成" >> "${TRIM_PKGVAR}/log/upgrade.log" 2>/dev/null || true
 exit 0

@@ -4,4 +4,15 @@
 # 注意：这个阶段应用目录（TRIM_APPDEST）还没创建，不能检查它——
 # 否则会以 10237「应用目录不存在」中止安装。
 # 这里只做与目标目录无关的前置校验。
+
+### 失败留痕：fnOS 的四个 init/callback 错误码共用「原因未知」文案，
+### 脚本若在裸命令上退出就不会留任何信息。见 install_callback 里的说明。
+_hermes_err_trap() {
+    local rc=$? line=$1 cmd=$2
+    local msg="[install_init] 第 ${line} 行失败 (rc=${rc}): ${cmd}"
+    echo "${msg}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+    [ -n "${TRIM_PKGVAR}" ] && echo "$(date -Is) ${msg}" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+}
+trap '_hermes_err_trap ${LINENO} "${BASH_COMMAND}"' ERR
+
 exit 0

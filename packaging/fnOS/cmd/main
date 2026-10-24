@@ -937,5 +937,10 @@ case "$1" in
     gateway-stop)    stop_gateway_only ;;
     # 内部：被 runuser 以应用用户身份拉起的 supervisor 循环体
     __gateway_supervisor) shift; gateway_supervisor_loop "$@" ;;
-    *)       exit 1 ;;
+    *)
+        # 平台可能传入我们不认识的子命令。静默 exit 1 会让界面显示
+        # 「执行脚本出错且原因未知」（实机报告 C2 的建议③）——先留痕再失败。
+        log_msg "未知子命令：'${1:-<空>}'（只接受 start/stop/restart/status/update/gateway-*/__gateway_supervisor）"
+        echo "未知子命令：${1:-<空>}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+        exit 1 ;;
 esac

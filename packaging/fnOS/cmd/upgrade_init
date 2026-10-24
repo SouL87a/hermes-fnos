@@ -1,3 +1,35 @@
 #!/bin/bash
 # 升级前：停服务。用户数据在 TRIM_PKGVAR，不受升级影响。
+#
+# ⚠ 自证日志：fnOS 的「本地应用覆盖升级」在部分机器上会在"停止应用后、写入
+# 新内容前"中止，界面只显示「执行脚本出错且原因未知」，回调脚本的
+# stdout/stderr 与退出码被丢弃（同一份包全新安装则正常）。
+# 这里把关键信息写到 <data>/log/upgrade.log（数据目录升级失败也不会回滚），
+# 便于判断"升级流程到底走到了哪一步"。
+APP="hermes"
+if [ -z "${TRIM_PKGVAR}" ] && [ -d "/var/apps/${APP}/var" ]; then
+    TRIM_PKGVAR="$(readlink -f "/var/apps/${APP}/var")"
+fi
+LOG_DIR="${TRIM_PKGVAR}/log"
+mkdir -p "${LOG_DIR}" 2>/dev/null || true
+
+_hermes_err_trap() {
+    local rc=$? line=$1 cmd=$2
+    local msg="[upgrade_init] 第 ${line} 行失败 (rc=${rc}): ${cmd}"
+    echo "${msg}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+    echo "$(date -Is) ${msg}" >> "${LOG_DIR}/upgrade.log" 2>/dev/null || true
+}
+trap '_hermes_err_trap ${LINENO} "${BASH_COMMAND}"' ERR
+
+_old_manifest=""
+for m in "${TRIM_APPDEST}/../manifest" "/var/apps/${APP}/manifest" "/var/apps/${APP}/target/../manifest"; do
+    [ -r "${m}" ] && { _old_manifest="${m}"; break; }
+done
+_old_ver="$(grep -E '^version' "${_old_manifest}" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
+
+{
+    echo "$(date -Is) upgrade_init: APPDEST=${TRIM_APPDEST} PKGVAR=${TRIM_PKGVAR}"
+    echo "  旧 manifest: ${_old_manifest:-<未找到>} ${_old_ver:-<无版本>}"
+} >> "${LOG_DIR}/upgrade.log" 2>/dev/null || true
+
 exit 0

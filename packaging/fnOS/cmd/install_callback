@@ -3,6 +3,22 @@
 # 校验运行时完整性、准备数据目录。
 set -e
 
+### 失败必定留痕（实机教训）：
+### fnOS 的 InstallInit/InstallCallback/UpgradeInit/UpgradeCallback 四个错误码
+### 共用同一句文案「执行脚本出错且原因未知」。脚本若死在 `set -e` 下的裸命令上，
+### 不经过任何 `echo ... > ${TRIM_TEMP_LOGFILE}` 路径，用户就只能看到"原因未知"。
+### 这里用 ERR trap 把行号与失败命令写进 TRIM_TEMP_LOGFILE（应用中心会显示它），
+### 同时追加到数据目录（失败回滚后仍可查）。
+_hermes_err_trap() {
+    local rc=$? line=$1 cmd=$2
+    local msg="[install_callback] 第 ${line} 行失败 (rc=${rc}): ${cmd}"
+    echo "${msg}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+    [ -n "${TRIM_PKGVAR}" ] && echo "$(date -Is) ${msg}" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+}
+trap '_hermes_err_trap ${LINENO} "${BASH_COMMAND}"' ERR
+# 让 trap 的日志目录尽早存在（下面正式创建数据目录时会再次 mkdir，幂等）。
+[ -n "${TRIM_PKGVAR}" ] && mkdir -p "${TRIM_PKGVAR}/log" 2>/dev/null || true
+
 APP="hermes"
 
 if [ -z "${TRIM_APPDEST}" ]; then
@@ -200,7 +216,17 @@ if [ ! -f "${RUNTIME}/web_dist/index.html" ]; then
     exit 1
 fi
 
-chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+### 属主修正：全新安装时数据目录是新建的、条目很少 → 递归没问题；
+### 但「卸载保留数据后重装」或升级路径下该目录可能有 168,510 个条目 / 12 GB，
+### 全量递归要十几秒到一分钟，可能超出平台 callback 的超时（实机报告 C3）。
+### 所以：条目数小（<2000）才递归，否则只修顶层。
+_entries="$(find "${TRIM_PKGVAR}" -maxdepth 1 2>/dev/null | wc -l)"
+if [ "${_entries:-0}" -lt 2000 ]; then
+    chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+else
+    echo "  数据目录条目较多（${_entries}），只修正顶层属主（避免递归超时）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+    chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+fi
 
 # 安装向导里填的 HTTP 代理（wizard_proxy）落盘到 $HERMES_HOME/.env。
 # 逻辑与 config_callback 相同；这里只处理「安装时填了值」的情况，
