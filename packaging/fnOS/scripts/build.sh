@@ -311,12 +311,23 @@ mkdir -p "${RT}/hermes"
 ### 覆盖代码树（自伤）。移出工作树后 sealed_steward 走 stamp 的 distribution
 ### 分支 → 被正确拒绝并提示走应用中心；而我们的 hermes-update.py 用
 ### GIT_DIR/GIT_WORK_TREE 定向，在线更新功能不受影响。
+### 排除桌面端/测试代码（NAS 版不需要，且显著减小包体积）：
+###   apps/desktop   Electron 桌面端源码 —— 4,119 条目（占全包 17%）
+###   测试文件       1,872 个（.test.* / .spec.*）
+### 实测：全包 24,679 条目 → 排除后约 18,700（-24%）。
+### 安全性：venv_sync.py 只"探测" apps/desktop/dist/index.html 是否存在来决定
+###   是否构建桌面端（不存在→desktop=False），不做硬依赖；`hermes desktop`
+###   子命令在 NAS 上本就不可用。apps/shared 与 bootstrap-installer 只有 109
+###   条目，保守保留（避免影响前端构建脚本）。
+### 背景：fnOS 覆盖升级曾在解包阶段失败（临时目录只解出 cmd/config/wizard，
+###   runtime 未解出）——减小体积/文件数可降低此类失败概率。
 ( cd "${SRC}" && tar -cf - \
     --exclude='.git' \
     --exclude='node_modules' \
     --exclude='web/node_modules' \
     --exclude='ui-tui/node_modules' \
     --exclude='apps/*/node_modules' \
+    --exclude='apps/desktop' \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     --exclude='.venv' \
@@ -324,6 +335,10 @@ mkdir -p "${RT}/hermes"
     --exclude='tests-js' \
     --exclude='evals' \
     --exclude='website' \
+    --exclude='*.test.ts' --exclude='*.test.tsx' \
+    --exclude='*.test.js' --exclude='*.test.jsx' \
+    --exclude='*.spec.ts' --exclude='*.spec.tsx' \
+    --exclude='__tests__' --exclude='__mocks__' \
     . ) | ( cd "${RT}/hermes" && tar -xf - )
 
 # ── 3a. .git 移到工作树外（保留在线更新能力，同时堵住 hermes update 自伤）──
