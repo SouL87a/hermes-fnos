@@ -210,40 +210,49 @@ else
     [ -x "${PYBIN}" ] || { echo "✗ CPython 解包异常，缺 ${PYBIN}"; exit 1; }
     "${PYBIN}" --version
 
-    # ── 瘦身（实测省 ~145MB 解包后 / ~50MB 压缩后）──────────
-    # ⚠ 必须用 eu-strip（elfutils），【不能用 GNU strip】：
-    #   PBS 的二进制带符号版本节（.gnu.version*），GNU strip 会剥掉它们 →
-    #   运行时报 "no version information available" 与
-    #   "symbol lookup error: undefined symbol" → Python 直接起不来（已实测）。
-    #   eu-strip --strip-all 保留必要的动态符号，实测 Python 正常。
-    #   构建机需装 elfutils（Ubuntu: apt-get install -y elfutils）。
-    _eu_strip() {
-        local f="$1"
-        [ -f "${f}" ] || return 0
-        if command -v eu-strip > /dev/null 2>&1; then
-            eu-strip --strip-all -o "${f}.stripped" "${f}" 2>/dev/null \
-                && mv -f "${f}.stripped" "${f}" \
-                || { rm -f "${f}.stripped"; echo "  ⚠ eu-strip 失败，保留原文件：${f}"; }
-        else
-            echo "  ⚠ 未找到 eu-strip（elfutils），跳过 strip：${f}"
-        fi
-    }
+    # ── 瘦身（实测 runtime/python 443MB → 262MB，-181MB）──────────
+    # 依据（在 NAS 上对 runtime/python 内【全部 ELF】做了扫描，比 ldd 更确凿）：
+    #   命中 libpython3 的文件只有 2 个：libpython3.14.so.1.0 它自己，以及
+    #   libpython3.so（16KB 的开发用链接桩）。bin/python3.14 是【静态链接】CPython，
+    #   site-packages 里所有扩展 .so 也都不链 libpython。
+    #   另外懒安装走 pm/environment.py 的 `--no-index --only-binary :all:`，
+    #   只装 wheel、永不编译源码 → include/（C 头文件）同样没有存在意义。
+    # 因此 libpython*.so 与 include/ 直接【删除】，不是 strip（多省 35MB + 少两个文件）。
     _before="$(du -sm "${RT}/python" 2>/dev/null | cut -f1)"
-    # python3.14（可执行）：75MB → ~30MB
-    _eu_strip "${RT}/python/bin/python3.14"
-    # libpython3.14.so（共享库）：131MB → ~33MB
-    # 运行期不需要（python3.14 静态链接了 CPython），保留只为支持 pip 编译 sdist。
-    _eu_strip "${RT}/python/lib/libpython3.14.so.1.0"
-    # 运行期用不到：C 头文件（编译扩展才要）、ensurepip（pip 已在 site-packages）、
-    # idlelib（IDE）。⚠ 不要删 __pycache__（删了每次启动重编译，更慢）。
+    # 三个实体文件 + 指向它们的符号链接（否则删完留悬空链接）：
+    #   libpython3.14.so.1.0   131MB 实际库
+    #   libpython3.so           16KB 开发用链接桩
+    #   libpython3.14.so        → .so.1.0 的软链
+    rm -f "${RT}/python/lib/libpython3.14.so.1.0" \
+          "${RT}/python/lib/libpython3.so" \
+          "${RT}/python/lib/libpython3.14.so"
+    # 运行期用不到：C 头文件、ensurepip（pip 已在 site-packages）、idlelib（IDE）。
+    # ⚠ 不要删 __pycache__（删了每次启动重编译，反而更慢）。
     rm -rf "${RT}/python/include" \
            "${RT}/python/lib/python3.14/ensurepip" \
            "${RT}/python/lib/python3.14/idlelib"
+    # 只对可执行文件 strip：75MB → ~30MB。
+    # ⚠ 必须用 eu-strip（elfutils），【不能用 GNU strip】：
+    #   PBS 二进制带 .gnu.version* 符号版本节，GNU strip 会剥掉它们 →
+    #   "no version information available" + "symbol lookup error: undefined
+    #   symbol" → Python 完全起不来（已实测，--strip-unneeded 也一样）。
+    if [ -f "${RT}/python/bin/python3.14" ]; then
+        if command -v eu-strip > /dev/null 2>&1; then
+            eu-strip --strip-all -o "${RT}/python/bin/python3.14.stripped" \
+                    "${RT}/python/bin/python3.14" 2>/dev/null \
+                && mv -f "${RT}/python/bin/python3.14.stripped" "${RT}/python/bin/python3.14" \
+                || { rm -f "${RT}/python/bin/python3.14.stripped"; echo "  ⚠ eu-strip 失败，保留原二进制"; }
+        else
+            echo "  ⚠ 未找到 eu-strip（elfutils），跳过 strip（体积会多 ~45MB）"
+        fi
+    fi
     _after="$(du -sm "${RT}/python" 2>/dev/null | cut -f1)"
     [ -n "${_before}" ] && [ -n "${_after}" ] && \
         echo "[build] runtime/python 瘦身：${_before}MB → ${_after}MB"
-    # 瘦身后必须仍可运行（防止 strip 出错把包打废）
-    "${PYBIN}" -c "import sqlite3,sys; print('[build] 瘦身后自检 OK:', sys.version.split()[0], sqlite3.sqlite_version)" \
+    # 瘦身后必须仍可运行（防止 strip/删除出错把包打废）。
+    # 校验点覆盖：解释器本身、三方扩展（走 .so，证明不依赖 libpython）、
+    # 以及一个纯 C 扩展模块。
+    "${PYBIN}" -c "import sys, sqlite3, ssl, ctypes, asyncio, multiprocessing; print('[build] 瘦身后自检 OK:', sys.version.split()[0], sqlite3.sqlite_version)" \
         || { echo "✗ 瘦身后 Python 无法运行（check eu-strip 版本）"; exit 1; }
 fi
 
