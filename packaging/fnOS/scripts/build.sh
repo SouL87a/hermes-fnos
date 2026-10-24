@@ -209,6 +209,42 @@ else
     PYBIN="${RT}/python/bin/python3"
     [ -x "${PYBIN}" ] || { echo "✗ CPython 解包异常，缺 ${PYBIN}"; exit 1; }
     "${PYBIN}" --version
+
+    # ── 瘦身（实测省 ~145MB 解包后 / ~50MB 压缩后）──────────
+    # ⚠ 必须用 eu-strip（elfutils），【不能用 GNU strip】：
+    #   PBS 的二进制带符号版本节（.gnu.version*），GNU strip 会剥掉它们 →
+    #   运行时报 "no version information available" 与
+    #   "symbol lookup error: undefined symbol" → Python 直接起不来（已实测）。
+    #   eu-strip --strip-all 保留必要的动态符号，实测 Python 正常。
+    #   构建机需装 elfutils（Ubuntu: apt-get install -y elfutils）。
+    _eu_strip() {
+        local f="$1"
+        [ -f "${f}" ] || return 0
+        if command -v eu-strip > /dev/null 2>&1; then
+            eu-strip --strip-all -o "${f}.stripped" "${f}" 2>/dev/null \
+                && mv -f "${f}.stripped" "${f}" \
+                || { rm -f "${f}.stripped"; echo "  ⚠ eu-strip 失败，保留原文件：${f}"; }
+        else
+            echo "  ⚠ 未找到 eu-strip（elfutils），跳过 strip：${f}"
+        fi
+    }
+    _before="$(du -sm "${RT}/python" 2>/dev/null | cut -f1)"
+    # python3.14（可执行）：75MB → ~30MB
+    _eu_strip "${RT}/python/bin/python3.14"
+    # libpython3.14.so（共享库）：131MB → ~33MB
+    # 运行期不需要（python3.14 静态链接了 CPython），保留只为支持 pip 编译 sdist。
+    _eu_strip "${RT}/python/lib/libpython3.14.so.1.0"
+    # 运行期用不到：C 头文件（编译扩展才要）、ensurepip（pip 已在 site-packages）、
+    # idlelib（IDE）。⚠ 不要删 __pycache__（删了每次启动重编译，更慢）。
+    rm -rf "${RT}/python/include" \
+           "${RT}/python/lib/python3.14/ensurepip" \
+           "${RT}/python/lib/python3.14/idlelib"
+    _after="$(du -sm "${RT}/python" 2>/dev/null | cut -f1)"
+    [ -n "${_before}" ] && [ -n "${_after}" ] && \
+        echo "[build] runtime/python 瘦身：${_before}MB → ${_after}MB"
+    # 瘦身后必须仍可运行（防止 strip 出错把包打废）
+    "${PYBIN}" -c "import sqlite3,sys; print('[build] 瘦身后自检 OK:', sys.version.split()[0], sqlite3.sqlite_version)" \
+        || { echo "✗ 瘦身后 Python 无法运行（check eu-strip 版本）"; exit 1; }
 fi
 
 # ── 2. 依赖 ──────────────────────────────────────────────────
@@ -339,6 +375,7 @@ mkdir -p "${RT}/hermes"
     --exclude='*.test.js' --exclude='*.test.jsx' \
     --exclude='*.spec.ts' --exclude='*.spec.tsx' \
     --exclude='__tests__' --exclude='__mocks__' \
+    --exclude='contributors/emails' \
     . ) | ( cd "${RT}/hermes" && tar -xf - )
 
 # ── 3a. .git 移到工作树外（保留在线更新能力，同时堵住 hermes update 自伤）──

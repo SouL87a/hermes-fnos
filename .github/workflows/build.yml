@@ -81,6 +81,15 @@ jobs:
           curl -fsSL https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # build.sh 用 eu-strip 给 CPython 瘦身（省 ~145MB）。
+      # ⚠ 不能用 GNU strip：它会剥掉 PBS 二进制的 .gnu.version* 节，
+      #   导致运行期 "symbol lookup error: undefined symbol"（已实测）。
+      - name: Install elfutils (eu-strip)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq elfutils
+          eu-strip --version | head -1
+
       - name: Show toolchain
         run: |
           python3 --version
