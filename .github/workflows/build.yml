@@ -157,6 +157,20 @@ jobs:
             ./runtime/python/bin/python3 -c "import sqlite3,sys; print('  自带 CPython SQLite:', sqlite3.sqlite_version); i=sqlite3.sqlite_version_info; sys.exit(1 if not (i<(3,7,0) or i>=(3,51,3) or (3,50,7)<=i<(3,51,0) or (3,44,6)<=i<(3,45,0)) else 0)" \
               || { echo '✗ SQLite 命中 WAL-reset 门 —— state.db 会降级 DELETE，doctor 报假 FTS 损坏'; exit 1; }
             echo '✓ SQLite 过 WAL-reset 门（WAL 可用）'
+
+            # 瘦身冒烟：构建里删了 libpython*.so / include/ / ensurepip / idlelib，
+            # 并对 python3.14 做了 eu-strip。最怕的是某个模块在【运行期 dlopen】才
+            # 暴露问题，所以这里实际 import 一批最依赖动态加载的模块。
+            # （包内已预装三方依赖，故同时验证 pydantic_core / cryptography / PIL。）
+            ./runtime/python/bin/python3 -c "import ctypes, ssl, sqlite3, hashlib, json, socket, select, asyncio; import pydantic_core, cryptography, PIL; print('  smoke ok:', sqlite3.sqlite_version, pydantic_core.__version__, PIL.__version__)" \
+              || { echo '✗ 瘦身后冒烟失败（某个模块 dlopen 不到 —— 检查 libpython/include 是否被误删，或 eu-strip 版本）'; exit 1; }
+            echo '✓ 瘦身冒烟通过（ctypes/ssl/sqlite3/hashlib + 三方扩展）'
+
+            # 断言 libpython 确实不在了（防止构建脚本被改回去而无人察觉）
+            if find ./runtime/python/lib -maxdepth 1 -name 'libpython3*' | grep -q .; then
+              echo '✗ runtime/python/lib 里仍有 libpython3* —— 瘦身未生效'; exit 1
+            fi
+            echo '✓ libpython* 已移除'
           fi
 
           # bin/hermes CLI shim：实跑 `bin/hermes --version`，断言 doctor 里所有

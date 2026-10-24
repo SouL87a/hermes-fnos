@@ -218,6 +218,9 @@ else
     #   另外懒安装走 pm/environment.py 的 `--no-index --only-binary :all:`，
     #   只装 wheel、永不编译源码 → include/（C 头文件）同样没有存在意义。
     # 因此 libpython*.so 与 include/ 直接【删除】，不是 strip（多省 35MB + 少两个文件）。
+    # ⚠ 直接后果：包内不能再编译 C 扩展（Python.h 与 libpython 都不在）。
+    #   该约束成立的前提是上游保持 --only-binary :all:。若该策略被放开，
+    #   必须把 include/ 与 libpython*.so 加回来（见本段末尾的详细说明）。
     _before="$(du -sm "${RT}/python" 2>/dev/null | cut -f1)"
     # 三个实体文件 + 指向它们的符号链接（否则删完留悬空链接）：
     #   libpython3.14.so.1.0   131MB 实际库
@@ -250,10 +253,21 @@ else
     [ -n "${_before}" ] && [ -n "${_after}" ] && \
         echo "[build] runtime/python 瘦身：${_before}MB → ${_after}MB"
     # 瘦身后必须仍可运行（防止 strip/删除出错把包打废）。
-    # 校验点覆盖：解释器本身、三方扩展（走 .so，证明不依赖 libpython）、
-    # 以及一个纯 C 扩展模块。
-    "${PYBIN}" -c "import sys, sqlite3, ssl, ctypes, asyncio, multiprocessing; print('[build] 瘦身后自检 OK:', sys.version.split()[0], sqlite3.sqlite_version)" \
-        || { echo "✗ 瘦身后 Python 无法运行（check eu-strip 版本）"; exit 1; }
+    # 校验点专门挑【运行期 dlopen】最密集的模块：ctypes（dlopen 本身）、
+    # ssl（OpenSSL）、sqlite3、hashlib（_hashlib/_sha*）、socket/select、
+    # asyncio（epoll/selector），再加上三方 C 扩展。
+    "${PYBIN}" -c "
+import ctypes, ssl, sqlite3, hashlib, json, socket, select, asyncio, multiprocessing
+import sys
+print('[build] 瘦身后自检 OK:', sys.version.split()[0], sqlite3.sqlite_version)
+" || { echo "✗ 瘦身后 Python 无法运行（check eu-strip 版本 / 是否误删了必要 .so）"; exit 1; }
+    ### ⚠ 约束（删除 include/ + libpython 的代价，务必保留此说明）：
+    ### 包内【无法再编译 C 扩展】——报错会是 "Python.h: No such file" 或
+    ### 链接阶段找不到 libpython3.14.so。
+    ### 当前安全，因为懒安装走 pm/environment.py 的
+    ###   `--no-index --only-binary :all:`
+    ### 只装 wheel、永不编译 sdist。若哪天有人放开 --only-binary（或允许源码包），
+    ### 必须同时把 include/ 与 libpython*.so 加回来，否则安装会在构建阶段失败。
 fi
 
 # ── 2. 依赖 ──────────────────────────────────────────────────
