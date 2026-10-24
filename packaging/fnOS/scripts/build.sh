@@ -755,25 +755,13 @@ cp -r "${PKG_DIR}/config" "${STAGE}/config"
 cp -r "${PKG_DIR}/wizard" "${STAGE}/wizard"
 chmod 755 "${STAGE}/cmd/"*
 
-### ⚠ 关键修复：让 config/ 与 wizard/ 里也含【可执行文件】，迫使平台保留 755。
-### 实机排查结论：fnOS 升级时先把 fpk 复制到
-###   /vol1/appcenter-downloads/<app>-<ver>-tpk/
-### 但它【不保留目录 mode】—— 实测：
-###   cmd/      包内 755（含 755 的脚本）→ 临时目录 755  ✅
-###   config/   包内 755（文件全 644）    → 临时目录 644  ❌（drw-r--r--，无法进入）
-###   wizard/   包内 755（文件全 644）    → 临时目录 644  ❌
-###   临时根 .  包内 755                  → 临时目录 644  ❌
-### 根目录无 x 位 → 平台无法在其中创建 runtime/、ui/、bin/ → app.tgz 解包失败
-### → APP_UPDATE_FAILED（新内容零落盘）。同一包全新安装成功，因为目标目录不存在。
-### 对策：在 config/ 与 wizard/ 里各放一个可执行占位文件；并把包内所有目录
-### 显式 755。cmd/ 已有的先例证明「含可执行文件的目录」会保留 755。
+### 目录权限统一为 755（常规做法，非升级问题修复）。
+### 注：2026-10-24 曾怀疑「平台复制到临时目录时把目录降为 644 导致解包失败」，
+### 但后续实测推翻了该假设（/vol1 带 trimacl，644 不阻断；平台解包进程是 root）。
+### 真正的升级失败根因是 uninstall_callback 的自我误杀（见该文件注释）。
+### 这里保留 755 设置本身（显式权限无害），但不要用它解释升级问题。
 find "${STAGE}" -type d -exec chmod 755 {} \; 2>/dev/null || true
-for _d in "${STAGE}/config" "${STAGE}/wizard"; do
-    [ -d "${_d}" ] || continue
-    printf '#!/bin/sh\n# 占位（可执行）：确保 fnOS 复制到临时目录时保留 755 目录权限，\n# 否则平台无法解包 app.tgz（见 build.sh 里的排查说明）。\nexit 0\n' \
-        > "${_d}/.keep-exec"
-    chmod 755 "${_d}/.keep-exec"
-done
+
 
 # config/resource 里 usr-local-linker 列了 bin/hermes、bin/hermes-update、bin/rg。
 # rg 是可选下载（见步骤 5），失败时它不在 app 里 —— 此时把 "bin/rg" 从 resource

@@ -5,15 +5,39 @@
 #   "true"  → 完全删除：应用私有数据 + 工作区共享目录
 #   "false" → 保留（默认）：下次安装可继续使用；升级/重装也走这条
 #
-# 应用私有数据在 ${TRIM_PKGVAR}（= /vol1/@appdata/hermes：venv、会话 DB、
-# config.yaml、.env、site-packages、.agent-browser、node …）。
-# 工作区在共享目录 /@appshare/hermes/workspace（用户可见、可手动放文件）——
-# 只在【用户明确选完全删除】时才动它，默认保留。
+# ⚠ 2026-10-24 修复（升级失败 APP_UPDATE_FAILED code=10393 的根因）：
+#   ① 原来的 `pgrep -f "/var/apps/${APP}/"` 会匹配到【本脚本自己】——
+#      本脚本的 cmdline 就是 `/var/apps/hermes/cmd/uninstall_callback`，
+#      于是下面那行 kill -KILL 把脚本自身杀了，退出码变成 137(SIGKILL)。
+#      平台把这一步记为 UninstallCallbackException(10393)，
+#      而 fnOS 的「覆盖升级」内部会先执行旧版的卸载回调 → 升级必然失败。
+#      实测复现：pgrep -f 在脚本内部会列出脚本自身 pid（见 2026-10-24 验证记录）。
+#   ② 修法：踢掉自己、父进程、以及祖先进程链，再杀应用进程。
+#      另外把匹配收窄为「确实运行在应用目录里的可执行文件」，避免误杀平台自身的
+#      rsync/tar/cp（升级时它们的命令行里同样含 /@appcenter/hermes/）。
 
 APP="hermes"
 
-# ① 兜底清进程（应用目录可能已被移除，走固定标记路径）。
+_self_pids() {
+    # 自己 + 祖先进程链（平台调用链上都是 hook 脚本，不能杀）
+    local p="$$"
+    while [ -n "${p}" ] && [ "${p}" -gt 1 ] 2>/dev/null; do
+        printf '%s\n' "${p}"
+        p="$(awk '{print $4}' "/proc/${p}/stat" 2>/dev/null)"
+    done
+}
+
+_skip=" $( _self_pids | tr '\n' ' ' ) "
+
+# ① 兜底清进程（只杀真正跑在应用目录里的进程，且排除自身与祖先）。
 for pid in $(pgrep -f "/@appcenter/${APP}/" 2>/dev/null; pgrep -f "/var/apps/${APP}/" 2>/dev/null); do
+    case "${_skip}" in *" ${pid} "*) continue ;; esac
+    # 只处理 exe 落在应用目录里的进程；hook 脚本（bash）与平台复制进程一律跳过。
+    _exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null)"
+    case "${_exe}" in
+        /vol*/@appcenter/${APP}/*|/var/apps/${APP}/target/*) ;;
+        *) continue ;;
+    esac
     kill -KILL "${pid}" 2>/dev/null || true
 done
 
