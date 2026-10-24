@@ -86,15 +86,21 @@ fi
 #   v0.21.4+canary.20261001T070239Z → 0.21.4
 #   v2026.9.24                     → 2026.9.24
 UPSTREAM_REF_V="$(grep -vE '^\s*#|^\s*$' "${REPO}/upstream.version" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
+UP_VER=""
+[ -n "${UPSTREAM_REF_V}" ] && UP_VER="$(printf '%s' "${UPSTREAM_REF_V}" | sed -E 's/^v//; s/\+.*$//')"
 VERSION="${HERMES_VERSION:-}"
 if [ -z "${VERSION}" ] && [ -f "${REPO}/fnos.version" ]; then
-    VERSION="$(grep -vE '^\s*#|^\s*$' "${REPO}/fnos.version" | head -n 1 | tr -d '[:space:]')"
-    [ -n "${VERSION}" ] && echo "[build] 使用 fnos.version 指定的打包版本：${VERSION}"
+    _fv="$(grep -vE '^\s*#|^\s*$' "${REPO}/fnos.version" | head -n 1 | tr -d '[:space:]')"
+    if [ -n "${_fv}" ]; then
+        if [ -z "${UP_VER}" ] || [ "${_fv%%-*}" = "${UP_VER}" ]; then
+            VERSION="${_fv}"
+            echo "[build] 使用 fnos.version 指定的打包版本：${VERSION}"
+        else
+            echo "[build] ⚠ fnos.version=${_fv} 与上游 ${UP_VER} 不一致，已忽略（请更新或清空 fnos.version）"
+        fi
+    fi
 fi
-if [ -z "${VERSION}" ] && [ -n "${UPSTREAM_REF_V}" ]; then
-    # 只剥 v 前缀与 +build 元数据，保留 -N 修订号
-    VERSION="$(printf '%s' "${UPSTREAM_REF_V}" | sed -E 's/^v//; s/\+.*$//')"
-fi
+[ -z "${VERSION}" ] && VERSION="${UP_VER}"
 [ -z "${VERSION}" ] && VERSION="0.0.0"
 echo "[build] 版本 ${VERSION}（跟随上游 ${UPSTREAM_REF_V:-?}）"
 

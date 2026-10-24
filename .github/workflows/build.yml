@@ -41,15 +41,32 @@ jobs:
         id: ver
         run: |
           set -e
-          # 版本跟随上游：fpk 版本 = 上游 ref 的版本号
-          # （v0.21.4+canary.… → 0.21.4），与应用中心/install-stamp 一致。
+          # 版本优先级必须与 build.sh 完全一致，否则会出现
+          # 「资产名 hermes-0.22.2-1.fpk 但 tag=v0.22.2」的错配：
+          #   1) fnos.version（同上游版本重打包时递增 -1/-2，如 0.22.2-1）
+          #   2) 上游 ref 推导（剥 v 前缀与 +canary，保留 -N）
           if [ -n "${{ github.event.inputs.hermes_ref }}" ]; then
             REF="${{ github.event.inputs.hermes_ref }}"
           else
             REF="$(grep -vE '^\s*#|^\s*$' upstream.version | head -n 1 | tr -d '[:space:]')"
           fi
-          VERSION="$(printf '%s' "$REF" | sed -E 's/^v//; s/[+-].*$//')"
-          [ -n "$VERSION" ] || VERSION="$(grep -vE '^\s*#|^\s*$' fnos.version | head -n 1 | tr -d '[:space:]')"
+          UP_VER="$(printf '%s' "$REF" | sed -E 's/^v//; s/\+.*$//')"
+          FNOS_VER="$(grep -vE '^\s*#|^\s*$' fnos.version 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+          # fnos.version 只允许是「同一上游版本 + -N 修订」：主体必须等于上游版本。
+          # 否则说明上游发了新版而 fnos.version 忘了改 → 忽略它并告警，
+          # 避免把新版包错标成旧版本号（那会导致应用中心认为需要降级）。
+          if [ -n "$FNOS_VER" ]; then
+            BASE="${FNOS_VER%%-*}"
+            if [ "$BASE" = "$UP_VER" ]; then
+              VERSION="$FNOS_VER"
+              echo "使用 fnos.version 指定的打包版本: $VERSION"
+            else
+              echo "::warning::fnos.version=$FNOS_VER 与上游 $UP_VER 不一致，已忽略（请更新或清空 fnos.version）"
+              VERSION="$UP_VER"
+            fi
+          else
+            VERSION="$UP_VER"
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "版本: $VERSION（跟随上游 $REF）"
