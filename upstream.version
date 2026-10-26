@@ -4,13 +4,13 @@
 #   此前是日期式 v2026.M.D；上游从 v0.21.6 起改用新 stable 发布管线，退回
 #   semver vX.Y.Z。官方原话（v0.21.6 release notes）：
 #     "This is the first release cut by the new stable release pipeline"
-#   之后 v0.21.7 / v0.22.0 / v0.22.1 / v0.22.2 均为 semver，未见回退。
+#   之后 v0.21.7 / v0.22.0 … v0.22.5 均为 semver，未见回退。
 #
 # 为什么用 stable 而不是 canary：用户要求「正式版 Hermes」。
-# v0.22.2 的 requires-python 是 >=3.11,<3.15 —— 自带 CPython 3.12.14 在内。
+# v0.22.5 的 requires-python 是 >=3.11,<3.15 —— 自带 CPython 3.14.7 在内。
 #
-# 最近核实（2026-10-18）：最新正式版为 v0.22.2（2026-10-15 发布）。
+# 最近核实（2026-10-26）：最新正式版为 v0.22.5（2026-10-23 发布）。
 # 上游发新 stable 后改这一行即可 —— build.sh 会自动改 fpk 版本号与 stamp，
 # 在线的「检查更新」按 stable 通道跟随（见 hermes-update.py 的 channel）：
 # 它优先走 GitHub Releases API（按发布时间倒序），不依赖 tag 命名规则。
-v0.22.2
+v0.22.5

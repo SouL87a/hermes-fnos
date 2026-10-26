@@ -340,14 +340,34 @@ if [ -n "${HERMES_PIP_INDEX:-}" ]; then
     echo "[build] 使用 PyPI 镜像：${HERMES_PIP_INDEX}"
 fi
 
+### ⚠ 上游依赖冲突的 override（v0.22.5 起必需）
+### v0.22.5 的 pyproject.toml 里：
+###   · 核心依赖要求 Pillow==13.0.0
+###   · browser-harness==0.1.13 内部 pin 了 pillow==12.3.0（精确 ==）
+### 上游自己用 [tool.uv] override-dependencies 解决（注释里写明 browser-harness
+### 只做 open/convert/compose，13.0.0 兼容；等它放开 Pillow 13 后该行可删）。
+### 但我们用 `uv pip install -r deps.txt`，【不读 pyproject 的 [tool.uv]】，
+### 所以必须显式把同样的 overrides 传给 uv —— 否则解析直接报
+###   "No solution found ... browser-harness depends on pillow==12.3.0
+###    and you require pillow==13.0.0 ... unsatisfiable"（已实测）。
+### 维护提示：上游改了这个 override 时，同步更新下方列表。
+OVERRIDES_TXT="${PKG_DIR}/.cache/uv-overrides.txt"
+mkdir -p "$(dirname "${OVERRIDES_TXT}")"
+printf '%s\n' "Pillow==13.0.0" > "${OVERRIDES_TXT}"
+OVERRIDE_FLAGS=(--overrides "$(winpath "${OVERRIDES_TXT}")")
+
 if [ -n "${UV}" ]; then
     echo "[build] 使用 uv：${UV}"
     "${UV}" pip install --python "$(winpath "${PYBIN}")" --no-config \
-        "${BINARY_FLAGS[@]}" "${INDEX_FLAGS[@]}" -r "$(winpath "${DEPS_TXT}")"
+        "${BINARY_FLAGS[@]}" "${INDEX_FLAGS[@]}" "${OVERRIDE_FLAGS[@]}" \
+        -r "$(winpath "${DEPS_TXT}")"
 else
     echo "[build] uv 不可用，回退 pip（较慢）"
-    "${PYBIN}" -m pip install --upgrade pip > /dev/null
-    "${PYBIN}" -m pip install "${BINARY_FLAGS[@]}" "${INDEX_FLAGS[@]}" -r "$(winpath "${DEPS_TXT}")"
+    ### pip 没有 --overrides；改用 constraints（约束同样能压住传递依赖的 pin，
+    ### 但若直接冲突仍会失败）。装完后校验会兜底。
+    "$PYBIN" -m pip install --upgrade pip > /dev/null
+    "$PYBIN" -m pip install "${BINARY_FLAGS[@]}" "${INDEX_FLAGS[@]}" \
+        -c "$(winpath "${OVERRIDES_TXT}")" -r "$(winpath "${DEPS_TXT}")"
 fi
 # 注意：不删 deps.txt —— 它是包内产物（runtime/deps.txt），
 # 系统 Python 模式安装时要用它装依赖，最终自检也要它。
