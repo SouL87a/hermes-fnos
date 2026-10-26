@@ -85,12 +85,15 @@ fi
 #   v0.22.2-1                      → 0.22.2-1
 #   v0.21.4+canary.20261001T070239Z → 0.21.4
 #   v2026.9.24                     → 2026.9.24
-UPSTREAM_REF_V="$(grep -vE '^\s*#|^\s*$' "${REPO}/upstream.version" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
+### ⚠ 两处 grep 都加 `|| true`：文件若只剩注释（无有效行），grep 返回 1，
+### 在 `set -euo pipefail` 下会让整个脚本【静默退出且无任何输出】
+### （实机踩过：清空 fnos.version 的值行后，CI 只报 exit code 1、无日志）。
+UPSTREAM_REF_V="$(grep -vE '^\s*#|^\s*$' "${REPO}/upstream.version" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
 UP_VER=""
 [ -n "${UPSTREAM_REF_V}" ] && UP_VER="$(printf '%s' "${UPSTREAM_REF_V}" | sed -E 's/^v//; s/\+.*$//')"
 VERSION="${HERMES_VERSION:-}"
 if [ -z "${VERSION}" ] && [ -f "${REPO}/fnos.version" ]; then
-    _fv="$(grep -vE '^\s*#|^\s*$' "${REPO}/fnos.version" | head -n 1 | tr -d '[:space:]')"
+    _fv="$(grep -vE '^\s*#|^\s*$' "${REPO}/fnos.version" | head -n 1 | tr -d '[:space:]' || true)"
     if [ -n "${_fv}" ]; then
         if [ -z "${UP_VER}" ] || [ "${_fv%%-*}" = "${UP_VER}" ]; then
             VERSION="${_fv}"

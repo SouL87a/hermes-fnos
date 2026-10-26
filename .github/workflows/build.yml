@@ -48,7 +48,7 @@ jobs:
           if [ -n "${{ github.event.inputs.hermes_ref }}" ]; then
             REF="${{ github.event.inputs.hermes_ref }}"
           else
-            REF="$(grep -vE '^\s*#|^\s*$' upstream.version | head -n 1 | tr -d '[:space:]')"
+            REF="$(grep -vE '^\s*#|^\s*$' upstream.version | head -n 1 | tr -d '[:space:]' || true)"
           fi
           UP_VER="$(printf '%s' "$REF" | sed -E 's/^v//; s/\+.*$//')"
           FNOS_VER="$(grep -vE '^\s*#|^\s*$' fnos.version 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"

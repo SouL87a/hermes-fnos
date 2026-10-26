@@ -6,6 +6,10 @@
 #
 # 何时递增：
 #   · 打包层修了缺陷（cmd/main / shim / 依赖），上游 tag 没动 → -1, -2, -3 …
-#   · 上游发了新 tag → 删掉本文件内容或改成新的上游版本（如 0.22.3）
+#   · 上游发了新 tag → 清空下面的值（跟随 upstream.version）
 #
-# ⚠ 留空表示「跟随 upstream.version」（推荐在上游发新版时这么做）。
+# ⚠ 本文件允许只剩注释（即"跟随上游"）。build.sh / CI 里读取它的 grep 都带
+#   `|| true`，因为没有有效行时 grep 返回 1，在 `set -euo pipefail` 下会让
+#   整个构建【静默退出、零输出】（2026-10-26 CI 踩过：只报 exit code 1）。
+#
+# 当前值（空 = 跟随 upstream.version）：
