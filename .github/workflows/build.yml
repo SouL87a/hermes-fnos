@@ -129,12 +129,32 @@ jobs:
           # app.tgz 内关键部件（ui/ 与 gateway-proxy/hermes-update 都在这里）
           tar -xzf "$FPK" app.tgz
           A="$(tar -tzf app.tgz)"
-          for need in ./ui/config ./ui/images/icon_64.png ./gateway-proxy.py ./hermes-update.py \
+          for need in ./ui/config ./ui/images/icon_64.png ./gateway-proxy.py ./envfile.sh ./hermes-update.py \
                       ./bin/hermes ./bin/hermes-update ./runtime/deps.txt \
                       ./runtime/web_dist/index.html ./runtime/web-build.mjs \
                       ./runtime/hermes/hermes_cli/__init__.py; do
             echo "$A" | grep -qx "$need" || { echo "✗ app.tgz 缺少 $need"; exit 1; }
           done
+
+          # 端口直连 + 面板鉴权：manifest / wizard / cmd-main 三处必须齐全，
+          # 缺一处就是「文档说有直连、实际打不开」。
+          # 解到临时目录，避免污染仓库根目录。
+          X="$(mktemp -d)"
+          tar -xzf "$FPK" -C "$X" manifest cmd/main wizard/install wizard/config
+          grep -q '^service_port[[:space:]]*=[[:space:]]*9119' "$X/manifest" \
+            || { echo "✗ manifest 缺少 service_port = 9119"; exit 1; }
+          grep -q '^checkport[[:space:]]*=[[:space:]]*true' "$X/manifest" \
+            || { echo "✗ manifest 缺少 checkport = true"; exit 1; }
+          for f in wizard/install wizard/config; do
+            grep -q 'wizard_auth_password' "$X/$f" \
+              || { echo "✗ $f 缺少面板密码字段"; exit 1; }
+          done
+          grep -q 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD' "$X/cmd/main" \
+            || { echo "✗ cmd/main 未注入 basic auth"; exit 1; }
+          grep -q 'envfile.sh' "$X/cmd/main" \
+            || { echo "✗ cmd/main 未加载 envfile.sh"; exit 1; }
+          rm -rf "$X"
+          echo "✓ 端口直连 + 面板鉴权 配置齐全"
 
           # Python 运行时：两种模式二选一
           #   自带模式（默认）→ runtime/python/bin/python3
