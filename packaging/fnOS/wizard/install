@@ -4,7 +4,39 @@
     "items": [
       {
         "type": "tips",
-        "helpText": "Hermes Agent 是 Nous Research 的自我进化 AI Agent。安装后从桌面图标打开控制台，在里面配置模型与 API Key（支持 Nous Portal、OpenRouter、OpenAI、自建端点等）。\n\n本应用走飞牛统一网关（飞牛登录态），不开放局域网端口；数据与工作区保存在 NAS 上，手机 / 平板 / 电脑共用一份。首次打开可能需要几秒初始化。"
+        "helpText": "Hermes Agent 是 Nous Research 的自我进化 AI Agent。安装后从桌面图标打开控制台，在里面配置模型与 API Key（支持 Nous Portal、OpenRouter、OpenAI、自建端点等）。\n\n访问方式有两种：\n  · 飞牛桌面图标 → 走统一网关（飞牛登录态）\n  · http://<NAS地址>:9119 → 局域网直连\n两者都需要下面设置的面板密码登录。数据与工作区保存在 NAS 上，手机 / 平板 / 电脑共用一份。首次打开可能需要几秒初始化。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "面板登录密码",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "设置访问 Hermes 控制台的用户名与密码。\n\n为什么需要：为了支持 http://<NAS地址>:9119 这种局域网直连，控制台必须监听局域网地址；Hermes 的安全加固要求这种情形下必须启用登录，否则拒绝启动。\n\n密码会以环境变量形式保存在应用数据目录的 .env 里（文件权限 600）。忘记可在「设置」页重新设置。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_auth_user",
+        "label": "登录用户名",
+        "initValue": "admin",
+        "rules": [
+          {
+            "pattern": "^[A-Za-z0-9._@-]{1,64}$",
+            "message": "1–64 位，仅字母/数字/._@-"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_auth_password",
+        "label": "登录密码（至少 8 位）",
+        "rules": [
+          {
+            "pattern": "^.{8,128}$",
+            "message": "密码至少 8 位"
+          }
+        ]
       }
     ]
   },

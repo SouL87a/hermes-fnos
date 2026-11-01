@@ -10,7 +10,8 @@
 ###    解释器取自应用中心「Python 3.12」，依赖装进该 venv。（系统 libsqlite3 偏旧
 ###    → WAL 会被 Hermes 降级成 DELETE，doctor 报假 FTS 损坏，故不作默认。）
 ### 两种模式都不需要在运行期 pip；web_dist 已预构建（--skip-build）。
-### 形态：hermes dashboard（FastAPI+uvicorn，仅绑 127.0.0.1）+
+### 形态：hermes dashboard（FastAPI+uvicorn；默认仅绑 127.0.0.1，配置了面板密码
+###       时绑 0.0.0.0 以支持 http://<NAS>:端口 直连，并启用上游 basic auth）+
 ###        gateway-proxy.py（监听 Unix Socket，反代到回环端口）。
 ### 前端是 React Router SPA，原生支持路径前缀反代：代理只要发
 ### X-Forwarded-Prefix: /app/hermes，服务端就改写 index.html 的资产 URL
@@ -51,6 +52,8 @@ export TRIM_GROUPNAME="${TRIM_GROUPNAME:-${TRIM_USERNAME}}"
 ### 在根目录写日志失败/留垃圾）。
 LOG_FILE="${TRIM_PKGVAR}/info.log"
 PID_FILE="${TRIM_PKGVAR}/app.pid"
+### 面板凭据的启动脚本（600）：避免密码出现在 /proc/<pid>/cmdline。
+AUTH_ENV_FILE="${TRIM_PKGVAR}/.dashboard-auth.sh"
 
 APP_DIR="${TRIM_APPDEST}"
 SRC_DIR="${APP_DIR}/runtime/hermes"
@@ -313,8 +316,82 @@ resolve_workspace() {
     printf '%s' "${TRIM_PKGVAR}/workspace"
 }
 
+### .env 读写助手（env_get / env_kv）从共享库加载 —— 安装/设置回调也要用同一套
+### 编解码，必须与 python-dotenv 逐字节一致，否则上游 load_hermes_dotenv 会用
+### 「它解析出来的密码」覆盖我们 exec env 传进去的密码。
+if [ -r "${APP_DIR}/envfile.sh" ]; then
+    . "${APP_DIR}/envfile.sh"
+else
+    log_msg "警告：缺少 envfile.sh —— 面板密码含 # 或首尾空格时可能失效"
+fi
+
+### 面板鉴权（basic auth）环境变量。
+### 为什么需要：dashboard 要绑 0.0.0.0 才能用 `http://NAS:端口` 访问，而上游
+### 自 2026-06 的 0day 加固起，**非回环绑定强制要求 auth provider**
+### （--insecure 已失效）。上游内置 basic 密码 provider，从环境变量读取：
+###   HERMES_DASHBOARD_BASIC_AUTH_USERNAME / _PASSWORD / _SECRET
+### 密码在安装向导填写，落到 <data>/.env（见 install_callback / config_callback）。
+### secret 用于会话签名；不设则每次重启随机生成 → 用户每次重启都要重新登录，
+### 所以安装时生成一个固定的并持久化到 .env。
+###
+### 返回值是若干行 `export KEY='...'`，调用方【写入 600 权限的文件再 source】，
+### 不拼进命令行（密码否则会出现在 /proc/<pid>/cmdline）。
+### 值用单引号包裹并转义单引号 —— .env 里的密码可能含 $ / ` / \ / " 等任意字符，
+### 只有单引号形式在 shell 里是字面量。
+### 留空说明：.env 里没配 → 返回 1，调用方退回仅回环。
+dashboard_auth_env() {
+    local user pass secret
+    user="$(env_get BASIC_AUTH_USER 2>/dev/null || true)"
+    pass="$(env_get BASIC_AUTH_PASSWORD 2>/dev/null || true)"
+    secret="$(env_get BASIC_AUTH_SECRET 2>/dev/null || true)"
+    if [ -z "${user}" ] || [ -z "${pass}" ]; then
+        return 1
+    fi
+    [ -n "${secret}" ] || secret="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    # 单引号转义：' → '\''
+    # ⚠ 必须用 bash 参数替换而不是 sed：sed 的替换文本里 \ 会被再吃掉一层，
+    #   `s/'/\'\\''\''/g` 实际输出 it'''s（实测），单引号结尾直接语法错误。
+    local q="'\\''"
+    user="${user//\'/${q}}"
+    pass="${pass//\'/${q}}"
+    secret="${secret//\'/${q}}"
+    printf "export HERMES_DASHBOARD_BASIC_AUTH_USERNAME='%s'\n" "${user}"
+    printf "export HERMES_DASHBOARD_BASIC_AUTH_PASSWORD='%s'\n" "${pass}"
+    printf "export HERMES_DASHBOARD_BASIC_AUTH_SECRET='%s'\n" "${secret}"
+}
+
+### 端口是否已被监听。
+### ⚠ 必须锚定【本地地址】列（$2）且要求 LISTEN 状态（st == 0A）：
+###   原先是 `grep -q ":1F87"` 全行匹配，远端地址恰好是该端口的 TIME_WAIT
+###   连接也会命中 —— 那会让「已就绪」判定假阳性，掩盖真正的 bind 失败。
 port_listening() {
-    grep -q ":$(printf '%04X' "${PORT}")" /proc/net/tcp 2>/dev/null
+    local hex
+    hex="$(printf '%04X' "${PORT}")"
+    awk -v h=":${hex}" '$2 ~ h"$" && $4 == "0A" { found = 1 } END { exit(found ? 0 : 1) }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+### 谁在监听 ${PORT}：输出 "pid 命令名"，找不到则输出空。
+### 只用于日志诊断（端口冲突时用户需要知道去关哪个应用）。
+port_owner() {
+    local hex pid fd inode inodes
+    hex="$(printf '%04X' "${PORT}")"
+    inodes="$(awk -v h=":${hex}" '$2 ~ h"$" && $4 == "0A" { print $10 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u)"
+    [ -n "${inodes}" ] || return 0
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        for fd in /proc/${pid}/fd/*; do
+            inode="$(readlink "${fd}" 2>/dev/null)"
+            case "${inode}" in
+                socket:\[*\])
+                    inode="${inode#socket:[}"; inode="${inode%]}"
+                    case " $(echo ${inodes} | tr '\n' ' ') " in
+                        *" ${inode} "*) printf '%s %s' "${pid}" "$(cat "/proc/${pid}/comm" 2>/dev/null)"; return 0 ;;
+                    esac
+                    ;;
+            esac
+        done
+    done
+    return 0
 }
 
 ### 查找 node —— 对话页的 TUI 终端、以及 npx 驱动的流程（装浏览器 / MCP 依赖）需要它。
@@ -402,8 +479,11 @@ browser_env() {
 ### ui/config 的入口是 /app/hermes（iframe）。飞牛统一网关把 /app/hermes/**
 ### 转到 hermes.sock 且不剥前缀。gateway-proxy.py 剥掉前缀后转发到
 ### 127.0.0.1:PORT，并给上游发 X-Forwarded-Prefix，让 dashboard 生成带前缀的
-### 资产 URL 与 __HERMES_BASE_PATH__。鉴权：dashboard 绑回环 → 不做 auth 门，
-### 网关侧用飞牛登录态（X-Trim-*）。
+### 资产 URL 与 __HERMES_BASE_PATH__。
+### 鉴权：两种模式——
+###   · 未配面板密码：dashboard 绑回环，不做 auth 门，网关侧用飞牛登录态（X-Trim-*）
+###   · 配了面板密码：dashboard 绑 0.0.0.0，启用 basic auth；网关转发来的请求
+###     也走同一套登录（飞牛登录态之外再加一层面板密码）
 
 GATEWAY_PID_FILE="${TRIM_PKGVAR}/gateway.pid"
 GATEWAY_WANT_FILE="${TRIM_PKGVAR}/gateway.want"   # 存在=期望运行；删除=停止
@@ -639,7 +719,8 @@ start_process() {
     log_msg "Starting Hermes dashboard (gateway + loopback port) ..."
     log_msg "PY=${PY}  APP_DIR=${APP_DIR}  HOME=${DATA_DIR}  WS=${ws}  PORT=${PORT}  SOCK=${GATEWAY_SOCKET}"
 
-    # 主服务：dashboard 仅绑回环，避免触发非回环的强制鉴权门。
+    # 主服务：binding 由下方 dashboard_auth_env 决定（有密码→0.0.0.0 + basic auth；
+    # 无密码→仅回环，不触发上游的强制鉴权门）。
     # 资源定位用上游官方的 HERMES_BUNDLED_* 机制（比靠 PROJECT_ROOT 推导更稳，
     # 与官方 fnOS 包的 hermes-env 一致）：源码树即资源根。
     # TUI 终端 + npx 驱动的流程（装浏览器 / MCP 依赖）用的 node。
@@ -654,6 +735,44 @@ start_process() {
     # 浏览器环境（Chromium 路径，见 browser_env 说明）
     local BROWSER_ENV="" _be
     _be="$(browser_env)" && [ -n "${_be}" ] && BROWSER_ENV="${_be} \\"
+
+    ### 绑定地址与鉴权：配了面板密码 → 绑 0.0.0.0（支持 http://NAS:端口），
+    ### 并注入 basic auth 三个变量（上游非回环绑定强制要求 auth provider）。
+    ### 未配密码 → 退回 127.0.0.1 仅回环（飞牛网关仍可用，保持开箱即用）。
+    local BIND_HOST="127.0.0.1"
+    local AUTH_ENV="" _ae
+    ### 凭据【不进 argv】：把 AUTH_ENV 写成 600 权限的启动脚本，由 bash 去 source。
+    ### 理由：拼进 `bash -c "..."` 的话，`ps` / `/proc/<pid>/cmdline` 对同机所有用户
+    ### 可见（NAS 上常有多个账号），等于把面板密码挂在大厅里。
+    ### ⚠ 脚本内容里是 `export KEY='...'`，由 dashboard_auth_env 保证单引号已转义。
+    rm -f "${AUTH_ENV_FILE}"
+    if _ae="$(dashboard_auth_env)" && [ -n "${_ae}" ]; then
+        BIND_HOST="0.0.0.0"
+        ( umask 077; printf '%s\n' "${_ae}" > "${AUTH_ENV_FILE}" ) 2>/dev/null || {
+            log_msg "警告：无法写入 ${AUTH_ENV_FILE}，本次不启用面板鉴权"
+            BIND_HOST="127.0.0.1"
+        }
+        if [ "${BIND_HOST}" = "0.0.0.0" ]; then
+            AUTH_ENV=". '${AUTH_ENV_FILE}' || exit 1"
+            log_msg "面板鉴权已启用（basic auth），绑定 ${BIND_HOST}:${PORT}"
+        fi
+        ### 端口预检：checkport=true 只是向应用中心声明申请该端口，不保证真的拿到。
+        ### 若 9119 已被别的应用占用，dashboard 会 bind 失败退出，而 gateway socket
+        ### 仍会起来 → 飞牛桌面点进去是 502，且日志里只有一行 uvicorn 报错。
+        ### 这里提前检测并明确降级：退回仅回环（端口不再对外）+ 把占用者写进日志。
+        if port_listening; then
+            local _owner
+            _owner="$(port_owner 2>/dev/null)"
+            log_msg "警告：端口 ${PORT} 已被占用（${_owner:-未知进程}）→ 端口直连不可用；"
+            log_msg "      本次改为仅绑回环，飞牛统一网关入口不受影响。"
+            log_msg "      要启用 http://NAS:${PORT} 直连，请停用/卸载占用该端口的应用后重启本应用。"
+            BIND_HOST="127.0.0.1"
+            AUTH_ENV=""
+            rm -f "${AUTH_ENV_FILE}" 2>/dev/null || true
+        fi
+    else
+        log_msg "面板未配置密码 → 仅绑回环 127.0.0.1:${PORT}（仅飞牛网关可访问）"
+    fi
 
     local CMD
     CMD="cd '${SRC_DIR}' && exec env \
@@ -675,12 +794,17 @@ HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
 TMPDIR='${ws}/tmp' TMP='${ws}/tmp' TEMP='${ws}/tmp' \
 ${NODE_ENV}
 ${BROWSER_ENV}
-'${PY}' -m ${MODULE} dashboard --host 127.0.0.1 --port '${PORT}' --no-open --skip-build"
+'${PY}' -m ${MODULE} dashboard --host '${BIND_HOST}' --port '${PORT}' --no-open --skip-build"
+
+    ### 顺序很关键：先 source 凭据脚本（在子 shell 里 export），再 exec env ——
+    ### `exec env` 会把这些变量原样继承给 python。
+    local RUNNER="${CMD}"
+    [ -n "${AUTH_ENV}" ] && RUNNER="${AUTH_ENV}; ${CMD}"
 
     if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
-        bash -c "${CMD}" >> "${LOG_FILE}" 2>&1 &
+        bash -c "${RUNNER}" >> "${LOG_FILE}" 2>&1 &
     else
-        runuser -u "${TRIM_USERNAME}" -- bash -c "${CMD}" >> "${LOG_FILE}" 2>&1 &
+        runuser -u "${TRIM_USERNAME}" -- bash -c "${RUNNER}" >> "${LOG_FILE}" 2>&1 &
     fi
     printf "%s" "$!" > "${PID_FILE}"
 
@@ -767,6 +891,8 @@ stop_process() {
         fi
         rm -f "${PID_FILE}"
     fi
+    # 停止时删掉凭据启动脚本：下次启动重新从 .env 生成，避免残留旧密码。
+    rm -f "${AUTH_ENV_FILE}" 2>/dev/null || true
 
     # 先停 gateway supervisor：删 want 文件 → 它不再拉起 gateway，循环自然退出。
     # 必须在清理进程之前做，否则 supervisor 会把我们刚杀掉的 gateway 又拉起来。

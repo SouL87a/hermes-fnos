@@ -595,6 +595,8 @@ cp "${PKG_DIR}/ui-images/icon_64.png"  "${APP_DIR}/ui/images/icon_64.png"
 cp "${PKG_DIR}/ui-images/icon_256.png" "${APP_DIR}/ui/images/icon_256.png"
 # 统一网关适配层（替代官方 Go wrapper）
 cp "${HERE}/gateway-proxy.py" "${APP_DIR}/gateway-proxy.py"
+# .env 读写助手（cmd/main 与 cmd/*_callback 共用，保证与 python-dotenv 逐字节一致）
+cp "${HERE}/envfile.sh" "${APP_DIR}/envfile.sh"
 # 在线更新引擎
 cp "${HERE}/hermes-update.py" "${APP_DIR}/hermes-update.py"
 # CLI 包装：usr-local-linker 会把 app/bin/hermes-update 链接进 PATH，

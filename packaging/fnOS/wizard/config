@@ -20,6 +20,37 @@
     ]
   },
   {
+    "stepTitle": "面板登录",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "修改访问 Hermes 控制台的用户名与密码（飞牛桌面图标与 http://<NAS地址>:9119 共用同一套凭据）。\n\n两项都填写才会更新；密码至少 8 位。改动后需重启应用生效。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_auth_user",
+        "label": "登录用户名",
+        "rules": [
+          {
+            "pattern": "^$|^[A-Za-z0-9._@-]{1,64}$",
+            "message": "1–64 位，仅字母/数字/._@-，或留空不修改"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_auth_password",
+        "label": "登录密码（留空=不修改）",
+        "rules": [
+          {
+            "pattern": "^$|^.{8,128}$",
+            "message": "密码至少 8 位，或留空不修改"
+          }
+        ]
+      }
+    ]
+  },
+  {
     "stepTitle": "其他",
     "items": [
       {
