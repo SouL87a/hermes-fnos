@@ -247,7 +247,8 @@ if [ -n "${wizard_proxy:-}" ]; then
     if [ -n "${PROXY}" ] && printf '%s' "${PROXY}" | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
         touch "${ENV_FILE}"
         TMP="${ENV_FILE}.tmp.$$"
-        grep -vE '^[[:space:]]*(export[[:space:]]+)?(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)=' \
+        # 连同上一轮的分节标题一起剔除（升级会重跑本脚本，否则注释越积越多）
+        grep -vE '^[[:space:]]*(export[[:space:]]+)?(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)=|^#[[:space:]]*──[[:space:]]*HTTP 代理' \
             "${ENV_FILE}" > "${TMP}" 2>/dev/null || true
         {
             echo "# ── HTTP 代理（安装向导写入）──"
@@ -267,7 +268,11 @@ fi
 ###   BASIC_AUTH_USER / BASIC_AUTH_PASSWORD / BASIC_AUTH_SECRET
 ### 为什么存明文密码：上游 basic provider 支持 HERMES_DASHBOARD_BASIC_AUTH_PASSWORD，
 ### 自行在内存里 scrypt 哈希，不需要我们预生成 hash（也就不用依赖上游内部 API）。
-### 文件权限 600；未填则跳过 → dashboard 退回仅回环（飞牛网关仍可用）。
+### 文件权限 600。
+### ⚠ 留空的语义分两种（fnOS 升级会重跑安装向导）：
+###   · 全新安装留空 → 不写凭据，dashboard 仅绑回环（只走飞牛网关）
+###   · 升级时留空   → **保留已有凭据**，绝不执行「清除」
+###   清除只能通过设置页（两项都空）。否则每次升级都会把用户踢回仅网关模式。
 ENV_FILE="${TRIM_PKGVAR}/.env"
 AUTH_USER="${wizard_auth_user:-}"
 AUTH_PASS="${wizard_auth_password:-}"
@@ -283,12 +288,15 @@ if [ -n "${AUTH_USER}" ] && [ -n "${AUTH_PASS}" ]; then
     if [ "${#AUTH_PASS}" -lt 8 ]; then
         echo "  ⚠ 面板密码少于 8 位，已忽略（dashboard 将仅绑回环）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
     else
-        # secret：会话签名 key。固定下来，否则每次重启 session 失效、要重新登录。
-        AUTH_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        # secret：会话签名 key。
+        # ⚠ 已有就沿用：升级时若重新生成，所有浏览器会话立刻失效（用户得重新登录）。
+        AUTH_SECRET="$(DATA_DIR="${TRIM_PKGVAR}" env_get BASIC_AUTH_SECRET 2>/dev/null || true)"
+        [ -n "${AUTH_SECRET}" ] || AUTH_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
         mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || true
         touch "${ENV_FILE}"
         TMP="${ENV_FILE}.tmp.$$"
-        grep -vE '^[[:space:]]*(export[[:space:]]+)?(BASIC_AUTH_USER|BASIC_AUTH_PASSWORD|BASIC_AUTH_SECRET)=' \
+        # 连同上一轮的分节标题一起剔除，否则每次升级都会多一行重复注释。
+        grep -vE '^[[:space:]]*(export[[:space:]]+)?(BASIC_AUTH_USER|BASIC_AUTH_PASSWORD|BASIC_AUTH_SECRET)=|^#[[:space:]]*──[[:space:]]*面板登录' \
             "${ENV_FILE}" > "${TMP}" 2>/dev/null || true
         {
             echo "# ── 面板登录（安装向导写入；改动后需重启应用）──"
@@ -303,6 +311,13 @@ if [ -n "${AUTH_USER}" ] && [ -n "${AUTH_PASS}" ]; then
         chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${ENV_FILE}" 2>/dev/null || true
         echo "  面板登录已配置：用户 ${AUTH_USER}（http://<NAS>:${TRIM_SERVICE_PORT:-9119}）" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
     fi
+elif [ -z "${AUTH_USER}" ] && [ -z "${AUTH_PASS}" ]; then
+    # 留空：不写任何东西。已有凭据（升级场景）原样保留 —— 见上方说明。
+    if grep -qE '^[[:space:]]*(export[[:space:]]+)?BASIC_AUTH_PASSWORD=' "${ENV_FILE}" 2>/dev/null; then
+        echo "  面板登录：本次留空，保留原有凭据不变" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
+    fi
+else
+    echo "  ⚠ 面板登录只填了一项（用户名/密码需同时填写），已忽略" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
 fi
 
 exit 0
