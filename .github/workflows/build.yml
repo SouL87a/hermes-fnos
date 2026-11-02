@@ -156,6 +156,15 @@ jobs:
           rm -rf "$X"
           echo "✓ 端口直连 + 面板鉴权 配置齐全"
 
+          # 端口直连白屏修复：web_dist 里必须有 app/hermes -> .. 的软链。
+          # 前端按 base=/app/hermes/ 构建，直连时没有代理剥前缀，靠这个别名
+          # 让 SPA 兜底路由按真实文件返回正确 MIME（否则 module 脚本被拒 → 白屏）。
+          LINKS="$(tar -tvzf app.tgz | grep 'runtime/web_dist/app/hermes' || true)"
+          echo "$LINKS"
+          echo "$LINKS" | grep -q '^l' \
+            || { echo "✗ app.tgz 里 runtime/web_dist/app/hermes 不是符号链接"; exit 1; }
+          echo "✓ web_dist 前缀别名存在"
+
           # Python 运行时：两种模式二选一
           #   自带模式（默认）→ runtime/python/bin/python3
           #   系统模式        → runtime/.use-system-python 标记，安装时在 NAS 建 venv

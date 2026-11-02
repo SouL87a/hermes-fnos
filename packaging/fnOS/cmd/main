@@ -364,6 +364,31 @@ dashboard_auth_env() {
 ### ⚠ 必须锚定【本地地址】列（$2）且要求 LISTEN 状态（st == 0A）：
 ###   原先是 `grep -q ":1F87"` 全行匹配，远端地址恰好是该端口的 TIME_WAIT
 ###   连接也会命中 —— 那会让「已就绪」判定假阳性，掩盖真正的 bind 失败。
+### 让 web_dist 同时适配「网关带前缀」与「端口直连无前缀」两种访问方式。
+###
+### 背景：前端产物按 base=/app/hermes/ 构建（web-build.mjs 写死），index.html 里是
+###   <script src="/app/hermes/assets/index-xxx.js">
+### 而 dashboard 只把静态资源挂在 /assets（上游 web_server_dashboard.py 的 mount）。
+###   · 经飞牛网关：gateway-proxy 先剥掉 /app/hermes 再转发 → 上游看到 /assets/… ✓
+###   · 端口直连：没有代理剥前缀 → /app/hermes/assets/… 命中 SPA 兜底路由，
+###     返回 index.html（text/html）；`type="module"` 脚本因 MIME 不符被浏览器
+###     拒绝执行 → 登录页正常（服务端直出）、登录后白屏（实测报告 2026-11-02）。
+###
+### 修法：在 web_dist 里给前缀做个指向自身的软链（app/hermes -> ..）。
+### 上游的 SPA 兜底路由会按真实文件路径返回、并带正确 MIME，所以无需改上游代码。
+### 只创建一次、幂等；web_dist 被在线更新整体替换后会丢失，故启动与更新后都要补。
+ensure_web_prefix_alias() {
+    local dist="$1"
+    [ -d "${dist}" ] || return 0
+    if [ -e "${dist}/app/hermes" ] && [ ! -L "${dist}/app/hermes" ]; then
+        # 已存在实体目录：不覆盖（可能是用户/上游自己放的），只提示。
+        log_msg "提示：${dist}/app/hermes 已存在且不是软链，跳过前缀别名"
+        return 0
+    fi
+    mkdir -p "${dist}/app" 2>/dev/null || return 0
+    [ -L "${dist}/app/hermes" ] || ln -sfn .. "${dist}/app/hermes" 2>/dev/null || true
+}
+
 port_listening() {
     local hex
     hex="$(printf '%04X' "${PORT}")"
@@ -687,6 +712,8 @@ start_process() {
         echo "应用缺少预构建前端（web_dist）" > "${TRIM_TEMP_LOGFILE}"
         return 1
     fi
+    # 端口直连需要：产物里的 /app/hermes/assets/… 能落到真实文件（见函数注释）。
+    ensure_web_prefix_alias "${WEB_DIST}"
 
     local ws
     ws="$(resolve_workspace)"

@@ -440,6 +440,28 @@ def install_deps(deps: list[str]) -> tuple[bool, str]:
 
 
 # ── 前端 ─────────────────────────────────────────────────────
+def ensure_web_prefix_alias(dist: Path) -> None:
+    """让 web_dist 同时服务「网关带前缀」与「端口直连无前缀」。
+
+    前端按 base=/app/hermes/ 构建，index.html 引用 /app/hermes/assets/…；
+    而 dashboard 只挂载 /assets。经飞牛网关时代理会剥掉前缀，直连 9119 时不会 ——
+    请求落到 SPA 兜底路由、以 text/html 返回，module 脚本被 MIME 拒绝 → 白屏。
+    给前缀建一个指向自身的软链即可让兜底路由按真实文件返回正确 MIME。
+    （与 cmd/main 的 ensure_web_prefix_alias 保持一致；重建会整体替换 web_dist，故此处也要补。）
+    """
+    try:
+        if not dist.is_dir():
+            return
+        link = dist / "app" / "hermes"
+        if link.exists() and not link.is_symlink():
+            return  # 实体目录，不动
+        (dist / "app").mkdir(parents=True, exist_ok=True)
+        if not link.is_symlink():
+            link.symlink_to("..")
+    except OSError:
+        pass  # 只影响端口直连显示，不该让更新失败
+
+
 def rebuild_web() -> tuple[bool, str]:
     """有 node/npm 就重建 web_dist。没有则保留旧 dist（可能过期但不影响启动）。
 
@@ -500,6 +522,7 @@ def rebuild_web() -> tuple[bool, str]:
         if WEB_DIST.exists():
             shutil.rmtree(WEB_DIST, ignore_errors=True)
         shutil.copytree(built, WEB_DIST)
+        ensure_web_prefix_alias(WEB_DIST)
         return True, "前端已重建（含 /app/hermes 前缀）"
     except subprocess.TimeoutExpired:
         return False, "前端构建超时"

@@ -540,7 +540,15 @@ sys.exit(0 if _build_web_ui(Path('${SRC}') / 'web', fatal=True) else 1)
     cp -r "${SRC}/hermes_cli/web_dist" "${RT}/web_dist"
 fi
 [ -f "${RT}/web_dist/index.html" ] || { echo "✗ 缺 web_dist/index.html"; exit 1; }
-echo "[build] web_dist ✓ ($(du -sh "${RT}/web_dist" | cut -f1))"
+
+# 端口直连（http://NAS:9119）需要：产物里的 /app/hermes/assets/… 能落到真实文件。
+# 前端按 base=/app/hermes/ 构建，而 dashboard 只挂 /assets；经飞牛网关时代理会剥前缀，
+# 直连时不会 → 命中 SPA 兜底路由、以 text/html 返回 → module 脚本被 MIME 拒绝 → 白屏
+# （2026-11-02 实机报告）。给前缀建一个指向自身的软链即可。
+# ⚠ 打包与运行期都要有：cmd/main 启动时、hermes-update.py 重建后都会再补一次（幂等）。
+mkdir -p "${RT}/web_dist/app"
+ln -sfn .. "${RT}/web_dist/app/hermes"
+echo "[build] web_dist ✓ ($(du -sh "${RT}/web_dist" | cut -f1))，已建 /app/hermes 前缀别名"
 
 # 把前端构建脚本随包分发 —— 在线更新（hermes-update.py）重建 web_dist 时
 # 必须用它，否则会走上游 npm run build（不带 base 注入）→ 前缀丢失 → 黑屏。
