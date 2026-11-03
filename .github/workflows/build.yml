@@ -165,6 +165,19 @@ jobs:
             || { echo "✗ app.tgz 里 runtime/web_dist/app/hermes 不是符号链接"; exit 1; }
           echo "✓ web_dist 前缀别名存在"
 
+          # PM 功能基线：install_callback 必须会写 enabled-features.json，
+          # 且必须含 messaging（缺它则 pm sync 生成 core-only venv →
+          # QQ/Telegram/Discord 适配器全部失效，实机报告 2026-11-03）。
+          grep -q 'enabled-features.json' "$X/cmd/install_callback" \
+            || { echo "✗ install_callback 未写 PM 功能基线"; exit 1; }
+          grep -q '"messaging"' "$X/cmd/install_callback" \
+            || { echo "✗ PM 功能基线缺少 messaging"; exit 1; }
+          # 守卫必须同时挂在 supervisor 循环里（网关级重启不经过 start_process）
+          if [ "$(grep -c 'ensure_pm_env_ignored' "$X/cmd/main")" -lt 3 ]; then
+            echo "✗ cmd/main 的 PM 守卫调用点不足（定义 + start_process + supervisor）"; exit 1
+          fi
+          echo "✓ PM 功能基线与 supervisor 守卫齐全"
+
           # Python 运行时：两种模式二选一
           #   自带模式（默认）→ runtime/python/bin/python3
           #   系统模式        → runtime/.use-system-python 标记，安装时在 NAS 建 venv
