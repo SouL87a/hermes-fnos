@@ -104,6 +104,10 @@ ensure_pm_env_ignored() {
     local d archived=0
     for d in "${root}"/*/; do
         [ -d "${d}" ] || continue
+        # ⚠ 跳过已经归档过的目录：glob 会匹配 *.disabled-*（它们同样在 installs/
+        #   下、同样含 facts.json），否则每次启动都把它再改名一次 —— 实机见过
+        #   9 层叠加 ...disabled-20261018...disabled-20261019...，目录名逼近 PATH_MAX。
+        case "${d}" in *.disabled-*) continue ;; esac
         [ -f "${d}facts.json" ] || continue
         # ⚠ 归档前先把「插件/懒安装依赖」迁移到 LAZY_SITE，否则 mem0 这类
         #   插件依赖会跟整个 PM venv 一起消失（实机事故：mem0 backend 初始化失败）。
@@ -564,6 +568,12 @@ ${gw_browser}
     ### 每秒级重启风暴。按退出码退避：75/0 走指数退避，其余（真崩溃）保持 1s 快速自愈。
     local backoff=1
     while [ -f "${GATEWAY_WANT_FILE}" ]; do
+        # ⚠ 每次 fork 前都要过一遍 PM 守卫：本循环是 dashboard「重启网关」按钮、
+        #   SIGUSR1、崩溃 respawn 的共同入口，它们都不经过 start_process()。
+        #   漏掉这里 = 只要发生过一次 pm sync，下一次网关级重启就必然切到
+        #   core-only venv，平台适配器（QQ/Telegram/Discord）全部失效
+        #   （实机报告 2026-11-03，四次重启均复现）。
+        ensure_pm_env_ignored
         log_msg "supervisor: 启动 gateway"
         if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
             bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &

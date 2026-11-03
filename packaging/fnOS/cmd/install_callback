@@ -55,6 +55,52 @@ fi
 
 mkdir -p "${TRIM_PKGVAR}/log" "${TRIM_PKGVAR}/workspace" "${TRIM_PKGVAR}/state"
 
+### PM 功能基线（enabled-features.json）—— 决定 pm sync 重建依赖环境时带哪些 extra。
+###
+### 为什么必须有：上游 pm 在每次 sync 时把「这个安装携带哪些 extra」写进 venv 的
+### facts.json；基线来自 pm/features.py::read_features()，读的就是这个文件。
+### 文件不存在 → 基线为空 → sync 生成 core-only venv（无 aiohttp 等）→ 网关
+### 一旦重载就切到该 venv，QQ/Telegram/Discord 等平台适配器全部建不出来
+### （实机报告 2026-11-03：重启网关后 qqbot 报 "No adapter available"）。
+###
+### 位置：上游 features_path() = store_root().parent。本安装的 store_root 解析为
+###   <data>/installs/<key>（install-stamp.json 无 runtimeDir → _unstamped_store →
+###   owning_home_root 或 get_default_hermes_root() = $HERMES_HOME = <data>），
+###   所以文件落在 <data>/enabled-features.json。
+### 内容必须与构建时实际装进包内的 extra 一致 —— build.sh 装的是 web + messaging。
+### ⚠ 不能多列：extra 里每个包都必须能解析，否则后续 sync 会因缺包失败。
+### 已存在（用户装过额外 feature）时不覆盖，但要补齐我们构建时带的基础项 ——
+### 旧版本包从未写过该文件，升级上来的用户正是靠这一步拿到基线。
+FEATURES_FILE="${TRIM_PKGVAR}/enabled-features.json"
+FEATURES_BASE='messaging web'
+if [ ! -f "${FEATURES_FILE}" ]; then
+    printf '{\n  "schema": 1,\n  "extras": [\n    "messaging",\n    "web"\n  ]\n}\n' > "${FEATURES_FILE}" 2>/dev/null || true
+    echo "  PM 功能基线：已写入 ${FEATURES_FILE}（web + messaging）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+else
+    # 读取现有 extras 与基础项取并集（保留用户额外装的），用包内解释器做 JSON 操作。
+    _py_merge="${RUNTIME}/python/bin/python3"
+    if [ -x "${_py_merge}" ]; then
+        "${_py_merge}" - "${FEATURES_FILE}" ${FEATURES_BASE} <<'PYEOF' 2>/dev/null || true
+import json, sys
+path, base = sys.argv[1], sys.argv[2:]
+try:
+    data = json.load(open(path, encoding="utf-8-sig"))
+except (OSError, ValueError):
+    data = {}
+extras = data.get("extras") if isinstance(data.get("extras"), list) else []
+merged = sorted({str(e) for e in extras} | set(base))
+if merged != sorted(str(e) for e in extras) or not isinstance(data.get("extras"), list):
+    data["schema"] = 1
+    data["extras"] = merged
+    open(path, "w", encoding="utf-8").write(json.dumps(data, indent=2) + "\n")
+    print("updated")
+PYEOF
+        echo "  PM 功能基线：已合并基础项（$("${_py_merge}" -c "import json,sys;print(','.join(json.load(open(sys.argv[1],encoding='utf-8-sig')).get('extras',[])))" "${FEATURES_FILE}" 2>/dev/null || echo '?')）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+    fi
+fi
+chmod 644 "${FEATURES_FILE}" 2>/dev/null || true
+chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${FEATURES_FILE}" 2>/dev/null || true
+
 ### 系统 Python 模式：构建时放了 .use-system-python 标记，这里在 NAS 上建 venv 并装依赖。
 ### 打包模式（自带 CPython）跳过此段 —— 依赖已随包分发。
 if [ -f "${RUNTIME}/.use-system-python" ]; then
