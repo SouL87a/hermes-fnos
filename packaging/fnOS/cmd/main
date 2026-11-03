@@ -97,7 +97,18 @@ LAZY_SITE="${DATA_DIR}/site-packages"
 ### core-only venv 顶掉。故启动前把 installs/<key> 归档，让 committed_venv() 返回
 ### None → 走 _require_own_dependencies()（非 store python 直接 return，保留原
 ### sys.path）。
-### 归档而非删除：留作排查/回退。每次启动都查，因为任何 PM sync 都会重建它。
+### 归档而非删除：留作排查/回退。
+###
+### ⚠ 放行条件（2026-11-03 实机验证后补）：早先无条件归档，而功能基线
+### （enabled-features.json）修好后 PM venv 已经是完整的（extras 含
+### messaging/web，aiohttp 在）。此时再归档，等于把刚 sync 好的环境作废：
+### 用户装的插件依赖每次重启都要重新搬一遍、installs/ 无限增长、
+### 而 PM 的备份/回滚机制形同虚设。
+### 所以只在「这个 venv 真的缺本安装的基础 extra」时才归档 —— 即残缺
+### （core-only）环境，正是本条守卫要防的那种。
+### 判据取 venv 的 facts.json 里的 extras（PM 自己在 sync 时写的），不重新
+### 解析 pyproject，避免运行期依赖源码树。
+PM_REQUIRED_EXTRAS="messaging web"
 ensure_pm_env_ignored() {
     local root="${DATA_DIR}/installs"
     [ -d "${root}" ] || return 0
@@ -109,6 +120,10 @@ ensure_pm_env_ignored() {
         #   9 层叠加 ...disabled-20261018...disabled-20261019...，目录名逼近 PATH_MAX。
         case "${d}" in *.disabled-*) continue ;; esac
         [ -f "${d}facts.json" ] || continue
+        # 环境健全（含全部基础 extra）→ 放行，不动它。
+        if pm_env_is_complete "${d%/}"; then
+            continue
+        fi
         # ⚠ 归档前先把「插件/懒安装依赖」迁移到 LAZY_SITE，否则 mem0 这类
         #   插件依赖会跟整个 PM venv 一起消失（实机事故：mem0 backend 初始化失败）。
         #   PM venv = 核心依赖(缺 messaging) + 插件依赖；我们只保住后者。
@@ -119,9 +134,32 @@ ensure_pm_env_ignored() {
         fi
     done
     if [ "${archived}" = "1" ]; then
-        log_msg "PM 依赖环境已归档（避免核心依赖被 core-only venv 覆盖；插件依赖已迁移到 ${LAZY_SITE}）"
+        log_msg "PM 依赖环境已归档（extras 缺 ${PM_REQUIRED_EXTRAS}，会被 core-only venv 顶掉；插件依赖已迁移到 ${LAZY_SITE}）"
     fi
     return 0
+}
+
+### 该 PM 环境是否带有本安装要求的全部基础 extra。
+### 读 <installs>/<key>/facts.json 的 venv.extras（PM 在每次 sync 时写入）。
+### 文件不存在/解析失败 → 视为不完整（保守：宁可归档，退回包内完整依赖）。
+pm_env_is_complete() {
+    local state_dir="$1" facts="${1}/facts.json"
+    [ -r "${facts}" ] || return 1
+    "${PY}" - "${facts}" ${PM_REQUIRED_EXTRAS} <<'PYEOF' 2>/dev/null
+import json, sys
+path, required = sys.argv[1], set(sys.argv[2:])
+try:
+    data = json.load(open(path, encoding="utf-8-sig"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+venv = (data.get("packages") or {}).get("venv") or data.get("venv") or {}
+extras = venv.get("extras")
+if not isinstance(extras, list):
+    raise SystemExit(1)
+# 上游用 "all" 表示全量安装，视同覆盖所有要求。
+have = {str(e).lower() for e in extras}
+raise SystemExit(0 if ("all" in have or required <= have) else 1)
+PYEOF
 }
 
 ### 把 PM venv 里「包内 site-packages 没有的」发行包迁到 LAZY_SITE。
