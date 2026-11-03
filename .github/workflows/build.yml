@@ -154,7 +154,6 @@ jobs:
             || { echo "✗ cmd/main 未注入 basic auth"; exit 1; }
           grep -q 'envfile.sh' "$X/cmd/main" \
             || { echo "✗ cmd/main 未加载 envfile.sh"; exit 1; }
-          rm -rf "$X"
           echo "✓ 端口直连 + 面板鉴权 配置齐全"
 
           # 端口直连白屏修复：web_dist 里必须有 app/hermes -> .. 的软链。
@@ -178,6 +177,7 @@ jobs:
             echo "✗ cmd/main 的 PM 守卫调用点不足（定义 + start_process + supervisor）"; exit 1
           fi
           echo "✓ PM 功能基线与 supervisor 守卫齐全"
+          rm -rf "$X"
 
           # Python 运行时：两种模式二选一
           #   自带模式（默认）→ runtime/python/bin/python3
