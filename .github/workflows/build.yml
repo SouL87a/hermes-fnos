@@ -140,7 +140,8 @@ jobs:
           # 缺一处就是「文档说有直连、实际打不开」。
           # 解到临时目录，避免污染仓库根目录。
           X="$(mktemp -d)"
-          tar -xzf "$FPK" -C "$X" manifest cmd/main wizard/install wizard/config
+          tar -xzf "$FPK" -C "$X" manifest cmd/main cmd/install_callback \
+                             wizard/install wizard/config
           grep -q '^service_port[[:space:]]*=[[:space:]]*9119' "$X/manifest" \
             || { echo "✗ manifest 缺少 service_port = 9119"; exit 1; }
           grep -q '^checkport[[:space:]]*=[[:space:]]*true' "$X/manifest" \
