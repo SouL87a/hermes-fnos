@@ -152,6 +152,50 @@ ensure_pm_env_ignored() {
     return 0
 }
 
+### 解析 PM【当前选中】环境的 site-packages 路径；拿不到则输出空。
+###
+### 为什么不能 find 猜（2026-11-04 实机教训）：
+###   1) 真实深度是 7：
+###      installs/<key>/environments/<gen>/venv/lib/python3.14/site-packages
+###      用 -maxdepth 3 会一条都找不到 → prune 整段逻辑静默不执行。
+###   2) installs/ 下还有 *.disabled-* 归档目录，它们同样含 environments/ 与
+###      facts.json；不排除的话会拿到已被归档的旧环境，版本对比全错。
+### 正确来源：<data>/installs/<key>/facts.json 的 packages.venv.environment，
+### 再拼 site-packages。facts 缺失或路径不存在 → 输出空（调用方自行跳过）。
+pm_env_site_packages() {
+    local facts
+    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f \
+               -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
+    [ -n "${facts}" ] || return 0
+    "${PY}" - "${facts}" <<'PYEOF' 2>/dev/null
+import json, sys
+from pathlib import Path
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+except (OSError, ValueError):
+    raise SystemExit(0)
+env = ((data.get("packages") or {}).get("venv") or {}).get("environment")
+if not isinstance(env, str) or not env:
+    raise SystemExit(0)
+venv = Path(env)
+if not (venv / "pyvenv.cfg").is_file():
+    raise SystemExit(0)
+libs = sorted((venv / "lib").glob("python3*/site-packages"))
+print(str(libs[0]) if libs else "")
+PYEOF
+}
+
+### PM 是否已经提交过可用的环境。
+### ⚠ 不能只看「有没有 facts.json」：归档目录 .disabled-* 里也留着 facts.json，
+###   只看文件存在会误判成「已有环境」→ bootstrap 不跑 → 懒安装又坏
+###   （2026-11-04 实机指出，升级时旧环境被归档的场景会复发）。
+### 判据：排除 .disabled-*，且 facts 记录的 environment 真实存在。
+pm_env_committed() {
+    local site
+    site="$(pm_env_site_packages)"
+    [ -n "${site}" ] && [ -d "${site}" ]
+}
+
 ### 该 PM 环境是否带有本安装要求的全部基础 extra。
 ### 读 <installs>/<key>/facts.json 的 venv.extras（PM 在每次 sync 时写入）。
 ### 文件不存在/解析失败 → 视为不完整（保守：宁可归档，退回包内完整依赖）。
@@ -184,7 +228,10 @@ PYEOF
 migrate_pm_venv_extras() {
     local state_dir="$1"
     local vendir
-    vendir="$(find "${state_dir}/environments" -maxdepth 3 -type d -name site-packages 2>/dev/null | head -n 1)"
+    # ⚠ 深度是 4：environments/<gen>/venv/lib/python3.14/site-packages。
+    #   原先 -maxdepth 3 永远找不到 → 归档 PM 环境时插件依赖从未被迁移过
+    #   （与 prune 的 -maxdepth 3 是同一类错误，2026-11-04 一并修正）。
+    vendir="$(find "${state_dir}/environments" -maxdepth 5 -type d -name site-packages 2>/dev/null | head -n 1)"
     [ -n "${vendir}" ] && [ -d "${vendir}" ] || return 0
     local bundled="${APP_DIR}/runtime/python/lib/python3.14/site-packages"
     [ -d "${bundled}" ] || bundled="$(find "${APP_DIR}/runtime/python" -maxdepth 5 -type d -name site-packages 2>/dev/null | head -n 1)"
@@ -938,9 +985,11 @@ PYEOF
 ### 是否需要 bootstrap：facts.json 不存在，且未成功过，且退避未到。
 pm_bootstrap_needed() {
     [ -f "${PM_BOOTSTRAP_DONE}" ] && return 1
-    local facts
-    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f 2>/dev/null | head -n 1)"
-    [ -n "${facts}" ] && return 1          # PM 已提交过环境
+    # PM 已提交过【可用】环境 → 无需 bootstrap。
+    # ⚠ 用 pm_env_committed（排除 .disabled-* 且校验 environment 真实存在），
+    #   不能只 find 到 facts.json 就认定有环境 —— 归档目录里也留着 facts.json，
+    #   那种情况下 bootstrap 必须照常跑（实机 2026-11-04 指出）。
+    pm_env_committed && return 1
     # 退避：失败后 10min → 1h → 6h → 24h，最多每小时一次，避免离线机器反复卡网络
     [ -r "${PM_BOOTSTRAP_TRIES}" ] || return 0
     local last count now wait
@@ -1046,9 +1095,12 @@ start_process() {
     ensure_pm_env_ignored
     # LAZY_SITE 冗余收敛：PM 环境健全时，把 LAZY_SITE 里 PM 已覆盖的包归档。
     # 默认干跑（只记日志）；确认无误后由用户设 PY_LAZY_PRUNE=1 才真执行。
+    # ⚠ 环境路径必须从 facts.json 读【当前选中的 generation】：
+    #   1) 不能靠 find 猜 —— 目录深度是 7（installs/<key>/environments/<gen>/venv/lib/python3.14/site-packages），
+    #      实机验证时 -maxdepth 3 导致整段逻辑从未执行（2026-11-04）。
+    #   2) 不能取 head -n 1 —— 会先命中 .disabled-* 里的旧环境，版本对比结果就错了。
     local _pm_site=""
-    _pm_site="$(find "${DATA_DIR}/installs" -maxdepth 3 -type d -name site-packages \
-                  -path '*/environments/*' 2>/dev/null | head -n 1)"
+    _pm_site="$(pm_env_site_packages)"
     [ -n "${_pm_site}" ] && lazy_prune_redundant "${_pm_site}" || true
     # doctor 需要 ~/.local/bin/hermes（$HOME = HERMES_HOME = DATA_DIR）。
     # 本包走 /usr/local/bin/hermes（usr-local-linker），但上游 doctor 的
