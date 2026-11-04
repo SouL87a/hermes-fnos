@@ -112,6 +112,17 @@ PM_REQUIRED_EXTRAS="messaging web"
 ensure_pm_env_ignored() {
     local root="${DATA_DIR}/installs"
     [ -d "${root}" ] || return 0
+    # ⚠ 与后台 bootstrap 互斥：bootstrap 正在写新 facts.json 时，这里若看到
+    #   「不完整的 facts.json」会把正在构建的目录整个归档 —— 45 秒白跑，还可能
+    #   留下半成品。用非阻塞锁：拿不到就说明别人正在动 PM 环境，本次直接跳过。
+    local _lock="${DATA_DIR}/pm-env.lock"
+    if command -v flock > /dev/null 2>&1; then
+        exec 201>>"${_lock}" 2>/dev/null || true
+        if ! flock -n 201 2>/dev/null; then
+            log_msg "PM 环境正被其他进程修改（bootstrap 进行中），本次守卫跳过"
+            return 0
+        fi
+    fi
     local d archived=0
     for d in "${root}"/*/; do
         [ -d "${d}" ] || continue
@@ -136,6 +147,8 @@ ensure_pm_env_ignored() {
     if [ "${archived}" = "1" ]; then
         log_msg "PM 依赖环境已归档（extras 缺 ${PM_REQUIRED_EXTRAS}，会被 core-only venv 顶掉；插件依赖已迁移到 ${LAZY_SITE}）"
     fi
+    # 释放 PM 环境锁（fd 201）。关闭 fd 即解锁。
+    { exec 201>&-; } 2>/dev/null || true
     return 0
 }
 
@@ -958,6 +971,16 @@ pm_bootstrap_kick() {
         # 输出单独存档，避免混进 info.log 淹没真正的启动错误
         local blog="${TRIM_PKGVAR}/log/pm-bootstrap.log"
         mkdir -p "$(dirname "${blog}")" 2>/dev/null || true
+        # 与 ensure_pm_env_ignored 共用同一把锁：bootstrap 写环境期间，守卫不会
+        # 把正在构建的 installs/<key> 当成「残缺环境」归档掉。
+        # 非阻塞：拿不到说明别人正在动 PM 环境，本次放弃（下次启动再试）。
+        if command -v flock > /dev/null 2>&1; then
+            exec 201>>"${DATA_DIR}/pm-env.lock" 2>/dev/null || true
+            if ! flock -n 201 2>/dev/null; then
+                log_msg "PM 环境 bootstrap：另有进程正在修改 PM 环境，本次跳过"
+                exit 0
+            fi
+        fi
         {
             echo "=== bootstrap started $(date -Is) extras=${extras} ==="
             cd "${SRC_DIR}" || exit 1
