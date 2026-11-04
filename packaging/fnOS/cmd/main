@@ -262,6 +262,11 @@ PYEOF
 ### 实测 LAZY_SITE 里 13 个发行包有 12 个 PM venv 已在（版本 ≥ LAZY），
 ### 只有 pyopen_wakeword 是游离的。把冗余的归档掉，可让三套依赖环境收敛成两套。
 ###
+### 为什么不干脆清空 LAZY_SITE？
+### 因为 PM 环境并非永久有效：ensure_pm_env_ignored 在 extras 不完整时仍会归档
+### 整个 PM 环境、退回包内依赖 —— 那一刻 LAZY_SITE 重新变得可见，是插件依赖的
+### 唯一来源。只清「PM 已覆盖」的部分，两端都安全。
+###
 ### ⚠ 三条实现红线：
 ###   1. 只按 *.dist-info 判断，绝不能用目录名 —— google / grpc 是 protobuf /
 ###      grpcio 的 namespace 包，没有 dist-info，按名字删会连带破坏它们。

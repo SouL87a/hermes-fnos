@@ -177,6 +177,21 @@ jobs:
             echo "✗ cmd/main 的 PM 守卫调用点不足（定义 + start_process + supervisor）"; exit 1
           fi
           echo "✓ PM 功能基线与 supervisor 守卫齐全"
+
+          # 按需安装修复：bootstrap + LAZY_SITE 收敛必须都在。
+          # 缺 bootstrap → 从未 pm install 的机器上 20+ 可选功能无法懒安装；
+          # 缺 prune → LAZY_SITE 与 PM venv 长期并存、双份依赖。
+          for fn in pm_bootstrap_kick lazy_prune_redundant; do
+            grep -q "^${fn}() {" "$X/cmd/main" \
+              || { echo "✗ cmd/main 缺少 ${fn}"; exit 1; }
+          done
+          # bootstrap 必须在后台跑：串进前台会拖慢启动（实测 sync 需 45s）
+          grep -q 'pm_bootstrap_kick || true' "$X/cmd/main" \
+            || { echo "✗ bootstrap 未以非阻塞方式调用"; exit 1; }
+          # prune 默认必须是干跑，避免一升级就自动搬动用户数据
+          grep -q 'PY_LAZY_PRUNE:-dry' "$X/cmd/main" \
+            || { echo "✗ prune 默认不是干跑"; exit 1; }
+          echo "✓ 按需安装修复（bootstrap + prune）齐全"
           rm -rf "$X"
 
           # Python 运行时：两种模式二选一
