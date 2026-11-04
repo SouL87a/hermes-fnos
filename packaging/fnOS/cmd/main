@@ -185,6 +185,14 @@ print(str(libs[0]) if libs else "")
 PYEOF
 }
 
+### 活跃 install 的 state 目录（<data>/installs/<key>，不含 .disabled-*）；拿不到输出空。
+pm_env_state_dir() {
+    local facts
+    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f \
+               -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
+    [ -n "${facts}" ] && dirname "${facts}"
+}
+
 ### PM 是否已经提交过可用的环境。
 ### ⚠ 不能只看「有没有 facts.json」：归档目录 .disabled-* 里也留着 facts.json，
 ###   只看文件存在会误判成「已有环境」→ bootstrap 不跑 → 懒安装又坏
@@ -1099,9 +1107,22 @@ start_process() {
     #   1) 不能靠 find 猜 —— 目录深度是 7（installs/<key>/environments/<gen>/venv/lib/python3.14/site-packages），
     #      实机验证时 -maxdepth 3 导致整段逻辑从未执行（2026-11-04）。
     #   2) 不能取 head -n 1 —— 会先命中 .disabled-* 里的旧环境，版本对比结果就错了。
+    # ⚠ 只在 PM 环境【健全】时清理：两个机制不能互相拆台 ——
+    #   prune 把 LAZY_SITE 的包归档后，如果 PM 环境之后又被
+    #   ensure_pm_env_ignored 归档（extras 不完整时），插件依赖就彻底没了。
+    #   所以额外要求 pm_env_is_complete（extras 含 messaging+web）。
     local _pm_site=""
     _pm_site="$(pm_env_site_packages)"
-    [ -n "${_pm_site}" ] && lazy_prune_redundant "${_pm_site}" || true
+    if [ -n "${_pm_site}" ]; then
+        local _pm_state _pm_facts
+        _pm_state="$(pm_env_state_dir)"
+        _pm_facts="${_pm_state}/facts.json"
+        if [ -n "${_pm_state}" ] && [ -r "${_pm_facts}" ] && pm_env_is_complete "${_pm_state}"; then
+            lazy_prune_redundant "${_pm_site}" || true
+        else
+            log_msg "LAZY_SITE 清理：PM 环境 extras 不完整，跳过（避免与归档守卫互相拆台）"
+        fi
+    fi
     # doctor 需要 ~/.local/bin/hermes（$HOME = HERMES_HOME = DATA_DIR）。
     # 本包走 /usr/local/bin/hermes（usr-local-linker），但上游 doctor 的
     # _check_command_installation() 只认 ~/.local/bin。
