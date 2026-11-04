@@ -255,6 +255,124 @@ PYEOF
     return 0
 }
 
+### 清理 LAZY_SITE 里「PM 环境已覆盖」的冗余包。
+###
+### 背景（实机 2026-11-04）：PM 接管运行时后，activate_dependencies() 会按
+### 【目录名】过滤掉所有叫 site-packages 的条目，LAZY_SITE 因此对主进程失效。
+### 实测 LAZY_SITE 里 13 个发行包有 12 个 PM venv 已在（版本 ≥ LAZY），
+### 只有 pyopen_wakeword 是游离的。把冗余的归档掉，可让三套依赖环境收敛成两套。
+###
+### ⚠ 三条实现红线：
+###   1. 只按 *.dist-info 判断，绝不能用目录名 —— google / grpc 是 protobuf /
+###      grpcio 的 namespace 包，没有 dist-info，按名字删会连带破坏它们。
+###   2. 只有「PM 版本 ≥ LAZY 版本」才归档；版本解析失败一律跳过（保守）。
+###   3. 只移动不删除，落到 <data>/lazy-site-archived/<时间戳>/，保留相对路径。
+###      PY_LAZY_PRUNE=dry 时只打印清单，不动文件。
+###
+### 环境变量：
+###   PY_LAZY_PRUNE=1|dry  执行/干跑（默认 dry，须显式开启才真归档）
+lazy_prune_redundant() {
+    local pm_site="$1" dry="${PY_LAZY_PRUNE:-dry}"
+    [ -d "${LAZY_SITE}" ] || return 0
+    [ -n "${pm_site}" ] && [ -d "${pm_site}" ] || {
+        log_msg "LAZY_SITE 清理：找不到 PM 环境，跳过"
+        return 0
+    }
+    local dir="${DATA_DIR}/lazy-site-archived/$(date +%Y%m%d%H%M%S)"
+    local -a _args=("${LAZY_SITE}" "${pm_site}" "${dir}")
+    [ "${dry}" = "dry" ] && _args+=(--dry)
+    "${PY}" - "${_args[@]}" <<'PYEOF' >> "${LOG_FILE}" 2>&1
+import json, os, re, shutil, sys
+from pathlib import Path
+
+lazy, pm, archive = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+dry = "--dry" in sys.argv
+
+def norm(n):
+    return re.sub(r"[-_.]+", "-", n).lower()
+
+def dist_map(root):
+    """发行包名 -> (dist-info 目录, 版本)。只认 *.dist-info。"""
+    out = {}
+    try:
+        for e in root.iterdir():
+            if e.is_dir() and e.name.endswith(".dist-info"):
+                stem = e.name[: -len(".dist-info")]
+                name, _, ver = stem.rpartition("-")
+                if name:
+                    out[norm(name)] = (e, ver)
+    except OSError:
+        pass
+    return out
+
+def ver_tuple(v):
+    parts = re.findall(r"\d+", v or "")
+    return tuple(int(p) for p in parts[:4]) if parts else ()
+
+lazy_d, pm_d = dist_map(lazy), dist_map(pm)
+redundant, keep = [], []
+for name, (di, ver) in sorted(lazy_d.items()):
+    if name not in pm_d:
+        keep.append((name, ver, "PM 没有"))
+        continue
+    pm_ver = pm_d[name][1]
+    lt, pt = ver_tuple(ver), ver_tuple(pm_ver)
+    if not lt or not pt:
+        keep.append((name, ver, "版本无法解析，保守保留"))
+        continue
+    if pt >= lt:
+        redundant.append((name, ver, pm_ver))
+    else:
+        keep.append((name, ver, f"PM 版本更低({pm_ver})"))
+
+print(f"[lazy-prune] LAZY={len(lazy_d)} PM={len(pm_d)} 冗余={len(redundant)} 保留={len(keep)}")
+for n, v, pv in redundant:
+    print(f"  归档 {n:22} LAZY={v:10} PM={pv}")
+for n, v, why in keep:
+    print(f"  保留 {n:22} {v:10} ({why})")
+
+if dry or not redundant:
+    raise SystemExit(0)
+
+# 同时归档这些发行包的顶层文件/目录（与 dist-info 同名的包体、.so 等）。
+# 依据 RECORD 精确列出，避免误删 namespace 包（google/grpc 不在任何 RECORD 里，天然不受影响）。
+moved = 0
+for name, _v, _pv in redundant:
+    di = lazy_d[name][0]
+    targets = {di}
+    # ⚠ 必须以 RECORD 为准。发行包名与顶层目录名【不保证一致】
+    #   （mem0ai → mem0、qdrant-client → qdrant_client），按名字猜会漏搬包体、
+    #   留下孤儿目录。真实 wheel 都带 RECORD（已核实 numpy 等）。
+    #   没有 RECORD 就跳过不归档 —— 宁可留着冗余，也不破坏环境。
+    rec = di / "RECORD"
+    if not rec.is_file():
+        print(f"  ! 跳过 {name}: 缺少 RECORD，无法确定包体范围")
+        continue
+    tops = set()
+    for line in rec.read_text(encoding="utf-8", errors="replace").splitlines():
+        rel = line.split(",", 1)[0].strip()
+        if not rel or rel.startswith(("..", "/")):
+            continue
+        top = rel.split("/", 1)[0]
+        if top and top != di.name:
+            tops.add(top)
+    for top in tops:
+        targets.add(lazy / top)
+    for src in sorted(targets):
+        if not src.exists():
+            continue
+        dest = archive / src.relative_to(lazy)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(src), str(dest))
+            moved += 1
+        except OSError as exc:
+            print(f"  ! 移动失败 {src}: {exc}")
+print(f"[lazy-prune] 已归档 {moved} 个条目 → {archive}")
+PYEOF
+    log_msg "LAZY_SITE 清理完成（冗余包已归档到 ${dir}）"
+}
+
 ### 懒安装目录的 ABI 守卫。
 ### ⚠ 惨痛教训（v0.22.2 升级实机）：LAZY_SITE 被放在 PYTHONPATH 里，且【优先于】
 ### 包内解释器自己的 site-packages。上一个版本（CPython 3.12）的懒安装目录里
@@ -877,6 +995,12 @@ start_process() {
     # PM 依赖环境守卫：facts.json 存在会让 PM 用 core-only venv 顶掉包内完整
     # site-packages（qqbot 等适配器失效）。见 ensure_pm_env_ignored 注释。
     ensure_pm_env_ignored
+    # LAZY_SITE 冗余收敛：PM 环境健全时，把 LAZY_SITE 里 PM 已覆盖的包归档。
+    # 默认干跑（只记日志）；确认无误后由用户设 PY_LAZY_PRUNE=1 才真执行。
+    local _pm_site=""
+    _pm_site="$(find "${DATA_DIR}/installs" -maxdepth 3 -type d -name site-packages \
+                  -path '*/environments/*' 2>/dev/null | head -n 1)"
+    [ -n "${_pm_site}" ] && lazy_prune_redundant "${_pm_site}" || true
     # doctor 需要 ~/.local/bin/hermes（$HOME = HERMES_HOME = DATA_DIR）。
     # 本包走 /usr/local/bin/hermes（usr-local-linker），但上游 doctor 的
     # _check_command_installation() 只认 ~/.local/bin。
