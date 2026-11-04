@@ -255,39 +255,10 @@ PYEOF
     return 0
 }
 
-### 清理 LAZY_SITE 里「PM 环境已覆盖」的冗余包。
-###
-### 背景（实机 2026-11-04）：PM 接管运行时后，activate_dependencies() 会按
-### 【目录名】过滤掉所有叫 site-packages 的条目，LAZY_SITE 因此对主进程失效。
-### 实测 LAZY_SITE 里 13 个发行包有 12 个 PM venv 已在（版本 ≥ LAZY），
-### 只有 pyopen_wakeword 是游离的。把冗余的归档掉，可让三套依赖环境收敛成两套。
-###
-### 为什么不干脆清空 LAZY_SITE？
-### 因为 PM 环境并非永久有效：ensure_pm_env_ignored 在 extras 不完整时仍会归档
-### 整个 PM 环境、退回包内依赖 —— 那一刻 LAZY_SITE 重新变得可见，是插件依赖的
-### 唯一来源。只清「PM 已覆盖」的部分，两端都安全。
-###
-### ⚠ 三条实现红线：
-###   1. 只按 *.dist-info 判断，绝不能用目录名 —— google / grpc 是 protobuf /
-###      grpcio 的 namespace 包，没有 dist-info，按名字删会连带破坏它们。
-###   2. 只有「PM 版本 ≥ LAZY 版本」才归档；版本解析失败一律跳过（保守）。
-###   3. 只移动不删除，落到 <data>/lazy-site-archived/<时间戳>/，保留相对路径。
-###      PY_LAZY_PRUNE=dry 时只打印清单，不动文件。
-###
-### 环境变量：
-###   PY_LAZY_PRUNE=1|dry  执行/干跑（默认 dry，须显式开启才真归档）
-lazy_prune_redundant() {
-    local pm_site="$1" dry="${PY_LAZY_PRUNE:-dry}"
-    [ -d "${LAZY_SITE}" ] || return 0
-    [ -n "${pm_site}" ] && [ -d "${pm_site}" ] || {
-        log_msg "LAZY_SITE 清理：找不到 PM 环境，跳过"
-        return 0
-    }
-    local dir="${DATA_DIR}/lazy-site-archived/$(date +%Y%m%d%H%M%S)"
-    local -a _args=("${LAZY_SITE}" "${pm_site}" "${dir}")
-    [ "${dry}" = "dry" ] && _args+=(--dry)
-    "${PY}" - "${_args[@]}" <<'PYEOF' >> "${LOG_FILE}" 2>&1
-import json, os, re, shutil, sys
+### 实际执行体（由 lazy_prune_redundant 通过 `"${PY}" -` 调用）
+lazy_prune_body() {
+    cat <<'PYEOF'
+import os, re, shutil, sys
 from pathlib import Path
 
 lazy, pm, archive = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
@@ -297,7 +268,6 @@ def norm(n):
     return re.sub(r"[-_.]+", "-", n).lower()
 
 def dist_map(root):
-    """发行包名 -> (dist-info 目录, 版本)。只认 *.dist-info。"""
     out = {}
     try:
         for e in root.iterdir():
@@ -328,30 +298,24 @@ for name, (di, ver) in sorted(lazy_d.items()):
     if pt >= lt:
         redundant.append((name, ver, pm_ver))
     else:
-        keep.append((name, ver, f"PM 版本更低({pm_ver})"))
+        keep.append((name, ver, "PM 版本更低(%s)" % pm_ver))
 
-print(f"[lazy-prune] LAZY={len(lazy_d)} PM={len(pm_d)} 冗余={len(redundant)} 保留={len(keep)}")
+print("[lazy-prune] LAZY=%d PM=%d 冗余=%d 保留=%d" % (len(lazy_d), len(pm_d), len(redundant), len(keep)))
 for n, v, pv in redundant:
-    print(f"  归档 {n:22} LAZY={v:10} PM={pv}")
+    print("  归档 %-22s LAZY=%-10s PM=%s" % (n, v, pv))
 for n, v, why in keep:
-    print(f"  保留 {n:22} {v:10} ({why})")
+    print("  保留 %-22s %-10s (%s)" % (n, v, why))
 
 if dry or not redundant:
     raise SystemExit(0)
 
-# 同时归档这些发行包的顶层文件/目录（与 dist-info 同名的包体、.so 等）。
-# 依据 RECORD 精确列出，避免误删 namespace 包（google/grpc 不在任何 RECORD 里，天然不受影响）。
 moved = 0
 for name, _v, _pv in redundant:
     di = lazy_d[name][0]
     targets = {di}
-    # ⚠ 必须以 RECORD 为准。发行包名与顶层目录名【不保证一致】
-    #   （mem0ai → mem0、qdrant-client → qdrant_client），按名字猜会漏搬包体、
-    #   留下孤儿目录。真实 wheel 都带 RECORD（已核实 numpy 等）。
-    #   没有 RECORD 就跳过不归档 —— 宁可留着冗余，也不破坏环境。
     rec = di / "RECORD"
     if not rec.is_file():
-        print(f"  ! 跳过 {name}: 缺少 RECORD，无法确定包体范围")
+        print("  ! 跳过 %s: 缺少 RECORD，无法确定包体范围" % name)
         continue
     tops = set()
     for line in rec.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -372,10 +336,67 @@ for name, _v, _pv in redundant:
             shutil.move(str(src), str(dest))
             moved += 1
         except OSError as exc:
-            print(f"  ! 移动失败 {src}: {exc}")
-print(f"[lazy-prune] 已归档 {moved} 个条目 → {archive}")
+            print("  ! 移动失败 %s: %s" % (src, exc))
+print("[lazy-prune] 已归档 %d 个条目 → %s" % (moved, archive))
 PYEOF
+}
+
+### 清理 LAZY_SITE 里「PM 环境已覆盖」的冗余包。
+###
+### 背景（实机 2026-11-04）：PM 接管运行时后，activate_dependencies() 会按
+### 【目录名】过滤掉所有叫 site-packages 的条目，LAZY_SITE 因此对主进程失效。
+### 实测 LAZY_SITE 里 13 个发行包有 12 个 PM venv 已在（版本 ≥ LAZY），
+### 只有 pyopen_wakeword 是游离的。把冗余的归档掉，可让三套依赖环境收敛成两套。
+###
+### 为什么不干脆清空 LAZY_SITE？
+### 因为 PM 环境并非永久有效：ensure_pm_env_ignored 在 extras 不完整时仍会归档
+### 整个 PM 环境、退回包内依赖 —— 那一刻 LAZY_SITE 重新变得可见，是插件依赖的
+### 唯一来源。只清「PM 已覆盖」的部分，两端都安全。
+###
+### ⚠ 三条实现红线：
+###   1. 只按 *.dist-info 判断，绝不能用目录名 —— google / grpc 是 protobuf /
+###      grpcio 的 namespace 包，没有 dist-info，按名字删会连带破坏它们。
+###   2. 只有「PM 版本 ≥ LAZY 版本」才归档；版本解析失败一律跳过（保守）。
+###   3. 只移动不删除，落到 <data>/lazy-site-archived/<时间戳>/，保留相对路径。
+###      PY_LAZY_PRUNE=dry 时只打印清单，不动文件。
+###
+### 环境变量：
+###   PY_LAZY_PRUNE=1|dry  执行/干跑（默认 dry，须显式开启才真归档）
+lazy_prune_redundant() {
+    local pm_site="$1" dry="${PY_LAZY_PRUNE:-dry}"
+    [ -d "${LAZY_SITE}" ] || return 0
+    if [ -z "${pm_site}" ] || [ ! -d "${pm_site}" ]; then
+        log_msg "LAZY_SITE 清理：找不到 PM 环境，跳过"
+        return 0
+    fi
+    local dir="${DATA_DIR}/lazy-site-archived/$(date +%Y%m%d%H%M%S)"
+    local out rc
+    if [ "${dry}" = "dry" ]; then
+        out="$(lazy_prune_body | "${PY}" - "${LAZY_SITE}" "${pm_site}" "${dir}" --dry 2>&1)"
+        rc=$?
+    else
+        out="$(lazy_prune_body | "${PY}" - "${LAZY_SITE}" "${pm_site}" "${dir}" 2>&1)"
+        rc=$?
+    fi
+    [ "${rc}" -eq 0 ] || { printf '%s\n' "${out}" >> "${LOG_FILE}"; return 0; }
+
+    if [ "${dry}" = "dry" ]; then
+        # 干跑预览会随每次应用启动重复出现；内容没变就不再写 info.log。
+        local cache="${DATA_DIR}/.lazy-prune-preview"
+        if [ -f "${cache}" ] && [ "$(cat "${cache}" 2>/dev/null)" = "${out}" ]; then
+            return 0
+        fi
+        printf '%s\n' "${out}" > "${cache}" 2>/dev/null || true
+        printf '%s\n' "${out}" >> "${LOG_FILE}"
+        log_msg "LAZY_SITE 清理预览（干跑，未改动文件；设 PY_LAZY_PRUNE=1 执行）"
+        return 0
+    fi
+
+    printf '%s\n' "${out}" >> "${LOG_FILE}"
     log_msg "LAZY_SITE 清理完成（冗余包已归档到 ${dir}）"
+    # 真跑后清掉旧预览缓存，避免下次干跑误判"没变化"
+    rm -f "${DATA_DIR}/.lazy-prune-preview" 2>/dev/null || true
+    return 0
 }
 
 ### 懒安装目录的 ABI 守卫。
