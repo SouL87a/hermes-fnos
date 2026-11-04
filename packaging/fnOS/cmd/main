@@ -740,6 +740,111 @@ start_gateway_supervisor() {
     return 0
 }
 
+### ── PM 环境 bootstrap ─────────────────────────────────────────
+### 为什么要做：上游 PM 的「按需安装」要求进程运行在 PM 选定的依赖环境里
+### （pm/client.py 的 running_from_selected_environment）。在一台从未跑过
+### `pm install` 的机器上，facts.json 不存在 → 判定为 False → 20+ 个可选功能
+### （telegram/discord/doc-extract/stt-whisper/唤醒词…）全部无法懒安装
+### （实机 2026-11-04 用临时 HOME 复现：committed_venv=None、running=False）。
+### 这里在启动后台补一次 sync，让 facts.json 出现，判定随即成立。
+###
+### ⚠ 三条硬约束：
+###   1. 绝不在前台跑：sync 要联网，本机实测 45s，离线机器会更久 —— 不能拖慢启动
+###   2. 绝不让失败影响应用：任何失败只记日志，下次启动按退避重试
+###   3. 成功与「试过」必须是两个标记文件，否则失败会被当成已成功
+PM_BOOTSTRAP_DONE="${TRIM_PKGVAR}/.pm-bootstrapped"
+PM_BOOTSTRAP_TRIES="${TRIM_PKGVAR}/.pm-bootstrap-attempts"
+
+### 取基线 extras（enabled-features.json 的 extras 数组）。
+### 读不到就退回默认值 —— 与 install_callback 写入的基础项一致。
+pm_bootstrap_extras() {
+    local f="${TRIM_PKGVAR}/enabled-features.json"
+    local out=""
+    [ -r "${f}" ] && out="$("${PY}" - "${f}" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+except (OSError, ValueError):
+    raise SystemExit(0)
+extras = data.get("extras")
+if isinstance(extras, list) and extras:
+    print(" ".join(str(e) for e in extras if str(e).strip()))
+PYEOF
+)"
+    # "all" 对我们没有意义（会装全部 extra，体积爆炸），过滤掉
+    out="$(printf '%s' "${out}" | tr ' ' '\n' | grep -vx 'all' | tr '\n' ' ')"
+    out="${out% }"
+    [ -n "${out}" ] || out="web messaging"
+    printf '%s' "${out}"
+}
+
+### 是否需要 bootstrap：facts.json 不存在，且未成功过，且退避未到。
+pm_bootstrap_needed() {
+    [ -f "${PM_BOOTSTRAP_DONE}" ] && return 1
+    local facts
+    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f 2>/dev/null | head -n 1)"
+    [ -n "${facts}" ] && return 1          # PM 已提交过环境
+    # 退避：失败后 10min → 1h → 6h → 24h，最多每小时一次，避免离线机器反复卡网络
+    [ -r "${PM_BOOTSTRAP_TRIES}" ] || return 0
+    local last count now wait
+    last="$(head -n 1 "${PM_BOOTSTRAP_TRIES}" 2>/dev/null | cut -d' ' -f1)"
+    count="$(head -n 1 "${PM_BOOTSTRAP_TRIES}" 2>/dev/null | cut -d' ' -f2)"
+    case "${last}" in ''|*[!0-9]*) return 0 ;; esac
+    case "${count}" in ''|*[!0-9]*) count=1 ;; esac
+    now="$(date +%s)"
+    case "${count}" in
+        1) wait=600 ;;      # 10 分钟
+        2) wait=3600 ;;     # 1 小时
+        3) wait=21600 ;;    # 6 小时
+        *) wait=86400 ;;    # 24 小时
+    esac
+    [ $(( now - last )) -ge "${wait}" ] && return 0
+    return 1
+}
+
+### 后台执行一次 bootstrap。本函数自身立刻返回，真正的工作在子 shell 里。
+pm_bootstrap_kick() {
+    pm_bootstrap_needed || return 0
+    local extras
+    extras="$(pm_bootstrap_extras)"
+    log_msg "PM 环境 bootstrap：后台安装基线依赖（${extras}）—— 完成后可选功能才能按需安装"
+
+    (
+        # 独立会话：父进程（App Center 的 start）退出后继续跑
+        # 输出单独存档，避免混进 info.log 淹没真正的启动错误
+        local blog="${TRIM_PKGVAR}/log/pm-bootstrap.log"
+        mkdir -p "$(dirname "${blog}")" 2>/dev/null || true
+        {
+            echo "=== bootstrap started $(date -Is) extras=${extras} ==="
+            cd "${SRC_DIR}" || exit 1
+            # 与 cmd/main 启动环境一致，但故意【不】带 LAZY_SITE：
+            # bootstrap 的结果只应影响 PM 自己的环境。
+            env HOME="${DATA_DIR}" \
+                PYTHONPATH="${SRC_DIR}" \
+                PYTHONUNBUFFERED=1 \
+                PYTHONDONTWRITEBYTECODE=1 \
+                HERMES_HOME="${DATA_DIR}" \
+                HERMES_MANAGED_BY="trim-hermes-fnos" \
+                "${PY}" -m hermes_cli.main pm install --extra ${extras}
+            rc=$?
+            echo "=== bootstrap finished $(date -Is) rc=${rc} ==="
+        } >> "${blog}" 2>&1
+
+        if [ "${rc:-1}" -eq 0 ]; then
+            date +%s > "${PM_BOOTSTRAP_DONE}" 2>/dev/null || true
+            rm -f "${PM_BOOTSTRAP_TRIES}" 2>/dev/null || true
+            log_msg "PM 环境 bootstrap 完成：可选功能现在可以按需安装"
+        else
+            local prev=0
+            [ -r "${PM_BOOTSTRAP_TRIES}" ] && prev="$(head -n 1 "${PM_BOOTSTRAP_TRIES}" 2>/dev/null | cut -d' ' -f2)"
+            case "${prev}" in ''|*[!0-9]*) prev=0 ;; esac
+            printf '%s %s\n' "$(date +%s)" "$((prev + 1))" > "${PM_BOOTSTRAP_TRIES}" 2>/dev/null || true
+            log_msg "PM 环境 bootstrap 失败（rc=${rc}），详见 log/pm-bootstrap.log；将按退避重试"
+        fi
+    ) </dev/null >/dev/null 2>&1 &
+    # 不记录 PID：这是尽力而为的后台任务，应用停止时无需管理它的生命周期
+}
+
 start_process() {
     if status > /dev/null 2>&1; then
         return 0
@@ -919,6 +1024,10 @@ HERMES_GATEWAY_DEBUG='1' \
         # 不阻断 dashboard 启动，但必须留下明确记录（否则表现为"应用正常、通道离线"）。
         log_msg "警告：消息网关 supervisor 启动失败 —— 消息平台将不可用，请查看日志"
     fi
+
+    # 后台补一次 PM 环境（不阻塞、失败不影响应用；见 pm_bootstrap_kick 说明）。
+    # 放在启动就绪判定之前发起，让它与 dashboard/gateway 的启动并行进行。
+    pm_bootstrap_kick || true
 
     # 就绪：TCP 回环监听 + Unix Socket
     local i=0
