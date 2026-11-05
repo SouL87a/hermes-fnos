@@ -258,9 +258,8 @@ print(d['packages']['python']['version'])" "${SRC}/pm/lock.json" 2>/dev/null || 
     #   manifest overrides 声明了 13.0.0；pip 不认那个语义 → 用 constraints
     #   把 Pillow 钉到 13.0.0（constraints 只约束版本、不参与解析起点，
     #   恰好实现"override"效果）。旧方案的 uv-overrides.txt 同源。
-    local OVR="${PBS_CACHE}/pip-constraints.txt"
-    printf '%s
-' "Pillow==13.0.0" > "${OVR}"
+    OVR="${PBS_CACHE}/pip-constraints.txt"
+    printf '%s' "Pillow==13.0.0" > "${OVR}"
     PIP_ARGS=(download
         -r "${RT}/requirements.lock"
         -d "${RT}/wheelhouse"
