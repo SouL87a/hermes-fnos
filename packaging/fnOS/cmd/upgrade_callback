@@ -1,5 +1,10 @@
 #!/bin/bash
-# 升级后：补齐运行时可执行位。用户数据保留在 TRIM_PKGVAR。
+# 升级后：补执行位；从旧布局升级时做一次性迁移。
+###
+### 布局变更（v0.23 起）：
+###   旧：包内预置 runtime/python + runtime/hermes（扁平依赖）+ hermes-git.git
+###   新：源码在 <data>/src（git clone，带 .git），依赖在 PM 真实 venv
+### 从旧版升级上来时，旧的预置运行时不再被使用；用户数据必须原样保留。
 set -e
 
 APP="hermes"
@@ -10,6 +15,10 @@ if [ -z "${TRIM_APPDEST}" ]; then
         TRIM_APPDEST="$(readlink -f "/var/apps/${APP}")"
     fi
 fi
+export TRIM_APPDEST
+export TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/${APP}/var}"
+export TRIM_USERNAME="${TRIM_USERNAME:-${APP}}"
+export TRIM_GROUPNAME="${TRIM_GROUPNAME:-${TRIM_USERNAME}}"
 
 ### 自证日志 + 失败留痕（见 upgrade_init 的说明）。
 mkdir -p "${TRIM_PKGVAR}/log" 2>/dev/null || true
@@ -21,26 +30,46 @@ _hermes_err_trap() {
 }
 trap '_hermes_err_trap ${LINENO} "${BASH_COMMAND}"' ERR
 
-echo "$(date -Is) upgrade_callback: RUNTIME=${TRIM_APPDEST}/runtime 存在=$([ -d "${TRIM_APPDEST}/runtime" ] && echo yes || echo no)" \
-    >> "${TRIM_PKGVAR}/log/upgrade.log" 2>/dev/null || true
-
 RUNTIME="${TRIM_APPDEST}/runtime"
-[ -d "${RUNTIME}/python/bin" ] && find "${RUNTIME}/python/bin" -type f -exec chmod +x {} \; 2>/dev/null || true
-if [ -d "${RUNTIME}/python/lib" ]; then
-    find "${RUNTIME}/python/lib" -name '*.so' -o -name '*.so.*' 2>/dev/null | while read -r so; do
-        chmod +x "${so}" 2>/dev/null || true
-    done
-fi
-[ -f "${TRIM_APPDEST}/gateway-proxy.py" ] && chmod +x "${TRIM_APPDEST}/gateway-proxy.py" 2>/dev/null || true
+DATA="${TRIM_PKGVAR}"
+echo "$(date -Is) upgrade_callback 开始：APP=${TRIM_APPDEST} DATA=${DATA}" \
+    >> "${DATA}/log/upgrade.log" 2>/dev/null || true
 
-### ⚠ 不再 `chown -R "${TRIM_PKGVAR}"`：
-### 实测该目录有 168,510 个条目 / 12 GB，全量递归要十几秒到一分钟，
-### 若平台对 callback 设超时会中途被杀 → 判升级失败（实机报告 C3）。
-### 只修顶层目录属主（新解出的应用文件已在 TRIM_APPDEST，与数据目录无关）。
-chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+### 1) 执行位（fnpack 会把 app.tgz 内权限拍平）
+[ -f "${TRIM_APPDEST}/gateway-proxy.py" ] && chmod +x "${TRIM_APPDEST}/gateway-proxy.py" 2>/dev/null || true
+[ -f "${TRIM_APPDEST}/scripts/install-runtime.sh" ] && chmod +x "${TRIM_APPDEST}/scripts/install-runtime.sh" 2>/dev/null || true
+
+### 2) 旧布局清理：runtime/ 下的预置运行时已无意义。
+###    ⚠ 只动包内容树（TRIM_APPDEST，升级时本就整体替换），不碰 DATA 里的用户数据。
+if [ -d "${RUNTIME}" ]; then
+    rm -rf "${RUNTIME}/python" "${RUNTIME}/hermes" "${RUNTIME}/hermes-git.git" \
+           "${RUNTIME}/deps.txt" "${RUNTIME}/web-build.mjs" 2>/dev/null || true
+    echo "$(date -Is) 已清理旧预置运行时（runtime/python、runtime/hermes 等）" \
+        >> "${DATA}/log/upgrade.log" 2>/dev/null || true
+fi
+
+### 3) 数据目录里的旧产物：
+###    <data>/site-packages 是旧 LAZY_SITE，新布局不再使用 → 归档（不删，可回退）
+if [ -d "${DATA}/site-packages" ]; then
+    _bak="${DATA}/site-packages.archived-$(date +%Y%m%d%H%M%S)"
+    if mv "${DATA}/site-packages" "${_bak}" 2>/dev/null; then
+        echo "$(date -Is) 旧 LAZY_SITE 已归档 → ${_bak}" \
+            >> "${DATA}/log/upgrade.log" 2>/dev/null || true
+    fi
+fi
+
+### 4) 源码/依赖缺失不阻塞升级；真正缺失时 cmd/main 启动会同步补齐。
+if [ ! -d "${DATA}/src/hermes_cli" ]; then
+    echo "$(date -Is) 尚无 ${DATA}/src —— 首次启动时会自动获取源码与依赖" \
+        >> "${DATA}/log/upgrade.log" 2>/dev/null || true
+fi
+
+### 5) 属主：只修顶层（全量递归在 168k 条目 / 12GB 上会超时，实机报告 C3）
+chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${DATA}" 2>/dev/null || true
 for d in log workspace state; do
-    [ -d "${TRIM_PKGVAR}/${d}" ] && \
-        chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}/${d}" 2>/dev/null || true
+    [ -d "${DATA}/${d}" ] && \
+        chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${DATA}/${d}" 2>/dev/null || true
 done
-echo "$(date -Is) upgrade_callback: 完成" >> "${TRIM_PKGVAR}/log/upgrade.log" 2>/dev/null || true
+
+echo "$(date -Is) upgrade_callback 完成" >> "${DATA}/log/upgrade.log" 2>/dev/null || true
 exit 0

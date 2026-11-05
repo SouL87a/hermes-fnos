@@ -2,14 +2,11 @@
 
 ### Hermes Agent —— 飞牛 fnOS 服务生命周期
 ###
-### 原生应用，两种运行时模式（构建时定）：
-###  - 自带 CPython 模式（默认）：依赖预装进包内 python-build-standalone 的
-###    site-packages，运行期零联网；不用 venv（venv 的 pyvenv.cfg/符号链接带构建机
-###    绝对路径，装到 NAS 后路径变化会失效）。自带 SQLite 较新，WAL 正常。
-###  - 系统 Python 模式：安装时在 NAS 上建 venv（${TRIM_PKGVAR}/venv），
-###    解释器取自应用中心「Python 3.12」，依赖装进该 venv。（系统 libsqlite3 偏旧
-###    → WAL 会被 Hermes 降级成 DELETE，doctor 报假 FTS 损坏，故不作默认。）
-### 两种模式都不需要在运行期 pip；web_dist 已预构建（--skip-build）。
+### 原生应用，运行期由上游 PM 管理：
+###  - 安装时 scripts/install-runtime.sh 取 uv → git clone 源码 → pm install
+###  - 源码在 ${TRIM_PKGVAR}/src（带 .git，hermes update 原生可用）
+###  - 依赖在 PM 的真实 venv（<data>/installs/<key>/environments/<gen>/venv）
+###  - 前端 web_dist 由构建期预构建（--skip-build）
 ### 形态：hermes dashboard（FastAPI+uvicorn；默认仅绑 127.0.0.1，配置了面板密码
 ###       时绑 0.0.0.0 以支持 http://<NAS>:端口 直连，并启用上游 basic auth）+
 ###        gateway-proxy.py（监听 Unix Socket，反代到回环端口）。
@@ -56,7 +53,7 @@ PID_FILE="${TRIM_PKGVAR}/app.pid"
 AUTH_ENV_FILE="${TRIM_PKGVAR}/.dashboard-auth.sh"
 
 APP_DIR="${TRIM_APPDEST}"
-SRC_DIR="${APP_DIR}/runtime/hermes"
+SRC_DIR="${TRIM_PKGVAR}/src"
 
 ### 本脚本的绝对路径 / 所在目录。
 ### ⚠ cmd/ 被 fnOS 装在 /var/apps/<app>/cmd/（= <appdata>/cmd），**不在**
@@ -64,456 +61,73 @@ SRC_DIR="${APP_DIR}/runtime/hermes"
 ### 都是错的路径。凡是需要引用本脚本自身的地方，一律用下面这两个变量。
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 APP_CTL_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
-### 两种运行时模式（由构建时的标记文件决定）：
-###  - 自带 CPython（默认）：PY=runtime/python/bin/python3，依赖在其 site-packages。
-###  - 系统 Python 模式：存在 .use-system-python 标记时用 NAS 上现建的
-###    venv（${TRIM_PKGVAR}/venv，路径是本机的、可移植性没问题）。
-if [ -f "${APP_DIR}/runtime/.use-system-python" ]; then
-    PY="${TRIM_PKGVAR}/venv/bin/python3"
-else
-    PY="${APP_DIR}/runtime/python/bin/python3"
-fi
+### 解释器：PM venv 里的 python（安装期由 install-runtime.sh 建好）。
+### 这里只在【函数定义阶段】留空；真正启动前会调 pm_venv_python 重新解析。
+PY=""
 WEB_DIST="${APP_DIR}/runtime/web_dist"
 GATEWAY_SOCKET="${APP_DIR}/hermes.sock"
 GATEWAY_PROXY="${APP_DIR}/gateway-proxy.py"
 DATA_DIR="${TRIM_PKGVAR}"
-### 可选依赖的懒安装目标（TTS/STT/Bedrock 等首次使用时才装）。
-### 为什么必须显式给：自带 CPython 不是 venv，而 Hermes 的懒安装默认走
-### `uv pip install`（uv 无 venv 时会拒绝："No virtual environment found"），
-### 且它会强制设 VIRTUAL_ENV=<解释器上级>，连 UV_SYSTEM_PYTHON 都压不住、还会
-### 试图写只读的 TRIM_APPDEST（实测均失败）。设了这个变量后，上游改走
-### `uv pip install --target <此目录>`（上游明确为"非 venv 部署"设计，带 ABI 戳
-### 校验）—— 不需要 venv，且落在可写的数据目录。实测 --target 路径 exit=0。
-LAZY_SITE="${DATA_DIR}/site-packages"
-
-### PM（上游包管理器）依赖环境守卫。
-### ⚠ 实机事故（v0.22.2）：上游把 pm 模块加回来了，且 hermes_bootstrap 每次启动都调
-### pm.environments.activate_dependencies()。只要 <data>/installs/<key>/facts.json 存在，
-### 它就会【无条件清空 sys.path 上所有 site-packages 项】，改用 facts.json 记录的
-### venv —— 而我们的事实文件里 extras=[]（PM sync 时 feature_list 为空），该 venv
-### 缺 messaging 全栈（aiohttp/telegram/discord/slack…）→ 所有可选平台适配器失效：
-### 「No adapter available for enabled qqbot」。
-### 本包的依赖完整预装在包内 CPython 的 site-packages（86 个发行包），不应被这个
-### core-only venv 顶掉。故启动前把 installs/<key> 归档，让 committed_venv() 返回
-### None → 走 _require_own_dependencies()（非 store python 直接 return，保留原
-### sys.path）。
-### 归档而非删除：留作排查/回退。
+### PM 依赖环境：由上游 PM 自己管理（真实 venv）。
 ###
-### ⚠ 放行条件（2026-11-03 实机验证后补）：早先无条件归档，而功能基线
-### （enabled-features.json）修好后 PM venv 已经是完整的（extras 含
-### messaging/web，aiohttp 在）。此时再归档，等于把刚 sync 好的环境作废：
-### 用户装的插件依赖每次重启都要重新搬一遍、installs/ 无限增长、
-### 而 PM 的备份/回滚机制形同虚设。
-### 所以只在「这个 venv 真的缺本安装的基础 extra」时才归档 —— 即残缺
-### （core-only）环境，正是本条守卫要防的那种。
-### 判据取 venv 的 facts.json 里的 extras（PM 自己在 sync 时写的），不重新
-### 解析 pyproject，避免运行期依赖源码树。
-PM_REQUIRED_EXTRAS="messaging web"
-ensure_pm_env_ignored() {
-    local root="${DATA_DIR}/installs"
-    [ -d "${root}" ] || return 0
-    # ⚠ 与后台 bootstrap 互斥：bootstrap 正在写新 facts.json 时，这里若看到
-    #   「不完整的 facts.json」会把正在构建的目录整个归档 —— 45 秒白跑，还可能
-    #   留下半成品。用非阻塞锁：拿不到就说明别人正在动 PM 环境，本次直接跳过。
-    local _lock="${DATA_DIR}/pm-env.lock"
-    if command -v flock > /dev/null 2>&1; then
-        exec 201>>"${_lock}" 2>/dev/null || true
-        if ! flock -n 201 2>/dev/null; then
-            log_msg "PM 环境正被其他进程修改（bootstrap 进行中），本次守卫跳过"
-            return 0
-        fi
-    fi
-    local d archived=0
-    for d in "${root}"/*/; do
-        [ -d "${d}" ] || continue
-        # ⚠ 跳过已经归档过的目录：glob 会匹配 *.disabled-*（它们同样在 installs/
-        #   下、同样含 facts.json），否则每次启动都把它再改名一次 —— 实机见过
-        #   9 层叠加 ...disabled-20261018...disabled-20261019...，目录名逼近 PATH_MAX。
-        case "${d}" in *.disabled-*) continue ;; esac
-        [ -f "${d}facts.json" ] || continue
-        # 环境健全（含全部基础 extra）→ 放行，不动它。
-        if pm_env_is_complete "${d%/}"; then
-            continue
-        fi
-        # ⚠ 归档前先把「插件/懒安装依赖」迁移到 LAZY_SITE，否则 mem0 这类
-        #   插件依赖会跟整个 PM venv 一起消失（实机事故：mem0 backend 初始化失败）。
-        #   PM venv = 核心依赖(缺 messaging) + 插件依赖；我们只保住后者。
-        migrate_pm_venv_extras "${d%/}" || true
-        local bak="${d%/}.disabled-$(date +%Y%m%d%H%M%S)"
-        if mv "${d%/}" "${bak}" 2>/dev/null; then
-            archived=1
-        fi
-    done
-    if [ "${archived}" = "1" ]; then
-        log_msg "PM 依赖环境已归档（extras 缺 ${PM_REQUIRED_EXTRAS}，会被 core-only venv 顶掉；插件依赖已迁移到 ${LAZY_SITE}）"
-    fi
-    # 释放 PM 环境锁（fd 201）。关闭 fd 即解锁。
-    { exec 201>&-; } 2>/dev/null || true
-    return 0
-}
-
-### 解析 PM【当前选中】环境的 site-packages 路径；拿不到则输出空。
+### 历史：v0.22.5-6 及以前，本包把依赖扁平预置在 runtime/python/lib/.../site-packages，
+### 不是 PM 认得的形态，导致懒安装被拒（20+ 可选功能不可用）。为此打过约 450 行
+### 补丁（守卫/bootstrap/prune/迁移/ABI）。那套方案已归档到 archive/v0.22.5-6/。
 ###
-### 为什么不能 find 猜（2026-11-04 实机教训）：
-###   1) 真实深度是 7：
-###      installs/<key>/environments/<gen>/venv/lib/python3.14/site-packages
-###      用 -maxdepth 3 会一条都找不到 → prune 整段逻辑静默不执行。
-###   2) installs/ 下还有 *.disabled-* 归档目录，它们同样含 environments/ 与
-###      facts.json；不排除的话会拿到已被归档的旧环境，版本对比全错。
-### 正确来源：<data>/installs/<key>/facts.json 的 packages.venv.environment，
-### 再拼 site-packages。facts 缺失或路径不存在 → 输出空（调用方自行跳过）。
-pm_env_site_packages() {
+### 现在：安装期由 scripts/install-runtime.sh 用 git clone + `pm install` 建真实
+### venv，源码在 ${TRIM_PKGVAR}/src（带 .git，hermes update 原生可用）。
+### 这里只保留「读 PM 环境路径」与「环境缺失时补装」。
+
+### 从 <data>/installs/<key>/facts.json 读出当前 PM venv 的 python；拿不到输出空。
+pm_venv_python() {
     local facts
     facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f \
                -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
     [ -n "${facts}" ] || return 0
-    "${PY}" - "${facts}" <<'PYEOF' 2>/dev/null
+    local boot=""
+    local c
+    for c in "$(command -v python3 2>/dev/null)" "${PY}"; do
+        if [ -n "${c}" ] && [ -x "${c}" ]; then boot="${c}"; break; fi
+    done
+    [ -n "${boot}" ] || return 0
+    "${boot}" - "${facts}" <<'PYEOF' 2>/dev/null
 import json, sys
 from pathlib import Path
 try:
-    data = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
 except (OSError, ValueError):
     raise SystemExit(0)
-env = ((data.get("packages") or {}).get("venv") or {}).get("environment")
+env = ((d.get("packages") or {}).get("venv") or {}).get("environment")
 if not isinstance(env, str) or not env:
     raise SystemExit(0)
-venv = Path(env)
-if not (venv / "pyvenv.cfg").is_file():
-    raise SystemExit(0)
-libs = sorted((venv / "lib").glob("python3*/site-packages"))
-print(str(libs[0]) if libs else "")
+py = Path(env) / "bin" / "python3"
+print(str(py) if py.is_file() else "")
 PYEOF
 }
 
-### 活跃 install 的 state 目录（<data>/installs/<key>，不含 .disabled-*）；拿不到输出空。
-pm_env_state_dir() {
-    local facts
-    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f \
-               -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
-    [ -n "${facts}" ] && dirname "${facts}"
+### PM 环境是否就绪（能拿到可执行的 venv python）。
+pm_env_ready() {
+    local py
+    py="$(pm_venv_python)"
+    [ -n "${py}" ] && [ -x "${py}" ]
 }
 
-### PM 是否已经提交过可用的环境。
-### ⚠ 不能只看「有没有 facts.json」：归档目录 .disabled-* 里也留着 facts.json，
-###   只看文件存在会误判成「已有环境」→ bootstrap 不跑 → 懒安装又坏
-###   （2026-11-04 实机指出，升级时旧环境被归档的场景会复发）。
-### 判据：排除 .disabled-*，且 facts 记录的 environment 真实存在。
-pm_env_committed() {
-    local site
-    site="$(pm_env_site_packages)"
-    [ -n "${site}" ] && [ -d "${site}" ]
-}
-
-### 该 PM 环境是否带有本安装要求的全部基础 extra。
-### 读 <installs>/<key>/facts.json 的 venv.extras（PM 在每次 sync 时写入）。
-### 文件不存在/解析失败 → 视为不完整（保守：宁可归档，退回包内完整依赖）。
-pm_env_is_complete() {
-    local state_dir="$1" facts="${1}/facts.json"
-    [ -r "${facts}" ] || return 1
-    "${PY}" - "${facts}" ${PM_REQUIRED_EXTRAS} <<'PYEOF' 2>/dev/null
-import json, sys
-path, required = sys.argv[1], set(sys.argv[2:])
-try:
-    data = json.load(open(path, encoding="utf-8-sig"))
-except (OSError, ValueError):
-    raise SystemExit(1)
-venv = (data.get("packages") or {}).get("venv") or data.get("venv") or {}
-extras = venv.get("extras")
-if not isinstance(extras, list):
-    raise SystemExit(1)
-# 上游用 "all" 表示全量安装，视同覆盖所有要求。
-have = {str(e).lower() for e in extras}
-raise SystemExit(0 if ("all" in have or required <= have) else 1)
-PYEOF
-}
-
-### 把 PM venv 里「包内 site-packages 没有的」发行包迁到 LAZY_SITE。
-### 为什么：PM venv 同时承载核心依赖与插件依赖，整体归档会丢后者；而包内
-### site-packages 已含全部核心依赖，所以只补差集即可。按 dist-info 名判重，
-### 已存在的（含更高版本）跳过 —— 绝不让 pip 升级核心包（LAZY_SITE 在
-### PYTHONPATH 里优先于包内，升级核心包会遮蔽）。
-### 纯复制、不解析依赖关系（PM 装时已解析过）。
-migrate_pm_venv_extras() {
-    local state_dir="$1"
-    local vendir
-    # ⚠ 深度是 4：environments/<gen>/venv/lib/python3.14/site-packages。
-    #   原先 -maxdepth 3 永远找不到 → 归档 PM 环境时插件依赖从未被迁移过
-    #   （与 prune 的 -maxdepth 3 是同一类错误，2026-11-04 一并修正）。
-    vendir="$(find "${state_dir}/environments" -maxdepth 5 -type d -name site-packages 2>/dev/null | head -n 1)"
-    [ -n "${vendir}" ] && [ -d "${vendir}" ] || return 0
-    local bundled="${APP_DIR}/runtime/python/lib/python3.14/site-packages"
-    [ -d "${bundled}" ] || bundled="$(find "${APP_DIR}/runtime/python" -maxdepth 5 -type d -name site-packages 2>/dev/null | head -n 1)"
-    [ -n "${bundled}" ] && [ -d "${bundled}" ] || return 0
-    mkdir -p "${LAZY_SITE}" 2>/dev/null || true
-    "${PY}" - "${vendir}" "${bundled}" "${LAZY_SITE}" <<'PYEOF' >> "${LOG_FILE}" 2>&1
-import os, re, shutil, sys
-from pathlib import Path
-
-src, bundled, dst = map(Path, sys.argv[1:4])
-# 规范化发行包名（PEP 503）：Foo_Bar-1.0.dist-info -> foo-bar
-def norm(n: str) -> str:
-    return re.sub(r"[-_.]+", "-", n).lower()
-
-def dists(root: Path) -> dict:
-    out = {}
-    try:
-        for e in root.iterdir():
-            if e.is_dir() and e.name.endswith(".dist-info"):
-                out[norm(e.name[: -len(".dist-info")].rsplit("-", 1)[0])] = e.name
-    except OSError:
-        pass
-    return out
-
-have_bundled = dists(bundled)
-have_lazy = dists(dst)
-migrated, skipped = [], []
-for e in src.iterdir():
-    if not e.is_dir():
-        continue
-    name = e.name
-    if name.endswith(".dist-info"):
-        base = norm(name[: -len(".dist-info")].rsplit("-", 1)[0])
-    else:
-        continue
-    if base in have_bundled or base in have_lazy:
-        skipped.append(base)
-        continue
-    if (dst / name).exists():
-        skipped.append(base)
-        continue
-    shutil.copytree(e, dst / name, symlinks=True, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
-    # __pycache__/RECORD 之外的顶层内容：dist-info 已复制，跳过重复
-    migrated.append(base)
-
-# 复制非 dist-info 的顶层文件/目录（纯 python 包体、.so、data 等）。
-# 用 RECORD 精确对照比按名字猜更稳，但为免复杂，这里只复制 dist-info 里列出、
-# dst 尚不存在的条目。
-migrated_files = 0
-for base in migrated:
-    # 找到该 base 对应的 dist-info（可能在 src 里）
-    di = None
-    for e in src.iterdir():
-        if e.is_dir() and norm(e.name[: -len(".dist-info")].rsplit("-", 1)[0]) == base and e.name.endswith(".dist-info"):
-            di = e
-            break
-    if di is None:
-        continue
-    rec = di / "RECORD"
-    if not rec.is_file():
-        continue
-    for line in rec.read_text(encoding="utf-8", errors="replace").splitlines():
-        rel = line.split(",", 1)[0].strip()
-        if not rel or rel.startswith("..") or rel.startswith("/"):
-            continue
-        s, t = src / rel, dst / rel
-        if t.exists() or not s.exists():
-            continue
-        t.parent.mkdir(parents=True, exist_ok=True)
-        if s.is_symlink():
-            try: t.symlink_to(os.readlink(s))
-            except OSError: pass
-        elif s.is_file():
-            shutil.copy2(s, t)
-            migrated_files += 1
-
-print(f"  [pm-migrate] 新增 {len(migrated)} 个发行包、{migrated_files} 个文件, 跳过 {len(skipped)} 个已存在")
-if migrated:
-    print("    ", ", ".join(sorted(migrated)[:12]) + (" …" if len(migrated) > 12 else ""))
-PYEOF
-    return 0
-}
-
-### 实际执行体（由 lazy_prune_redundant 通过 `"${PY}" -` 调用）
-lazy_prune_body() {
-    cat <<'PYEOF'
-import os, re, shutil, sys
-from pathlib import Path
-
-lazy, pm, archive = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
-dry = "--dry" in sys.argv
-
-def norm(n):
-    return re.sub(r"[-_.]+", "-", n).lower()
-
-def dist_map(root):
-    out = {}
-    try:
-        for e in root.iterdir():
-            if e.is_dir() and e.name.endswith(".dist-info"):
-                stem = e.name[: -len(".dist-info")]
-                name, _, ver = stem.rpartition("-")
-                if name:
-                    out[norm(name)] = (e, ver)
-    except OSError:
-        pass
-    return out
-
-def ver_tuple(v):
-    parts = re.findall(r"\d+", v or "")
-    return tuple(int(p) for p in parts[:4]) if parts else ()
-
-lazy_d, pm_d = dist_map(lazy), dist_map(pm)
-redundant, keep = [], []
-for name, (di, ver) in sorted(lazy_d.items()):
-    if name not in pm_d:
-        keep.append((name, ver, "PM 没有"))
-        continue
-    pm_ver = pm_d[name][1]
-    lt, pt = ver_tuple(ver), ver_tuple(pm_ver)
-    if not lt or not pt:
-        keep.append((name, ver, "版本无法解析，保守保留"))
-        continue
-    if pt >= lt:
-        redundant.append((name, ver, pm_ver))
-    else:
-        keep.append((name, ver, "PM 版本更低(%s)" % pm_ver))
-
-print("[lazy-prune] LAZY=%d PM=%d 冗余=%d 保留=%d" % (len(lazy_d), len(pm_d), len(redundant), len(keep)))
-for n, v, pv in redundant:
-    print("  归档 %-22s LAZY=%-10s PM=%s" % (n, v, pv))
-for n, v, why in keep:
-    print("  保留 %-22s %-10s (%s)" % (n, v, why))
-
-if dry or not redundant:
-    raise SystemExit(0)
-
-moved = 0
-for name, _v, _pv in redundant:
-    di = lazy_d[name][0]
-    targets = {di}
-    rec = di / "RECORD"
-    if not rec.is_file():
-        print("  ! 跳过 %s: 缺少 RECORD，无法确定包体范围" % name)
-        continue
-    tops = set()
-    for line in rec.read_text(encoding="utf-8", errors="replace").splitlines():
-        rel = line.split(",", 1)[0].strip()
-        if not rel or rel.startswith(("..", "/")):
-            continue
-        top = rel.split("/", 1)[0]
-        if top and top != di.name:
-            tops.add(top)
-    for top in tops:
-        targets.add(lazy / top)
-    for src in sorted(targets):
-        if not src.exists():
-            continue
-        dest = archive / src.relative_to(lazy)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            shutil.move(str(src), str(dest))
-            moved += 1
-        except OSError as exc:
-            print("  ! 移动失败 %s: %s" % (src, exc))
-print("[lazy-prune] 已归档 %d 个条目 → %s" % (moved, archive))
-PYEOF
-}
-
-### 清理 LAZY_SITE 里「PM 环境已覆盖」的冗余包。
-###
-### 背景（实机 2026-11-04）：PM 接管运行时后，activate_dependencies() 会按
-### 【目录名】过滤掉所有叫 site-packages 的条目，LAZY_SITE 因此对主进程失效。
-### 实测 LAZY_SITE 里 13 个发行包有 12 个 PM venv 已在（版本 ≥ LAZY），
-### 只有 pyopen_wakeword 是游离的。把冗余的归档掉，可让三套依赖环境收敛成两套。
-###
-### 为什么不干脆清空 LAZY_SITE？
-### 因为 PM 环境并非永久有效：ensure_pm_env_ignored 在 extras 不完整时仍会归档
-### 整个 PM 环境、退回包内依赖 —— 那一刻 LAZY_SITE 重新变得可见，是插件依赖的
-### 唯一来源。只清「PM 已覆盖」的部分，两端都安全。
-###
-### ⚠ 三条实现红线：
-###   1. 只按 *.dist-info 判断，绝不能用目录名 —— google / grpc 是 protobuf /
-###      grpcio 的 namespace 包，没有 dist-info，按名字删会连带破坏它们。
-###   2. 只有「PM 版本 ≥ LAZY 版本」才归档；版本解析失败一律跳过（保守）。
-###   3. 只移动不删除，落到 <data>/lazy-site-archived/<时间戳>/，保留相对路径。
-###      PY_LAZY_PRUNE=dry 时只打印清单，不动文件。
-###
-### 环境变量：
-###   PY_LAZY_PRUNE=1|dry  执行/干跑（默认 dry，须显式开启才真归档）
-lazy_prune_redundant() {
-    local pm_site="$1" dry="${PY_LAZY_PRUNE:-dry}"
-    [ -d "${LAZY_SITE}" ] || return 0
-    if [ -z "${pm_site}" ] || [ ! -d "${pm_site}" ]; then
-        log_msg "LAZY_SITE 清理：找不到 PM 环境，跳过"
+### 环境缺失时同步补齐（阻塞）。用于安装回调被平台超时打断的兜底。
+pm_env_install_blocking() {
+    local rt="${APP_DIR}/scripts/install-runtime.sh"
+    [ -f "${rt}" ] || { log_msg "缺少 install-runtime.sh，无法补齐运行期"; return 1; }
+    log_msg "PM 环境缺失，开始同步安装（首次可能需要数分钟）…"
+    HERMES_REF="$(cat "${APP_DIR}/upstream-ref" 2>/dev/null || echo v0.22.5)" \
+        bash "${rt}" "${DATA_DIR}" "${APP_DIR}" >> "${LOG_FILE}" 2>&1
+    local rc=$?
+    if [ "${rc}" -eq 0 ] && pm_env_ready; then
+        log_msg "PM 环境安装完成"
         return 0
     fi
-    local dir="${DATA_DIR}/lazy-site-archived/$(date +%Y%m%d%H%M%S)"
-    local out rc
-    if [ "${dry}" = "dry" ]; then
-        out="$(lazy_prune_body | "${PY}" - "${LAZY_SITE}" "${pm_site}" "${dir}" --dry 2>&1)"
-        rc=$?
-    else
-        out="$(lazy_prune_body | "${PY}" - "${LAZY_SITE}" "${pm_site}" "${dir}" 2>&1)"
-        rc=$?
-    fi
-    [ "${rc}" -eq 0 ] || { printf '%s\n' "${out}" >> "${LOG_FILE}"; return 0; }
-
-    if [ "${dry}" = "dry" ]; then
-        # 干跑预览会随每次应用启动重复出现；内容没变就不再写 info.log。
-        local cache="${DATA_DIR}/.lazy-prune-preview"
-        if [ -f "${cache}" ] && [ "$(cat "${cache}" 2>/dev/null)" = "${out}" ]; then
-            return 0
-        fi
-        printf '%s\n' "${out}" > "${cache}" 2>/dev/null || true
-        printf '%s\n' "${out}" >> "${LOG_FILE}"
-        log_msg "LAZY_SITE 清理预览（干跑，未改动文件；设 PY_LAZY_PRUNE=1 执行）"
-        return 0
-    fi
-
-    printf '%s\n' "${out}" >> "${LOG_FILE}"
-    log_msg "LAZY_SITE 清理完成（冗余包已归档到 ${dir}）"
-    # 真跑后清掉旧预览缓存，避免下次干跑误判"没变化"
-    rm -f "${DATA_DIR}/.lazy-prune-preview" 2>/dev/null || true
-    return 0
+    log_msg "PM 环境安装失败（rc=${rc}），详见 log/install-runtime.log"
+    return 1
 }
 
-### 懒安装目录的 ABI 守卫。
-### ⚠ 惨痛教训（v0.22.2 升级实机）：LAZY_SITE 被放在 PYTHONPATH 里，且【优先于】
-### 包内解释器自己的 site-packages。上一个版本（CPython 3.12）的懒安装目录里
-### 残留着 cp312 编译的扩展（如 pydantic_core/_pydantic_core.cpython-312-*.so）。
-### 换成 CPython 3.14 后，这些目录仍在 PYTHONPATH 前部 → import 到 cp312 的包
-### → `ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'`
-### → dashboard 起不来（Bad Gateway）、gateway 的 agent 也全线失败。
-### 上游只在【下次懒安装时】才校验 ABI 戳（_ensure_target_ready），不会在启动时
-### 清理 —— 所以必须由我们在启动前处理：ABI 不匹配就把整个目录归档移走
-### （不删，留作排查/回退），让解释器用包内自带的 site-packages。
-### 当前解释器的 ABI 标记，形如 `cpython-314-x86_64-linux-gnu`（不含前后缀）。
-lazy_abi() {
-    "${PY}" -c 'import sysconfig; s=sysconfig.get_config_var("EXT_SUFFIX") or ""; print(s[1:-3] if s.startswith(".") and s.endswith(".so") else s)' 2>/dev/null
-}
-
-ensure_lazy_site_abi() {
-    [ -d "${LAZY_SITE}" ] || { mkdir -p "${LAZY_SITE}" 2>/dev/null || true; return 0; }
-    local want stamp have
-    want="$(lazy_abi)"
-    [ -n "${want}" ] || return 0
-    stamp="${LAZY_SITE}/.abi-stamp"
-    if [ -f "${stamp}" ]; then
-        have="$(tr -d '[:space:]' < "${stamp}" 2>/dev/null)"
-        [ "${have}" = "${want}" ] && return 0
-    else
-        # 没有戳：目录可能来自旧版本（或首次创建）→ 看里面有没有同构的 .so 能判断。
-        # 抽不到 ABI（abi3 稳定 ABI / 异常命名）→ 放行（宁可保留也不误删用户目录）。
-        local so abi=""
-        so="$(find "${LAZY_SITE}" -maxdepth 3 -name '*.so' 2>/dev/null | head -n 1)"
-        if [ -z "${so}" ]; then
-            printf '%s\n' "${want}" > "${stamp}" 2>/dev/null || true
-            return 0
-        fi
-        abi="$(basename "${so}" | sed -nE 's/^.*\.(cpython-[0-9]+[^.]*)\.so$/\1/p')"
-        if [ -z "${abi}" ] || [ "${abi}" = "${want}" ]; then
-            printf '%s\n' "${want}" > "${stamp}" 2>/dev/null || true
-            return 0
-        fi
-        have="${abi}"
-    fi
-    local bak="${LAZY_SITE}.abi-mismatch-$(date +%Y%m%d%H%M%S)"
-    log_msg "懒安装目录 ABI 不匹配（旧=${have:-?} 新=${want}）→ 归档到 ${bak} 并重建"
-    mv "${LAZY_SITE}" "${bak}" 2>/dev/null || rm -rf "${LAZY_SITE}" 2>/dev/null || true
-    mkdir -p "${LAZY_SITE}" 2>/dev/null || true
-    printf '%s\n' "${want}" > "${LAZY_SITE}/.abi-stamp" 2>/dev/null || true
-    return 0
-}
 
 ### 进程识别：绝对路径匹配，不误伤其他 python。
 ### ⚠ 系统 Python 模式下 dashboard 的 argv[0] 是 ${TRIM_PKGVAR}/venv/bin/python3，
@@ -794,7 +408,7 @@ gateway_supervisor_loop() {
     local GW_CMD
     GW_CMD="cd '${SRC_DIR}' && exec env \
 HOME='${DATA_DIR}' \
-PYTHONPATH='${SRC_DIR}:${LAZY_SITE}' \
+PYTHONPATH='${SRC_DIR}' \
 PYTHONUNBUFFERED=1 \
 PYTHONDONTWRITEBYTECODE=1 \
 HERMES_HOME='${DATA_DIR}' \
@@ -805,7 +419,6 @@ HERMES_BUNDLED_LOCALES='${SRC_DIR}/locales' \
 HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
 HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
-HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
 HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
 TMPDIR='${ws}/tmp' TMP='${ws}/tmp' TEMP='${ws}/tmp' \
 ${gw_node}
@@ -818,12 +431,6 @@ ${gw_browser}
     ### 每秒级重启风暴。按退出码退避：75/0 走指数退避，其余（真崩溃）保持 1s 快速自愈。
     local backoff=1
     while [ -f "${GATEWAY_WANT_FILE}" ]; do
-        # ⚠ 每次 fork 前都要过一遍 PM 守卫：本循环是 dashboard「重启网关」按钮、
-        #   SIGUSR1、崩溃 respawn 的共同入口，它们都不经过 start_process()。
-        #   漏掉这里 = 只要发生过一次 pm sync，下一次网关级重启就必然切到
-        #   core-only venv，平台适配器（QQ/Telegram/Discord）全部失效
-        #   （实机报告 2026-11-03，四次重启均复现）。
-        ensure_pm_env_ignored
         log_msg "supervisor: 启动 gateway"
         if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
             bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
@@ -952,123 +559,6 @@ start_gateway_supervisor() {
     return 0
 }
 
-### ── PM 环境 bootstrap ─────────────────────────────────────────
-### 为什么要做：上游 PM 的「按需安装」要求进程运行在 PM 选定的依赖环境里
-### （pm/client.py 的 running_from_selected_environment）。在一台从未跑过
-### `pm install` 的机器上，facts.json 不存在 → 判定为 False → 20+ 个可选功能
-### （telegram/discord/doc-extract/stt-whisper/唤醒词…）全部无法懒安装
-### （实机 2026-11-04 用临时 HOME 复现：committed_venv=None、running=False）。
-### 这里在启动后台补一次 sync，让 facts.json 出现，判定随即成立。
-###
-### ⚠ 三条硬约束：
-###   1. 绝不在前台跑：sync 要联网，本机实测 45s，离线机器会更久 —— 不能拖慢启动
-###   2. 绝不让失败影响应用：任何失败只记日志，下次启动按退避重试
-###   3. 成功与「试过」必须是两个标记文件，否则失败会被当成已成功
-PM_BOOTSTRAP_DONE="${TRIM_PKGVAR}/.pm-bootstrapped"
-PM_BOOTSTRAP_TRIES="${TRIM_PKGVAR}/.pm-bootstrap-attempts"
-
-### 取基线 extras（enabled-features.json 的 extras 数组）。
-### 读不到就退回默认值 —— 与 install_callback 写入的基础项一致。
-pm_bootstrap_extras() {
-    local f="${TRIM_PKGVAR}/enabled-features.json"
-    local out=""
-    [ -r "${f}" ] && out="$("${PY}" - "${f}" <<'PYEOF' 2>/dev/null
-import json, sys
-try:
-    data = json.load(open(sys.argv[1], encoding="utf-8-sig"))
-except (OSError, ValueError):
-    raise SystemExit(0)
-extras = data.get("extras")
-if isinstance(extras, list) and extras:
-    print(" ".join(str(e) for e in extras if str(e).strip()))
-PYEOF
-)"
-    # "all" 对我们没有意义（会装全部 extra，体积爆炸），过滤掉
-    out="$(printf '%s' "${out}" | tr ' ' '\n' | grep -vx 'all' | tr '\n' ' ')"
-    out="${out% }"
-    [ -n "${out}" ] || out="web messaging"
-    printf '%s' "${out}"
-}
-
-### 是否需要 bootstrap：facts.json 不存在，且未成功过，且退避未到。
-pm_bootstrap_needed() {
-    [ -f "${PM_BOOTSTRAP_DONE}" ] && return 1
-    # PM 已提交过【可用】环境 → 无需 bootstrap。
-    # ⚠ 用 pm_env_committed（排除 .disabled-* 且校验 environment 真实存在），
-    #   不能只 find 到 facts.json 就认定有环境 —— 归档目录里也留着 facts.json，
-    #   那种情况下 bootstrap 必须照常跑（实机 2026-11-04 指出）。
-    pm_env_committed && return 1
-    # 退避：失败后 10min → 1h → 6h → 24h，最多每小时一次，避免离线机器反复卡网络
-    [ -r "${PM_BOOTSTRAP_TRIES}" ] || return 0
-    local last count now wait
-    last="$(head -n 1 "${PM_BOOTSTRAP_TRIES}" 2>/dev/null | cut -d' ' -f1)"
-    count="$(head -n 1 "${PM_BOOTSTRAP_TRIES}" 2>/dev/null | cut -d' ' -f2)"
-    case "${last}" in ''|*[!0-9]*) return 0 ;; esac
-    case "${count}" in ''|*[!0-9]*) count=1 ;; esac
-    now="$(date +%s)"
-    case "${count}" in
-        1) wait=600 ;;      # 10 分钟
-        2) wait=3600 ;;     # 1 小时
-        3) wait=21600 ;;    # 6 小时
-        *) wait=86400 ;;    # 24 小时
-    esac
-    [ $(( now - last )) -ge "${wait}" ] && return 0
-    return 1
-}
-
-### 后台执行一次 bootstrap。本函数自身立刻返回，真正的工作在子 shell 里。
-pm_bootstrap_kick() {
-    pm_bootstrap_needed || return 0
-    local extras
-    extras="$(pm_bootstrap_extras)"
-    log_msg "PM 环境 bootstrap：后台安装基线依赖（${extras}）—— 完成后可选功能才能按需安装"
-
-    (
-        # 独立会话：父进程（App Center 的 start）退出后继续跑
-        # 输出单独存档，避免混进 info.log 淹没真正的启动错误
-        local blog="${TRIM_PKGVAR}/log/pm-bootstrap.log"
-        mkdir -p "$(dirname "${blog}")" 2>/dev/null || true
-        # 与 ensure_pm_env_ignored 共用同一把锁：bootstrap 写环境期间，守卫不会
-        # 把正在构建的 installs/<key> 当成「残缺环境」归档掉。
-        # 非阻塞：拿不到说明别人正在动 PM 环境，本次放弃（下次启动再试）。
-        if command -v flock > /dev/null 2>&1; then
-            exec 201>>"${DATA_DIR}/pm-env.lock" 2>/dev/null || true
-            if ! flock -n 201 2>/dev/null; then
-                log_msg "PM 环境 bootstrap：另有进程正在修改 PM 环境，本次跳过"
-                exit 0
-            fi
-        fi
-        {
-            echo "=== bootstrap started $(date -Is) extras=${extras} ==="
-            cd "${SRC_DIR}" || exit 1
-            # 与 cmd/main 启动环境一致，但故意【不】带 LAZY_SITE：
-            # bootstrap 的结果只应影响 PM 自己的环境。
-            env HOME="${DATA_DIR}" \
-                PYTHONPATH="${SRC_DIR}" \
-                PYTHONUNBUFFERED=1 \
-                PYTHONDONTWRITEBYTECODE=1 \
-                HERMES_HOME="${DATA_DIR}" \
-                HERMES_MANAGED_BY="trim-hermes-fnos" \
-                "${PY}" -m hermes_cli.main pm install --extra ${extras}
-            rc=$?
-            echo "=== bootstrap finished $(date -Is) rc=${rc} ==="
-        } >> "${blog}" 2>&1
-
-        if [ "${rc:-1}" -eq 0 ]; then
-            date +%s > "${PM_BOOTSTRAP_DONE}" 2>/dev/null || true
-            rm -f "${PM_BOOTSTRAP_TRIES}" 2>/dev/null || true
-            log_msg "PM 环境 bootstrap 完成：可选功能现在可以按需安装"
-        else
-            local prev=0
-            [ -r "${PM_BOOTSTRAP_TRIES}" ] && prev="$(head -n 1 "${PM_BOOTSTRAP_TRIES}" 2>/dev/null | cut -d' ' -f2)"
-            case "${prev}" in ''|*[!0-9]*) prev=0 ;; esac
-            printf '%s %s\n' "$(date +%s)" "$((prev + 1))" > "${PM_BOOTSTRAP_TRIES}" 2>/dev/null || true
-            log_msg "PM 环境 bootstrap 失败（rc=${rc}），详见 log/pm-bootstrap.log；将按退避重试"
-        fi
-    ) </dev/null >/dev/null 2>&1 &
-    # 不记录 PID：这是尽力而为的后台任务，应用停止时无需管理它的生命周期
-}
-
 start_process() {
     if status > /dev/null 2>&1; then
         return 0
@@ -1094,33 +584,13 @@ start_process() {
 
     local ws
     ws="$(resolve_workspace)"
-    mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "${ws}/tmp" "${LAZY_SITE}" "$(dirname "${PID_FILE}")"
-    # 懒安装目录 ABI 守卫：Python 大版本变更后，旧目录里的 cp3xx 扩展会让
-    # import 崩（pydantic_core 等），必须先归档。见 ensure_lazy_site_abi 注释。
-    ensure_lazy_site_abi
-    # PM 依赖环境守卫：facts.json 存在会让 PM 用 core-only venv 顶掉包内完整
-    # site-packages（qqbot 等适配器失效）。见 ensure_pm_env_ignored 注释。
-    ensure_pm_env_ignored
-    # LAZY_SITE 冗余收敛：PM 环境健全时，把 LAZY_SITE 里 PM 已覆盖的包归档。
-    # 默认干跑（只记日志）；确认无误后由用户设 PY_LAZY_PRUNE=1 才真执行。
-    # ⚠ 环境路径必须从 facts.json 读【当前选中的 generation】：
-    #   1) 不能靠 find 猜 —— 目录深度是 7（installs/<key>/environments/<gen>/venv/lib/python3.14/site-packages），
-    #      实机验证时 -maxdepth 3 导致整段逻辑从未执行（2026-11-04）。
-    #   2) 不能取 head -n 1 —— 会先命中 .disabled-* 里的旧环境，版本对比结果就错了。
-    # ⚠ 只在 PM 环境【健全】时清理：两个机制不能互相拆台 ——
-    #   prune 把 LAZY_SITE 的包归档后，如果 PM 环境之后又被
-    #   ensure_pm_env_ignored 归档（extras 不完整时），插件依赖就彻底没了。
-    #   所以额外要求 pm_env_is_complete（extras 含 messaging+web）。
-    local _pm_site=""
-    _pm_site="$(pm_env_site_packages)"
-    if [ -n "${_pm_site}" ]; then
-        local _pm_state _pm_facts
-        _pm_state="$(pm_env_state_dir)"
-        _pm_facts="${_pm_state}/facts.json"
-        if [ -n "${_pm_state}" ] && [ -r "${_pm_facts}" ] && pm_env_is_complete "${_pm_state}"; then
-            lazy_prune_redundant "${_pm_site}" || true
-        else
-            log_msg "LAZY_SITE 清理：PM 环境 extras 不完整，跳过（避免与归档守卫互相拆台）"
+    mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "${ws}/tmp" "$(dirname "${PID_FILE}")"
+    # PM 环境必须就绪：安装回调若被平台超时打断，这里同步补齐（阻塞）。
+    if ! pm_env_ready; then
+        if ! pm_env_install_blocking; then
+            log_msg "启动失败：运行期环境未就绪"
+            echo "运行期环境未就绪，请检查网络/代理后重启应用，详见 ${DATA_DIR}/log/install-runtime.log" > "${TRIM_TEMP_LOGFILE}"
+            return 1
         fi
     fi
     # doctor 需要 ~/.local/bin/hermes（$HOME = HERMES_HOME = DATA_DIR）。
@@ -1141,6 +611,14 @@ start_process() {
         fi
     fi
     rm -f "${GATEWAY_SOCKET}"
+
+    PY="$(pm_venv_python)"
+    [ -n "${PY}" ] && [ -x "${PY}" ] || {
+        log_msg "启动失败：拿不到 PM venv 解释器"
+        echo "无法定位 PM 虚拟环境" > "${TRIM_TEMP_LOGFILE}"
+        return 1
+    }
+    PATTERN="${PY} -m ${MODULE}"
 
     log_msg "Starting Hermes dashboard (gateway + loopback port) ..."
     log_msg "PY=${PY}  APP_DIR=${APP_DIR}  HOME=${DATA_DIR}  WS=${ws}  PORT=${PORT}  SOCK=${GATEWAY_SOCKET}"
@@ -1203,7 +681,7 @@ start_process() {
     local CMD
     CMD="cd '${SRC_DIR}' && exec env \
 HOME='${DATA_DIR}' \
-PYTHONPATH='${SRC_DIR}:${LAZY_SITE}' \
+PYTHONPATH='${SRC_DIR}' \
 PYTHONUNBUFFERED=1 \
 PYTHONDONTWRITEBYTECODE=1 \
 HERMES_HOME='${DATA_DIR}' \
@@ -1215,7 +693,6 @@ HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
 HERMES_WEB_DIST='${WEB_DIST}' \
 HERMES_WRITE_SAFE_ROOT='${ws}' \
 HERMES_MANAGED_BY='trim-hermes-fnos' \
-HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
 HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
 TMPDIR='${ws}/tmp' TMP='${ws}/tmp' TEMP='${ws}/tmp' \
 ${NODE_ENV}
@@ -1270,10 +747,6 @@ HERMES_GATEWAY_DEBUG='1' \
         # 不阻断 dashboard 启动，但必须留下明确记录（否则表现为"应用正常、通道离线"）。
         log_msg "警告：消息网关 supervisor 启动失败 —— 消息平台将不可用，请查看日志"
     fi
-
-    # 后台补一次 PM 环境（不阻塞、失败不影响应用；见 pm_bootstrap_kick 说明）。
-    # 放在启动就绪判定之前发起，让它与 dashboard/gateway 的启动并行进行。
-    pm_bootstrap_kick || true
 
     # 就绪：TCP 回环监听 + Unix Socket
     local i=0

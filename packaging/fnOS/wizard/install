@@ -45,7 +45,7 @@
     "items": [
       {
         "type": "tips",
-        "helpText": "如果 NAS 需要代理才能访问外网，在这里填 HTTP 代理地址；不需要就留空。\n\n用途：Hermes 的「检查更新 / 在线更新」要访问 github.com，装依赖要访问 PyPI —— 这两个域名国内经常连不上，配了代理能显著改善（也能让「系统」页的检查更新秒回）。\n\n格式：http://127.0.0.1:7890 或 http://192.168.1.10:7890。仅支持 http 代理；若你的代理软件只开 socks5，请在其中开启一个 http 端口。留空表示直连。"
+        "helpText": "安装时需要从网上下载 Hermes 源码、Python 运行时和依赖，请按你的网络情况选择。\n\n① 有 HTTP 代理（推荐，最稳）\n   在下面填代理地址，全程走代理。\n   例：http://192.168.1.10:7890（仅支持 http；若代理软件只开 socks5，请在其中开启 http 端口）。\n\n② 没有代理\n   留空即可。安装会自动在「直连 + 国内 GitHub 加速镜像」之间竞速，哪个快用哪个；PyPI 走清华镜像。\n   若直连和镜像都慢，安装会主动放弃慢的源，不会卡在几十 KB/s。\n\n安装失败时，可到「应用设置」补充代理后重启应用重试。"
       },
       {
         "type": "text",
@@ -55,6 +55,30 @@
           {
             "pattern": "^$|^https?://[A-Za-z0-9._~:/?#\\[\\]@!$&'()*+,;=%\\-]+$",
             "message": "请填 http://主机:端口 形式，或留空"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_github_mirror",
+        "label": "GitHub 加速前缀（留空=自动竞速）",
+        "initValue": "",
+        "rules": [
+          {
+            "pattern": "^$|^https?://[A-Za-z0-9._~:/?#\\[\\]@!$&'()*+,;=%\\-]+/?$",
+            "message": "请填 https://gh-proxy.com/ 这样的前缀，或留空"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_pypi_index_url",
+        "label": "PyPI 源（留空=清华镜像；有代理时自动用官方源）",
+        "initValue": "",
+        "rules": [
+          {
+            "pattern": "^$|^https?://[A-Za-z0-9._~:/?#\\[\\]@!$&'()*+,;=%\\-]+/?$",
+            "message": "请填 https://pypi.tuna.tsinghua.edu.cn/simple 这样的地址，或留空"
           }
         ]
       }
