@@ -58,6 +58,44 @@ if [ -d "${DATA}/site-packages" ]; then
     fi
 fi
 
+### 3b) 关键：清掉【旧源码路径】对应的 PM 环境。
+### pm/environments.py 的 install_key = sha256(源码绝对路径)[:16]。
+###   · 旧布局：源码在包内 <appcenter>/runtime/hermes
+###   · 新布局：源码在数据目录 <data>/src
+### 两者 key 不同 → 升级后 installs/ 下会有【两套】facts.json。
+### 我们按 find|head -n1 取环境，可能拿到旧的那套（其 venv 指向已删除的路径）
+### → 启动失败。所以把「不是 <data>/src 算出来的 key」的目录全部归档。
+IMPORT_STATE="${DATA}/installs"
+if [ -d "${IMPORT_STATE}" ]; then
+    KEEP_KEY=""
+    if command -v python3 > /dev/null 2>&1; then
+        KEEP_KEY="$(python3 -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])" "${DATA}/src" 2>/dev/null || true)"
+    fi
+    if [ -n "${KEEP_KEY}" ]; then
+        ARCH_DIR="${IMPORT_STATE}.archived-$(date +%Y%m%d%H%M%S)"
+        MOVED=0
+        for d in "${IMPORT_STATE}"/*/; do
+            [ -d "${d}" ] || continue
+            NAME="$(basename "${d%/}")"
+            case "${NAME}" in
+                *.disabled-*) continue ;;
+                "${KEEP_KEY}") continue ;;
+            esac
+            mkdir -p "${ARCH_DIR}" 2>/dev/null || true
+            if mv "${d%/}" "${ARCH_DIR}/${NAME}" 2>/dev/null; then
+                MOVED=$((MOVED + 1))
+            fi
+        done
+        if [ "${MOVED}" -gt 0 ]; then
+            echo "$(date -Is) 已归档 ${MOVED} 个旧 PM 环境 → ${ARCH_DIR}（保留新 key=${KEEP_KEY}）" \
+                >> "${DATA}/log/upgrade.log" 2>/dev/null || true
+        fi
+    else
+        echo "$(date -Is) ⚠ 无法计算新源码的 install key（缺少 python3），跳过旧 PM 环境归档" \
+            >> "${DATA}/log/upgrade.log" 2>/dev/null || true
+    fi
+fi
+
 ### 4) 源码/依赖缺失不阻塞升级；真正缺失时 cmd/main 启动会同步补齐。
 if [ ! -d "${DATA}/src/hermes_cli" ]; then
     echo "$(date -Is) 尚无 ${DATA}/src —— 首次启动时会自动获取源码与依赖" \
