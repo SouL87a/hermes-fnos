@@ -187,14 +187,11 @@ stamp = {
     "displayVersion": base,
     "distance": 0,
 }
-open(out, "w", encoding="utf-8").write(json.dumps(stamp, ensure_ascii=False, indent=2) + "
-")
-print(f"[build]   stamp: base={base} commit={commit[:12] or '(none)'}")
+open(out, "w", encoding="utf-8").write(json.dumps(stamp, ensure_ascii=False, indent=2) + chr(10))
 PY
 [ -f "${STAMP}" ] || { echo "✗ install-stamp.json 生成失败"; exit 1; }
 # 记录上游 ref，安装期 install-runtime.sh 要用它 clone 对应版本
-printf '%s
-' "${UPSTREAM_REF_V:-v0.22.5}" > "${APP_DIR}/upstream-ref"
+echo "${UPSTREAM_REF_V:-v0.22.5}" > "${APP_DIR}/upstream-ref"
 
 # ── 4. 前端预构建（web_dist）────────────────────────────────
 # 实测踩到的坑：
@@ -245,13 +242,13 @@ fi
 # 前端按 base=/app/hermes/ 构建，而 dashboard 只挂 /assets；经飞牛网关时代理会剥前缀，
 # 直连时不会 → 命中 SPA 兜底路由、以 text/html 返回 → module 脚本被 MIME 拒绝 → 白屏
 # （2026-11-02 实机报告）。给前缀建一个指向自身的软链即可。
-# ⚠ 打包与运行期都要有：cmd/main 启动时、hermes-update.py 重建后都会再补一次（幂等）。
+# ⚠ 打包与运行期都要有：cmd/main 启动时补一次（幂等）。
 mkdir -p "${RT}/web_dist/app"
 ln -sfn .. "${RT}/web_dist/app/hermes"
 echo "[build] web_dist ✓ ($(du -sh "${RT}/web_dist" | cut -f1))，已建 /app/hermes 前缀别名"
 
-# 把前端构建脚本随包分发 —— 在线更新（hermes-update.py）重建 web_dist 时
-# 必须用它，否则会走上游 npm run build（不带 base 注入）→ 前缀丢失 → 黑屏。
+# 把前端构建脚本随包分发 —— 在线更新重建 web_dist 时需要它注入 /app/hermes 前缀，
+# 否则会走上游 npm run build（不带 base）→ 前缀丢失 → 白屏。
 cp "${HERE}/web-build.mjs" "${RT}/web-build.mjs"
 
 # ── 5. 桌面入口 + 网关代理（ui 必须在 app/ 内）───────────────
@@ -283,7 +280,7 @@ cat > "${APP_DIR}/bin/hermes" <<'WRAP'
 # Hermes CLI —— fnOS 打包版。
 # 目的：让 `hermes <子命令>`（doctor/setup/skills/status/cron/tools/auth/mcp…）可用。
 # 上游 install.sh 靠 venv console script 生成该入口；本包是「自带 CPython +
-# python -m hermes_cli.main」，没有 venv，故补上。机制同 bin/hermes-update
+# python -m hermes_cli.main」。机制同 usr-local-linker 的其它入口
 # （fnOS 把 fpk 的 bin/ 里每个文件软链到 /usr/local/bin）。
 # 路径/解释器/node/工作区解析逐条对齐 cmd/main → 跨卷、跨 node 版本、
 # 跨「系统 Python ↔ 自带 CPython」模式切换都成立。
@@ -512,9 +509,9 @@ chmod 755 "${STAGE}/cmd/"*
 find "${STAGE}" -type d -exec chmod 755 {} \; 2>/dev/null || true
 
 
-# config/resource 里 usr-local-linker 列了 bin/hermes、bin/hermes-update、bin/rg。
+# config/resource 里 usr-local-linker 列了 bin/hermes 与 bin/rg。
 # rg 是可选下载（见步骤 5），失败时它不在 app 里 —— 此时把 "bin/rg" 从 resource
-# 摘掉，避免 linker 指向不存在的文件。hermes/hermes-update 恒存在，不动。
+# 摘掉，避免 linker 指向不存在的文件。bin/hermes 恒存在，不动。
 # python3 在构建机必然可用（build.sh 前置就用它抽 deps.txt/写 stamp）。
 if [ ! -f "${APP_DIR}/bin/rg" ] && grep -q '"bin/rg"' "${STAGE}/config/resource"; then
     "${STAMP_PY}" - "${STAGE}/config/resource" <<'PY'

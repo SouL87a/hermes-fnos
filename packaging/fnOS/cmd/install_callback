@@ -114,7 +114,6 @@ chmod +x "${RUNTIME_SH}" 2>/dev/null || true
 ###   SSL_ERROR_SYSCALL，而 pypi.org 走代理很快。
 PROXY_RAW="${wizard_proxy:-}"
 case "${PROXY_RAW}" in *$'\n'*) PROXY_RAW="" ;; esac
-INSTALL_ENV=()
 if [ -n "${PROXY_RAW}" ] && printf '%s' "${PROXY_RAW}" \
         | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
     export HTTP_PROXY="${PROXY_RAW}" HTTPS_PROXY="${PROXY_RAW}" ALL_PROXY="${PROXY_RAW}"
