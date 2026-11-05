@@ -29,6 +29,12 @@ SRC="${DATA_DIR}/src"
 LOG="${DATA_DIR}/log/install-runtime.log"
 UV_STORE="${DATA_DIR}/tools"
 UV_VER="0.13.5"
+# 上游 ref：优先环境变量，否则读包内的 upstream-ref（构建期写入，与包版本一致）。
+# ⚠ 不能写死版本号：包升到 0.22.7 而这里还是 v0.22.5 时，安装出来的源码
+#   与 manifest/stamp 声明的版本不一致（实机 P4，2026-11-05）。
+if [ -z "${HERMES_REF:-}" ] && [ -f "${APP_DIR}/upstream-ref" ]; then
+    HERMES_REF="$(tr -d '[:space:]' < "${APP_DIR}/upstream-ref" 2>/dev/null || true)"
+fi
 HERMES_REF="${HERMES_REF:-v0.22.5}"
 REPO="NousResearch/hermes-agent"
 
@@ -185,7 +191,29 @@ ensure_uv() {
 # 优先 git clone（保留 .git → sealed_steward() 返回 None → 允许 hermes update）
 install_source() {
     if [ -d "${SRC}/.git" ] && git -C "${SRC}" rev-parse --verify HEAD > /dev/null 2>&1; then
-        log "✓ 源码已存在: ${SRC} ($(git -C "${SRC}" rev-parse --short HEAD))"
+        # ⚠ 源码已存在还不够：必须确认它的版本与包声明的一致（P4，2026-11-05）。
+        #   包从 0.22.5 升到 0.22.7 时 src 还是首次 clone 的 v0.22.5 ——
+        #   manifest/stamp 说 0.22.7，跑的是 0.22.5 的代码。
+        #   判据：git describe --tags 与 HERMES_REF 一致；不等就 fetch + checkout。
+        local cur_ver
+        cur_ver="$(git -C "${SRC}" describe --tags 2>/dev/null || git -C "${SRC}" rev-parse --short HEAD 2>/dev/null || echo '?')"
+        if [ "${cur_ver}" = "${HERMES_REF}" ]; then
+            log "✓ 源码已存在且版本匹配: ${SRC} (${cur_ver})"
+            return 0
+        fi
+        log "源码版本不匹配（当前 ${cur_ver}，包需要 ${HERMES_REF}），切换…"
+        if git -C "${SRC}" fetch --depth 1 origin "refs/tags/${HERMES_REF}" >> "${LOG}" 2>&1 \
+           && git -C "${SRC}" checkout --detach "FETCH_HEAD" >> "${LOG}" 2>&1; then
+            log "✓ 源码已切换到 ${HERMES_REF} ($(git -C "${SRC}" rev-parse --short HEAD))"
+            # ⚠ 源码换了 → 依赖图可能变了 → 现有 venv 不能再算「就绪」。
+            #   删掉当前 key 的 facts.json，让 pm_env_ok 返回假 → 走 pm install 重装。
+            local nk
+            nk="$( (command -v python3 >/dev/null 2>&1 && python3 -c \
+                "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])" "${SRC}") 2>/dev/null || true)"
+            [ -n "${nk}" ] && rm -f "${DATA_DIR}/installs/${nk}/facts.json" 2>/dev/null || true
+            return 0
+        fi
+        log "⚠ fetch/checkout ${HERMES_REF} 失败，沿用现有源码 ${cur_ver}（建议跑 hermes update）"
         return 0
     fi
     # 有残留但不是可用 git checkout → 挪开（不删，可能是用户的东西）
