@@ -372,16 +372,26 @@ log "=== install-runtime $(date -Is) mode=${MODE} ==="
 
 ### 幂等：PM 环境已就绪且源码存在 → 直接返回，不重复下载/安装。
 ### 升级或重装时这能省掉几分钟。
+### 环境是否【属于当前源码】且可用。
+### ⚠ 必须校验 key 匹配，不能只看「有个能用的 venv」：
+###   install_key = sha256(源码绝对路径)[:16]。旧布局源码在包内
+###   (<appcenter>/runtime/hermes)，新布局在 <data>/src —— key 不同。
+###   只判断「有 venv」会命中旧环境 → 幂等跳过 → 新源码下无法运行。
 pm_env_ok() {
-    local facts
-    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f                -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
-    [ -n "${facts}" ] || return 1
+    [ -d "${SRC}/hermes_cli" ] || return 1
+    local want_key
+    want_key="$( (command -v python3 >/dev/null 2>&1 && python3 -c \
+        "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])" "${SRC}") 2>/dev/null || true)"
+    [ -n "${want_key}" ] || return 1
+
+    local facts="${DATA_DIR}/installs/${want_key}/facts.json"
+    [ -f "${facts}" ] || return 1
+
     local boot
     boot="$(command -v python3 2>/dev/null)" || return 1
     local venv
     venv="$("${boot}" - "${facts}" <<'PY' 2>/dev/null
 import json, sys
-from pathlib import Path
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
 except (OSError, ValueError):
