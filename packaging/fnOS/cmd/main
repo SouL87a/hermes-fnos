@@ -835,6 +835,29 @@ stop_process() {
     rm -f "${GATEWAY_WANT_FILE}"
     rm -f "${GATEWAY_PID_FILE}"
 
+    ### ⚠ 等 gateway 优雅退出（这是 P2 修复的关键）。
+    ### gateway 收到 TERM 后要 drain（断开平台适配器、flush 状态），多 profile
+    ### 实测 6.4s+。此前 stop 流程只给了 ~2.5s 就 KILL → 下次启动报
+    ### "Previous gateway life exited UNCLEANLY"。
+    ### gateway 收 TERM 的途径有二：supervisor 的 trap、兜底 pkill。
+    ### 这里统一：现在就对 gateway 发 TERM（幂等），然后等它退出（受 stop_timeout 约束），
+    ### 确认退出（或超时 KILL）之后才动 supervisor。
+    if pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
+        log_msg "send TERM to gateway (drain, up to ${stop_timeout}s) ..."
+        pkill -TERM -f -- "${PATTERN} gateway run" 2>/dev/null || true
+        local gcount=0
+        while pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1 && [ "${gcount}" -lt "${stop_timeout}" ]; do
+            sleep 1
+            gcount=$((gcount + 1))
+        done
+        if pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
+            log_msg "gateway ${stop_timeout}s 未退出（drain 未完成），send KILL"
+            pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
+        else
+            log_msg "gateway 已优雅退出（${gcount}s）"
+        fi
+    fi
+
     # 兜底：dashboard 会 spawn 子进程（pty/session reaper），runuser 包装导致
     # pidfile 记的是 wrapper 的 PID，所以按绝对路径 pattern 兜底清理。
     if own_pids > /dev/null 2>&1; then
@@ -852,6 +875,9 @@ stop_process() {
     fi
     # supervisor 循环体本身（bash 跑 gateway_supervisor_loop）也按 cmd/main 路径兜底。
     # kill_supervisors 同时覆盖 exec 形态与历史遗留的 fork 子 shell（缺陷 B）。
+    # ⚠ 必须在 gateway 退出【之后】再杀 supervisor：supervisor 的 trap 会 TERM
+    #   自己的 gateway 子进程，若它先死而 gateway 还在 drain，gateway 就成了
+    #   无人等待的孤儿，只能被后面的 KILL 打断 → UNCLEANLY。
     kill_supervisors
     sleep 1
     kill_supervisors   # 二次确保 fork 子 shell 也被清掉

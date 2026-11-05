@@ -438,6 +438,18 @@ PY
 
 if [ "${MODE}" != "--force" ] && pm_env_ok; then
     log "✓ 运行期已就绪（PM 环境 + 源码），跳过安装"
+    # 环境虽就绪，旧 generation 仍需要回收（24h 冷静期过后才会被删，
+    # 但 pm gc 必须有人调 —— 只在"真安装"时调的话，日常重启永远清不到）。
+    # 静默执行：失败无关紧要，别刷日志。
+    if [ -n "${BOOT_PY:-}" ] || boot_py="$(command -v python3 2>/dev/null)"; then
+        (
+            cd "${SRC}" 2>/dev/null && \
+            env HOME="${DATA_DIR}" UV_CACHE_DIR="${DATA_DIR}/.uv-cache" \
+                UV_PYTHON_INSTALL_DIR="${DATA_DIR}/pythons" PYTHONPATH="${SRC}" \
+                HERMES_HOME="${DATA_DIR}" \
+                "${boot_py}" -m pm.cli gc
+        ) >> "${LOG}" 2>&1 || true
+    fi
     log "=== 完成 $(date -Is)（幂等跳过）==="
     exit 0
 fi
