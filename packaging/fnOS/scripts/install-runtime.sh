@@ -262,9 +262,17 @@ install_source() {
         local u
         for u in "${urls[@]}"; do
             log "  尝试: ${u}"
-            if git clone --filter=blob:none --depth 1 --branch "${HERMES_REF}" \
-                   "$u" "${SRC}" >> "${LOG}" 2>&1; then
-                log "✓ 源码就绪（git，支持在线更新）"
+            # sparse-checkout：排除 NAS 上用不到的目录（tests/website/桌面端等），
+            # 下载量与磁盘同时省 ~178MB（实测 285→107M）。hermes_cli/plugins/
+            # skills/apps/shared 等运行期必需的目录全部保留。
+            # .git 仍完整记录引用，hermes update 正常工作。
+            if git clone --filter=blob:none --depth 1 --no-checkout --branch "${HERMES_REF}" \
+                   "$u" "${SRC}" >> "${LOG}" 2>&1 \
+               && { git -C "${SRC}" sparse-checkout init --no-cone >> "${LOG}" 2>&1 \
+                    && git -C "${SRC}" sparse-checkout set '/*' '!/tests' '!/tests-js' \
+                           '!/evals' '!/website' '!/apps/desktop' '!/contributors/emails' >> "${LOG}" 2>&1 \
+                    && git -C "${SRC}" checkout >> "${LOG}" 2>&1; }; then
+                log "✓ 源码就绪（git sparse，支持在线更新）"
                 return 0
             fi
             rm -rf "${SRC}"
