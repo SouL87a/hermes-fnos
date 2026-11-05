@@ -117,6 +117,10 @@ case "${ARCH}" in
 esac
 echo "[build] 架构 ${ARCH} (${PBS_TRIPLE})"
 
+### 构建缓存（ripgrep 等可选组件；不再用于 CPython/依赖）
+PBS_CACHE="${PKG_DIR}/.cache"
+mkdir -p "${PBS_CACHE}"
+
 # ── 上游源码树 ───────────────────────────────────────────────
 if [ -n "${SRC_DIR_ARG}" ]; then
     SRC="${SRC_DIR_ARG}"
@@ -275,6 +279,7 @@ chmod 755 "${APP_DIR}/scripts/install-runtime.sh"
 #   裸 SSH 会话里没有 fnOS 注入的 TRIM_* 变量 —— 尤其工作区，若不单独探
 #   /vol*/@appshare/hermes/workspace，HERMES_WRITE_SAFE_ROOT 会错算成
 #   ${DATA}/workspace，让 CLI 的写安全边界指到错误目录（真机实测发现）。
+mkdir -p "${APP_DIR}/bin"
 cat > "${APP_DIR}/bin/hermes" <<'WRAP'
 #!/bin/bash
 # Hermes CLI —— fnOS 打包版。
@@ -331,12 +336,13 @@ if [ -z "${WS}" ]; then
 fi
 [ -n "${WS}" ] || WS="${DATA_DIR}/workspace"
 
+_py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
 # 解释器：PM 管理的 venv（从 facts.json 读当前 generation）→ PATH 兜底
 PY=""
 if [ -d "${DATA_DIR}/installs" ]; then
     _facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
-    if [ -n "${_facts}" ]; then
-        _venv="$(sed -n 's/.*"environment"[[:space:]]*:[[:space:]]*"\([^"]*\)".*//p' "${_facts}" | head -n 1)"
+    if [ -n "${_facts}" ] && [ -n "${_py}" ]; then
+        _venv="$("${_py}" -c "import json,sys;d=json.load(open(sys.argv[1],encoding='utf-8-sig'));print(((d.get('packages') or {}).get('venv') or {}).get('environment') or '')" "${_facts}" 2>/dev/null)"
         [ -n "${_venv}" ] && [ -x "${_venv}/bin/python3" ] && PY="${_venv}/bin/python3"
     fi
 fi

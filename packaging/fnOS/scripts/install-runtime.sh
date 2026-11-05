@@ -350,6 +350,38 @@ PY
 
 # ── main ─────────────────────────────────────────────────────
 log "=== install-runtime $(date -Is) mode=${MODE} ==="
+
+### 幂等：PM 环境已就绪且源码存在 → 直接返回，不重复下载/安装。
+### 升级或重装时这能省掉几分钟。
+pm_env_ok() {
+    local facts
+    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f                -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
+    [ -n "${facts}" ] || return 1
+    local boot
+    boot="$(command -v python3 2>/dev/null)" || return 1
+    local venv
+    venv="$("${boot}" - "${facts}" <<'PY' 2>/dev/null
+import json, sys
+from pathlib import Path
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+except (OSError, ValueError):
+    raise SystemExit(0)
+env = ((d.get("packages") or {}).get("venv") or {}).get("environment")
+print(env if isinstance(env, str) else "")
+PY
+)"
+    [ -n "${venv}" ] && [ -x "${venv}/bin/python3" ] || return 1
+    "${venv}/bin/python3" -c "import fastapi, aiohttp" 2>/dev/null || return 1
+    return 0
+}
+
+if [ "${MODE}" != "--force" ] && pm_env_ok && [ -d "${SRC}/hermes_cli" ]; then
+    log "✓ 运行期已就绪（PM 环境 + 源码），跳过安装"
+    log "=== 完成 $(date -Is)（幂等跳过）==="
+    exit 0
+fi
+
 ensure_uv
 install_source
 [ "${MODE}" = "--source-only" ] && { log "仅源码模式，结束"; exit 0; }
