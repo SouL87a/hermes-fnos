@@ -205,9 +205,31 @@ install_source() {
             return 0
         fi
         log "源码版本不匹配（当前 ${cur_ver}，包需要 ${HERMES_REF}），切换…"
+        # ⚠ 先处理本地修改（实机 2026-11-05：3 个本地补丁的未提交修改挡住
+        #   checkout → 静默沿用旧源码 → 用户以为升级了实际一行新代码都没进来）。
+        #   备份 diff 到 <data>/local-patches/pre-upgrade-<ts>/ 再 stash（可恢复）。
+        if ! git -C "${SRC}" diff --quiet 2>/dev/null; then
+            local pbak="${DATA_DIR}/local-patches/pre-upgrade-$(date +%Y%m%d-%H%M%S)"
+            mkdir -p "${pbak}" 2>/dev/null || true
+            git -C "${SRC}" diff > "${pbak}/local-changes.patch" 2>>"${LOG}" || true
+            git -C "${SRC}" stash push -u -m "hermes-fnos pre-upgrade $(date -Is)" >> "${LOG}" 2>&1 \
+                || git -C "${SRC}" checkout -- . >> "${LOG}" 2>&1 \
+                || die "本地修改既无法 stash 也无法还原，请手工处理 ${SRC}"
+            log "⚠ 检测到本地修改，已备份到 ${pbak} 并暂存（升级后请重打本地补丁）"
+        fi
         if git -C "${SRC}" fetch --depth 1 origin "refs/tags/${HERMES_REF}" >> "${LOG}" 2>&1 \
            && git -C "${SRC}" checkout --detach "FETCH_HEAD" >> "${LOG}" 2>&1; then
             log "✓ 源码已切换到 ${HERMES_REF} ($(git -C "${SRC}" rev-parse --short HEAD))"
+            # 自动重打本地补丁（报告建议 C）：脚本对跨版本冲突的处理是
+            # 「冲突就报冲突、不强打」，用户能拿到明确清单。
+            # 路径以实机为准：<data>/local-patches/（workspace 下的是旧版）。
+            local repatch="${DATA_DIR}/local-patches/repatch-after-update.sh"
+            if [ -x "${repatch}" ]; then
+                log "重打本地补丁…"
+                sh "${repatch}" >> "${LOG}" 2>&1 || log "⚠ 补丁有冲突未打全，清单见日志"
+            else
+                log "⚠ 源码已切换，若有本地补丁请重打（未找到 ${repatch}）"
+            fi
             # ⚠ 源码换了 → 依赖图可能变了 → 现有 venv 不能再算「就绪」。
             #   删掉当前 key 的 facts.json，让 pm_env_ok 返回假 → 走 pm install 重装。
             local nk
@@ -216,8 +238,9 @@ install_source() {
             [ -n "${nk}" ] && rm -f "${DATA_DIR}/installs/${nk}/facts.json" 2>/dev/null || true
             return 0
         fi
-        log "⚠ fetch/checkout ${HERMES_REF} 失败，沿用现有源码 ${cur_ver}（建议跑 hermes update）"
-        return 0
+        # checkout 失败必须中止（fail loud）：静默沿用旧源码 = 用户以为升级了
+        # 实际一行新代码都没进来（实机 2026-11-05 的现象）。
+        die "源码切换失败：${cur_ver} → ${HERMES_REF}（详见上方 git 输出；本地修改已备份到 ${DATA_DIR}/local-patches/）"
     fi
     # 有残留但不是可用 git checkout → 挪开（不删，可能是用户的东西）
     if [ -e "${SRC}" ]; then
