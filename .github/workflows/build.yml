@@ -97,20 +97,35 @@ jobs:
       # 构建期现在只做：源码树快照 + 前端构建 + 打包。
       # 不再下载 CPython、不再装依赖（那些改为安装期由 PM 完成）。
       # 注意：**不设**国内镜像 —— Actions runner 在海外，直连最快。
-      # preset=B 时额外预置 Python 压缩包与 wheelhouse（安装期少下载 ~840MB）
-      - name: Build fpk
-        env:
-          HERMES_PRESET: ${{ github.event.inputs.preset }}
+      # 档位说明：
+      #   默认（在线版）  ~4MB，安装期下载 ~900MB
+      #   preset=B（预置）~130MB，安装期下载 ~60MB（源码 clone）
+      #   tag 构建：A/B 两版都产出，Release 同时挂两个资产
+      #   手动触发：用 preset 输入选择（留空=A，B=B）
+      - name: Build fpk (online)
         run: |
           set -e
-          ARGS=""
-          [ -n "${HERMES_PRESET}" ] && ARGS="--preset ${HERMES_PRESET}"
-          bash packaging/fnOS/scripts/build.sh ${ARGS}
+          bash packaging/fnOS/scripts/build.sh
+          # 重命名为带档位后缀，避免与 B 版冲突
+          FPK="$(ls packaging/fnOS/dist/hermes-*.fpk | head -1)"
+          mv "$FPK" "${FPK%.fpk}-online.fpk"
+
+      - name: Build fpk (preset B)
+        run: |
+          set -e
+          rm -f packaging/fnOS/dist/hermes-*.fpk   # 清掉 A 版产物，避免 ls 匹配错
+          bash packaging/fnOS/scripts/build.sh --preset B
+          FPK="$(ls packaging/fnOS/dist/hermes-*.fpk | head -1)"
+          mv "$FPK" "${FPK%.fpk}-presetB.fpk"
 
       - name: Verify fpk
         run: |
           set -e
-          FPK="$(ls packaging/fnOS/dist/hermes-*.fpk | head -1)"
+          # 校验两个档位（都存在）
+          for FPK in packaging/fnOS/dist/hermes-*online.fpk packaging/fnOS/dist/hermes-*presetB.fpk; do
+            [ -f "$FPK" ] || { echo "✗ 缺少 $FPK"; exit 1; }
+          done
+          FPK="$(ls packaging/fnOS/dist/hermes-*online.fpk | head -1)"
           SIZE=$(stat -c%s "$FPK")
           echo "fpk: $FPK ($(du -h "$FPK" | cut -f1))"
           LIST="$(tar -tzf "$FPK")"
@@ -150,8 +165,17 @@ jobs:
           # ── 体积回归保护：不再预置运行时，应远小于 50MB ──
           # （前端 web_dist 约 10MB，其余脚本/图标很小）
           if [ "$SIZE" -gt 52428800 ]; then
-            echo "✗ fpk 体积 $(du -h "$FPK" | cut -f1) 超过 50MB —— 疑似又把运行时打包进去了"
+            echo "✗ 在线版 fpk 体积 $(du -h "$FPK" | cut -f1) 超过 50MB —— 疑似又把运行时打包进去了"
             exit 1
+          fi
+          BP="$(ls packaging/fnOS/dist/hermes-*presetB.fpk 2>/dev/null | head -1)"
+          if [ -n "$BP" ]; then
+            BSIZE=$(stat -c%s "$BP")
+            if [ "$BSIZE" -gt 209715200 ]; then
+              echo "✗ 档位B fpk $(du -h "$BP" | cut -f1) 超过 200MB —— wheelhouse/Python 预置异常膨胀"
+              exit 1
+            fi
+            echo "✓ 档位B 体积 $(du -h "$BP" | cut -f1)（上限 200MB）"
           fi
           echo "✓ 体积 $(du -h "$FPK" | cut -f1)（未预置运行时）"
 
@@ -195,7 +219,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: hermes-${{ steps.ver.outputs.version }}-fpk
-          path: packaging/fnOS/dist/hermes-*.fpk
+          path: |
+            packaging/fnOS/dist/hermes-*online.fpk
+            packaging/fnOS/dist/hermes-*presetB.fpk
           retention-days: 30
           if-no-files-found: error
 
@@ -292,6 +318,7 @@ jobs:
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$FPK" --clobber
+          gh release upload "$TAG" "$(ls packaging/fnOS/dist/hermes-*presetB.fpk 2>/dev/null | head -1)" --clobber 2>/dev/null || true
             gh release edit "$TAG" --notes-file "$NOTES"
           else
             gh release create "$TAG" "$FPK" --title "Hermes ${VERSION}" --notes-file "$NOTES"
