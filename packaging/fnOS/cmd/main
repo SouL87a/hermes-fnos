@@ -869,20 +869,25 @@ status() {
     return 1
 }
 
-### 在线更新：调 hermes-update.py（用同一个自带 Python）。
-### 用法：main update {check|apply|status|version}
+### 在线更新：直接用上游 `hermes update`。
+### 源码在 ${SRC_DIR}（安装期 git clone，带 .git）→ sealed_steward() 判定为
+### git 安装 → 允许就地更新。不再需要自研的 hermes-update.py。
+### 用法：main update {check|apply}
 do_update() {
-    local script="${APP_DIR}/hermes-update.py"
-    if [ ! -f "${script}" ]; then
-        echo "缺少更新脚本：${script}" >&2
+    local py
+    py="$(pm_venv_python)"
+    if [ -z "${py}" ] || [ ! -x "${py}" ]; then
+        echo "运行时不可用：PM 环境未就绪" >&2
         return 1
     fi
-    if [ ! -x "${PY}" ]; then
-        echo "运行时不可用：${PY}" >&2
-        return 1
-    fi
-    HERMES_APP_ROOT="${APP_DIR}" HERMES_DATA_ROOT="${DATA_DIR}" \
-        "${PY}" "${script}" "${1:-status}"
+    local sub="${1:-check}"
+    case "${sub}" in
+        check|status) exec env HOME="${DATA_DIR}" HERMES_HOME="${DATA_DIR}" \
+                          PYTHONPATH="${SRC_DIR}" "${py}" -m hermes_cli.main update --check ;;
+        apply|"")     exec env HOME="${DATA_DIR}" HERMES_HOME="${DATA_DIR}" \
+                          PYTHONPATH="${SRC_DIR}" "${py}" -m hermes_cli.main update ;;
+        *)            echo "用法：main update {check|apply}" >&2; return 1 ;;
+    esac
 }
 
 ### 单独重启消息网关（供代理的重启端点调用）：
