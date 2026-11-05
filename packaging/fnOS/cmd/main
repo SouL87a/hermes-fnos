@@ -80,29 +80,37 @@ DATA_DIR="${TRIM_PKGVAR}"
 
 ### 从 <data>/installs/<key>/facts.json 读出当前 PM venv 的 python；拿不到输出空。
 pm_venv_python() {
-    local facts
-    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f \
-               -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
-    [ -n "${facts}" ] || return 0
-    local boot=""
-    local c
+    local boot="" c
     for c in "$(command -v python3 2>/dev/null)" "${PY}"; do
         if [ -n "${c}" ] && [ -x "${c}" ]; then boot="${c}"; break; fi
     done
     [ -n "${boot}" ] || return 0
-    "${boot}" - "${facts}" <<'PYEOF' 2>/dev/null
+
+    # ⚠ 遍历【所有】候选 facts.json，返回第一个能解析出可执行 python 的路径。
+    #   不能只取 head -n 1：一次失败的安装会留下「有 facts.json 但 environment
+    #   指向空目录」的残留（实机 2026-11-05：installs/5aff5925… 只有 pm-runtime
+    #   和空 environments），取第一个就会拿到它 → 误判为「环境未就绪」并反复重装。
+    local f
+    while IFS= read -r f; do
+        [ -n "${f}" ] || continue
+        "${boot}" - "${f}" <<'PYEOF' 2>/dev/null && return 0
 import json, sys
 from pathlib import Path
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
 except (OSError, ValueError):
-    raise SystemExit(0)
+    raise SystemExit(1)
 env = ((d.get("packages") or {}).get("venv") or {}).get("environment")
 if not isinstance(env, str) or not env:
-    raise SystemExit(0)
+    raise SystemExit(1)
 py = Path(env) / "bin" / "python3"
-print(str(py) if py.is_file() else "")
+if not py.is_file():
+    raise SystemExit(1)
+print(str(py))
 PYEOF
+    done < <(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f \
+                 -not -path '*.disabled-*' 2>/dev/null | sort)
+    return 0
 }
 
 ### PM 环境是否就绪（能拿到可执行的 venv python）。
