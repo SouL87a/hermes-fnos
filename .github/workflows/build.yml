@@ -81,15 +81,6 @@ jobs:
           curl -fsSL https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # build.sh 用 eu-strip 给 CPython 瘦身（省 ~145MB）。
-      # ⚠ 不能用 GNU strip：它会剥掉 PBS 二进制的 .gnu.version* 节，
-      #   导致运行期 "symbol lookup error: undefined symbol"（已实测）。
-      - name: Install elfutils (eu-strip)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq elfutils
-          eu-strip --version | head -1
-
       - name: Show toolchain
         run: |
           python3 --version
@@ -101,14 +92,9 @@ jobs:
 
       - name: Build fpk
         env:
-          # 注意：**不设**国内镜像 —— Actions runner 在海外，PyPI/GitHub 直连最快；
-          # 清华/淘宝源反而拖慢甚至超时。（本地/国内构建时才设
-          # HERMES_PIP_INDEX / HERMES_NPM_REGISTRY。）
-          #
-          # 构建机 ubuntu-24.04（glibc 2.39）→ 目标 fnOS Debian 12（glibc 2.36）。
-          # build.sh 默认强制 --only-binary=:all:，只取 manylinux 预编译 wheel，
-          # 避免本地编译出链接到新 glibc 符号的 .so（装到 NAS 上会 GLIBC not found）。
-          HERMES_ALLOW_SOURCE_BUILD: "0"
+          # 构建期现在只做：源码树快照 + 前端构建 + 打包。
+          # 不再下载 CPython、不再装依赖（那些改为安装期由 PM 完成）。
+          # 注意：**不设**国内镜像 —— Actions runner 在海外，直连最快。
         run: |
           set -e
           bash packaging/fnOS/scripts/build.sh
@@ -117,35 +103,55 @@ jobs:
         run: |
           set -e
           FPK="$(ls packaging/fnOS/dist/hermes-*.fpk | head -1)"
+          SIZE=$(stat -c%s "$FPK")
           echo "fpk: $FPK ($(du -h "$FPK" | cut -f1))"
           LIST="$(tar -tzf "$FPK")"
           echo "$LIST" | head -12
 
-          # fpk 顶层：注意 ui/ 在 app.tgz 内，不在顶层
-          for need in manifest ICON.PNG ICON_256.PNG app.tgz cmd/main cmd/install_callback cmd/config_callback cmd/uninstall_callback config/privilege config/resource wizard/install wizard/config wizard/uninstall; do
+          # ── 顶层结构 ──────────────────────────────────────
+          for need in manifest ICON.PNG ICON_256.PNG app.tgz \
+                      cmd/main cmd/install_callback cmd/config_callback cmd/uninstall_callback \
+                      config/privilege config/resource \
+                      wizard/install wizard/config wizard/uninstall; do
             echo "$LIST" | grep -qx "$need" || { echo "✗ fpk 顶层缺少 $need"; exit 1; }
           done
 
-          # app.tgz 内关键部件（ui/ 与 gateway-proxy/hermes-update 都在这里）
-          tar -xzf "$FPK" app.tgz
-          A="$(tar -tzf app.tgz)"
-          for need in ./ui/config ./ui/images/icon_64.png ./gateway-proxy.py ./envfile.sh ./hermes-update.py \
-                      ./bin/hermes ./bin/hermes-update ./runtime/deps.txt \
-                      ./runtime/web_dist/index.html ./runtime/web-build.mjs \
-                      ./runtime/hermes/hermes_cli/__init__.py; do
+          X="$(mktemp -d)"
+          tar -xzf "$FPK" -C "$X" app.tgz manifest cmd/main cmd/install_callback \
+                             wizard/install wizard/config
+          A="$(tar -tzf "$X/app.tgz")"
+
+          # ── app.tgz 必须含的安装期组件 ────────────────────
+          for need in ./scripts/install-runtime.sh ./gateway-proxy.py ./envfile.sh \
+                      ./ui/config ./bin/hermes ./runtime/web_dist/index.html \
+                      ./runtime/install-stamp.json ./upstream-ref; do
             echo "$A" | grep -qx "$need" || { echo "✗ app.tgz 缺少 $need"; exit 1; }
           done
 
-          # 端口直连 + 面板鉴权：manifest / wizard / cmd-main 三处必须齐全，
-          # 缺一处就是「文档说有直连、实际打不开」。
-          # 解到临时目录，避免污染仓库根目录。
-          X="$(mktemp -d)"
-          tar -xzf "$FPK" -C "$X" manifest cmd/main cmd/install_callback \
-                             wizard/install wizard/config
+          # ── app.tgz 不得包含的东西（本版改为安装期获取）────
+          if echo "$A" | grep -qE '^\./runtime/(python|hermes)/'; then
+            echo "✗ app.tgz 仍含 runtime/python 或源码树"; exit 1
+          fi
+          if echo "$A" | grep -qx './runtime/deps.txt'; then
+            echo "✗ app.tgz 仍含 deps.txt"; exit 1
+          fi
+          if echo "$A" | grep -qx './hermes-update.py'; then
+            echo "✗ app.tgz 仍含 hermes-update.py（已改用上游 hermes update）"; exit 1
+          fi
+
+          # ── 体积回归保护：不再预置运行时，应远小于 50MB ──
+          # （前端 web_dist 约 10MB，其余脚本/图标很小）
+          if [ "$SIZE" -gt 52428800 ]; then
+            echo "✗ fpk 体积 $(du -h "$FPK" | cut -f1) 超过 50MB —— 疑似又把运行时打包进去了"
+            exit 1
+          fi
+          echo "✓ 体积 $(du -h "$FPK" | cut -f1)（未预置运行时）"
+
+          # ── 关键配置断言 ──────────────────────────────────
           grep -q '^service_port[[:space:]]*=[[:space:]]*9119' "$X/manifest" \
             || { echo "✗ manifest 缺少 service_port = 9119"; exit 1; }
           grep -q '^checkport[[:space:]]*=[[:space:]]*true' "$X/manifest" \
-            || { echo "✗ manifest 缺少 checkport = true"; exit 1; }
+            || { echo "✗ manifest 缺少 checkport"; exit 1; }
           for f in wizard/install wizard/config; do
             grep -q 'wizard_auth_password' "$X/$f" \
               || { echo "✗ $f 缺少面板密码字段"; exit 1; }
@@ -154,119 +160,29 @@ jobs:
             || { echo "✗ cmd/main 未注入 basic auth"; exit 1; }
           grep -q 'envfile.sh' "$X/cmd/main" \
             || { echo "✗ cmd/main 未加载 envfile.sh"; exit 1; }
-          echo "✓ 端口直连 + 面板鉴权 配置齐全"
+          grep -q 'install-runtime.sh' "$X/cmd/install_callback" \
+            || { echo "✗ install_callback 未调用 install-runtime.sh"; exit 1; }
 
-          # 端口直连白屏修复：web_dist 里必须有 app/hermes -> .. 的软链。
-          # 前端按 base=/app/hermes/ 构建，直连时没有代理剥前缀，靠这个别名
-          # 让 SPA 兜底路由按真实文件返回正确 MIME（否则 module 脚本被拒 → 白屏）。
-          LINKS="$(tar -tvzf app.tgz | grep 'runtime/web_dist/app/hermes' || true)"
-          echo "$LINKS"
+          # ── 关键：补丁必须已删除（防止回退到旧实现）────────
+          for fn in ensure_pm_env_ignored lazy_prune_redundant pm_bootstrap_kick \
+                    migrate_pm_venv_extras ensure_lazy_site_abi; do
+            if grep -q "^${fn}() {" "$X/cmd/main"; then
+              echo "✗ cmd/main 仍含旧补丁 ${fn}"; exit 1
+            fi
+          done
+          grep -q 'pm_venv_python()' "$X/cmd/main" \
+            || { echo "✗ cmd/main 缺少 pm_venv_python"; exit 1; }
+          echo "✓ 补丁已清除，改用 PM 真实 venv"
+
+          # ── web_dist 前缀别名（端口直连白屏修复）──────────
+          LINKS="$(tar -tvzf "$X/app.tgz" | grep 'runtime/web_dist/app/hermes' || true)"
           echo "$LINKS" | grep -q '^l' \
-            || { echo "✗ app.tgz 里 runtime/web_dist/app/hermes 不是符号链接"; exit 1; }
+            || { echo "✗ web_dist 缺少 app/hermes 软链"; exit 1; }
           echo "✓ web_dist 前缀别名存在"
 
-          # PM 功能基线：install_callback 必须会写 enabled-features.json，
-          # 且必须含 messaging（缺它则 pm sync 生成 core-only venv →
-          # QQ/Telegram/Discord 适配器全部失效，实机报告 2026-11-03）。
-          grep -q 'enabled-features.json' "$X/cmd/install_callback" \
-            || { echo "✗ install_callback 未写 PM 功能基线"; exit 1; }
-          grep -q '"messaging"' "$X/cmd/install_callback" \
-            || { echo "✗ PM 功能基线缺少 messaging"; exit 1; }
-          # 守卫必须同时挂在 supervisor 循环里（网关级重启不经过 start_process）
-          if [ "$(grep -c 'ensure_pm_env_ignored' "$X/cmd/main")" -lt 3 ]; then
-            echo "✗ cmd/main 的 PM 守卫调用点不足（定义 + start_process + supervisor）"; exit 1
-          fi
-          echo "✓ PM 功能基线与 supervisor 守卫齐全"
-
-          # 按需安装修复：bootstrap + LAZY_SITE 收敛必须都在。
-          # 缺 bootstrap → 从未 pm install 的机器上 20+ 可选功能无法懒安装；
-          # 缺 prune → LAZY_SITE 与 PM venv 长期并存、双份依赖。
-          for fn in pm_bootstrap_kick lazy_prune_redundant; do
-            grep -q "^${fn}() {" "$X/cmd/main" \
-              || { echo "✗ cmd/main 缺少 ${fn}"; exit 1; }
-          done
-          # bootstrap 必须在后台跑：串进前台会拖慢启动（实测 sync 需 45s）
-          grep -q 'pm_bootstrap_kick || true' "$X/cmd/main" \
-            || { echo "✗ bootstrap 未以非阻塞方式调用"; exit 1; }
-          # prune 默认必须是干跑，避免一升级就自动搬动用户数据
-          grep -q 'PY_LAZY_PRUNE:-dry' "$X/cmd/main" \
-            || { echo "✗ prune 默认不是干跑"; exit 1; }
-          echo "✓ 按需安装修复（bootstrap + prune）齐全"
           rm -rf "$X"
-
-          # Python 运行时：两种模式二选一
-          #   自带模式（默认）→ runtime/python/bin/python3
-          #   系统模式        → runtime/.use-system-python 标记，安装时在 NAS 建 venv
-          if echo "$A" | grep -qx "./runtime/.use-system-python"; then
-            echo "✓ 系统 Python 模式（安装时在 NAS 建 venv）"
-          elif echo "$A" | grep -qx "./runtime/python/bin/python3"; then
-            echo "✓ 自带 CPython 模式"
-          else
-            echo "✗ 既无 .use-system-python 标记，也无 runtime/python/bin/python3"; exit 1
-          fi
-
-          # 自带模式：实跑包内解释器，断言 SQLite 版本过 Hermes 的 WAL-reset 门。
-          # 这是本次默认切自带模式的【核心目的】—— 若 PBS tag 变更导致 SQLite 掉回
-          # 窗口外（如 3.51.1），此处立即失败，而不是等装到 NAS 上才发现 WAL 被降级。
-          # ⚠ 用单行 -c：YAML 块标量里没法把多行 Python 顶格写，缩进的顶层语句会
-          #   触发 IndentationError: unexpected indent。
-          if echo "$A" | grep -qx "./runtime/python/bin/python3"; then
-            tar -xzf app.tgz ./runtime/python
-            ./runtime/python/bin/python3 -c "import sqlite3,sys; print('  自带 CPython SQLite:', sqlite3.sqlite_version); i=sqlite3.sqlite_version_info; sys.exit(1 if not (i<(3,7,0) or i>=(3,51,3) or (3,50,7)<=i<(3,51,0) or (3,44,6)<=i<(3,45,0)) else 0)" \
-              || { echo '✗ SQLite 命中 WAL-reset 门 —— state.db 会降级 DELETE，doctor 报假 FTS 损坏'; exit 1; }
-            echo '✓ SQLite 过 WAL-reset 门（WAL 可用）'
-
-            # 瘦身冒烟：构建里删了 libpython*.so / include/ / ensurepip / idlelib，
-            # 并对 python3.14 做了 eu-strip。最怕的是某个模块在【运行期 dlopen】才
-            # 暴露问题，所以这里实际 import 一批最依赖动态加载的模块。
-            # （包内已预装三方依赖，故同时验证 pydantic_core / cryptography / PIL。）
-            ./runtime/python/bin/python3 -c "import ctypes, ssl, sqlite3, hashlib, json, socket, select, asyncio; import pydantic_core, cryptography, PIL; print('  smoke ok:', sqlite3.sqlite_version, pydantic_core.__version__, PIL.__version__)" \
-              || { echo '✗ 瘦身后冒烟失败（某个模块 dlopen 不到 —— 检查 libpython/include 是否被误删，或 eu-strip 版本）'; exit 1; }
-            echo '✓ 瘦身冒烟通过（ctypes/ssl/sqlite3/hashlib + 三方扩展）'
-
-            # 断言 libpython 确实不在了（防止构建脚本被改回去而无人察觉）
-            if find ./runtime/python/lib -maxdepth 1 -name 'libpython3*' | grep -q .; then
-              echo '✗ runtime/python/lib 里仍有 libpython3* —— 瘦身未生效'; exit 1
-            fi
-            echo '✓ libpython* 已移除'
-          fi
-
-          # bin/hermes CLI shim：实跑 `bin/hermes --version`，断言 doctor 里所有
-          # "run 'hermes …'" 建议真的可执行（P0）。也确认它经 usr-local-linker 落 PATH。
-          # （runtime/python 已在上方 SQLite 检查时解出，这里复用。）
-          if echo "$A" | grep -qx "./bin/hermes"; then
-            tar -xzf app.tgz ./bin ./runtime/hermes ./runtime/web_dist
-            chmod +x ./bin/hermes
-            mkdir -p var
-            TRIM_PKGVAR="$PWD/var" ./bin/hermes --version \
-              || { echo '✗ bin/hermes --version 失败'; exit 1; }
-            # 声明在 config/resource 的 usr-local-linker.bin 里才会落 /usr/local/bin/
-            # （匹配 '"bin/hermes"' 不会误中 '"bin/hermes-update"'，因后者 hermes 后是 - 不是 "）
-            tar -xzOf "$FPK" config/resource | grep -q '"bin/hermes"' \
-              || { echo '✗ config/resource 未声明 bin/hermes（不会落 /usr/local/bin）'; exit 1; }
-            echo '✓ bin/hermes 可执行 + 已在 config/resource 声明'
-          else
-            echo '✗ app.tgz 缺少 bin/hermes（doctor 建议将不可执行）'; exit 1
-          fi
-
-          # 构建信息戳（commit/发行方）。⚠ 版本号不来自它：上游读源码树的
-          # hermes_cli/__init__.py；此文件对自更新无作用，仅留构建来源。
-          echo "$A" | grep -qx "./runtime/hermes/install-stamp.json" \
-            && echo "✓ 含 install-stamp.json（构建来源信息）" \
-            || { echo "✗ 缺少 install-stamp.json"; exit 1; }
-
-          # .git 必须在【工作树外】（runtime/hermes-git.git）：
-          # ① 我们的 hermes-update.py 用 GIT_DIR 定向它做 git 更新；
-          # ② 工作树无 .git → 上游 `hermes update` 在 Linux 直接 "Not a git
-          #    repository. Please reinstall:" 退出，堵住自伤通道。见第三轮审计 P0。
-          echo "$A" | grep -q "^\./runtime/hermes-git\.git/" \
-            && echo "✓ .git 已移出工作树（在线更新可用，且堵住 hermes update 自伤）" \
-            || { echo "✗ 缺少 runtime/hermes-git.git"; exit 1; }
-          echo "$A" | grep -qx "./runtime/hermes/.git/HEAD" \
-            && { echo "✗ 工作树内仍有 .git —— 会让 hermes update 自伤"; exit 1; } \
-            || echo "✓ 工作树内无 .git"
-
           echo "✓ fpk 结构检查通过"
+
 
       - uses: actions/upload-artifact@v4
         with:

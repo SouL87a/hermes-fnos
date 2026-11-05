@@ -4,9 +4,9 @@
 
 - 服务端跑在 NAS 上，浏览器 / 飞牛桌面里直接用 **Hermes 原生 dashboard**——配置、API Key、会话管理、内嵌终端
 - 数据与工作区保存在 NAS 上，手机 / 平板 / 电脑共用一份
-- **非 Docker**：**自带 CPython 运行时**（含较新 SQLite），运行期零联网、零 pip
+- **非 Docker**：安装时按官方流程创建独立 Python 环境（不依赖 NAS 上装了什么）
 - 走飞牛**统一网关**（Unix Socket + 飞牛登录态）；可选开启 `http://<NAS>:9119` 局域网直连（共用面板密码）
-- **支持在线更新**：在 dashboard 内或 SSH 里一条命令，即可更新到上游新版本（代码 + 依赖）
+- **支持在线更新**：源码带 `.git`，在 dashboard 内或 SSH 里执行 `hermes update` 即可跟随上游
 
 > 本仓库只做 NAS 侧的移植与打包，不修改 Hermes 本身。上游代码：[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)（MIT）。
 
@@ -18,9 +18,9 @@
 
 | 组件 | 官方 `trim.hermes` | 本仓库 |
 |---|---|---|
-| 运行时 | Python 3.11.15（焊死） | **CPython 3.14.7**（自带，可随上游演进） |
+| 运行时 | Python 3.11.15（焊死） | **跟随上游 pm/lock.json**（当前 3.14.9） |
 | 网关适配 | Go 静态二进制（含版本锁，**改不了**） | **Python `gateway-proxy.py`**（明文，无锁） |
-| 更新 | 拦截（返回"去应用中心更新"） | **真实在线更新**（git 拉取 + 重装依赖） |
+| 更新 | 拦截（返回"去应用中心更新"） | **上游 `hermes update`**（git 拉取 + PM 同步依赖） |
 
 架构同构：
 
@@ -34,30 +34,17 @@ cmd/main
 
 ## 在线更新
 
-两种方式，都是"git 拉取新代码 + 重装依赖"（Python 运行时本身不更新，随 fpk 走）：
-
-**1. dashboard 内**：打开 `https://<NAS>/app/hermes/__hermes/update/ui`，点「检查更新」→「立即更新」。
-
-**2. SSH 命令**：
+用上游原生命令即可（源码在数据目录且带 `.git`）：
 
 ```bash
-hermes-update check     # 检查是否有新版本
-hermes-update apply     # 应用更新
-hermes-update status    # 查看状态与最近一次结果
-hermes-update version   # 打印当前版本
+hermes update --check    # 检查是否有新版本
+hermes update            # 应用更新（git 拉取 + PM 同步依赖）
 ```
 
-更新通道（`update.json` 或环境变量 `HERMES_UPDATE_CHANNEL`）：
+也可以在 dashboard 的「系统」页里点检查更新。更新后需重启应用生效。
 
-| channel | 含义 |
-|---|---|
-| `stable`（默认） | 跟最新稳定 release（如 `v0.22.2`）—— 正式版，与 `upstream.version` 口径一致 |
-| `main` | 跟 main 分支最新提交（前沿，可能未发正式版） |
-| `canary` | 跟最新 canary tag（预发布快照） |
-
-更新后**需重启应用**生效（应用中心 → 已安装 → Hermes → 重启）。依赖安装失败会**自动回滚**到原版本；被中断的更新（代码已切、依赖没装完）下次 `apply` 会识别并只补依赖。
-
-> 更新需要 NAS 能访问 GitHub。国内网络慢时可设 `HERMES_PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple` 加速依赖安装。
+> 更新需要 NAS 能访问 GitHub。国内网络慢时，在应用设置页填 HTTP 代理，
+> 或设置 `HERMES_PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple`。
 
 ### 装新 fpk 时（应用中心升级）
 
@@ -73,44 +60,45 @@ hermes-update version   # 打印当前版本
 > `upgrade_init` / `upgrade_callback` 会各写一行（含时间戳、旧版本、
 > runtime 是否存在）；若连第一行都没有，说明平台没走到升级钩子。
 
-## 为什么必须自带 Python
+## 安装方式：与官方一致
 
-ZCode 能"纯打包"是因为它复用应用中心的 `nodejs_v22`；**Hermes 没有商店可用的 Python 运行时**，所以必须自带一整套：
+本包**不再预置** Python 运行时、依赖和源码树，改为在安装时按上游官方流程获取：
 
-| | ZCode（NAS-ZCode） | Hermes（本仓库） |
+```
+安装期（install_callback → scripts/install-runtime.sh）
+  1. 获取 uv（锁定版本 + sha256 校验）
+  2. git clone 上游源码 → <数据目录>/src（保留 .git）
+  3. 由 Hermes 自带的包管理器创建真实 venv 并装依赖
+运行期
+  解释器与依赖都在 PM 管理的 venv 里；源码在数据目录，`hermes update` 原生可用
+```
+
+| | 旧方案（≤0.22.5-6） | 本方案 |
 |---|---|---|
-| 运行时 | 纯 Node，复用商店 `nodejs_v22` | **自带 CPython 3.14**（python-build-standalone） |
-| 依赖 | 官方预编译 runtime 包 | 构建时用 uv 装进 CPython 的 site-packages，随包分发 |
-| 前端 | 上游自带 `--web` | 构建时 `npm --workspace web build` → `web_dist/` |
-| 网关接入 | 代理改写 HTML 根路径 | **原生前缀反代**：代理发 `X-Forwarded-Prefix` 即可，无需改写 HTML |
-| 源码树 | 官方 runtime 包 | **保留 `.git`**（在线更新靠它） |
+| fpk 体积 | 197 MB | **约 5 MB** |
+| Python / 依赖 | 预置进包 | 安装时获取 |
+| 依赖布局 | 扁平 site-packages | **PM 真实 venv**（上游原生形态） |
+| 补丁代码 | ~450 行 | **0** |
+| 在线更新 | 自研 `hermes-update.py` | **上游 `hermes update`** |
+| 安装耗时 | 30 秒 | 1–5 分钟（取决于网络） |
 
-## 关于 Python 版本
+**为什么这样改**：扁平 site-packages 不是上游 PM 认得的形态，导致「按需安装」（20+ 个可选功能首次使用时自动装依赖）全部失效，只能靠补丁绕过。改用真实 venv 后，上游机制原样工作，不再需要任何补丁。
 
-**本仓库用上游 stable 的 `v0.22.2`**（`requires-python = ">=3.11,<3.15"`），自带 `python-build-standalone` 的 **CPython 3.14.7**。
+### 网络要求
 
-为什么是 3.14：上游从 `v0.21.6` 的「新 stable 发布管线」起，**把全部 45 条核心依赖都钉了 `python_version >= '3.14'` 环境标记**（同时 `requires-python` 仍写 `>=3.11` —— 元数据自相矛盾）。用 3.12 构建时这些依赖会被标记过滤掉，只剩零散传递依赖（实测只装上 37/56，`cryptography`/`PIL`/`psutil` 全缺，构建校验失败）。所以必须用 3.14。实测 `cpython-3.14.7`：56 个依赖全部有 cp314 wheel（零源码编译），关键模块均可导入。
+安装时需联网获取源码、Python 与依赖（约 150–250 MB）。
 
-> 上游 tag 命名也已变更：2026-10-08 起从日期式 `v2026.M.D` 改回 semver `vX.Y.Z`（`v0.21.6` 的 release notes 称 "the new stable release pipeline"）。在线的「检查更新」已改为优先走 Releases API（按发布时间），不依赖命名规则。
+- **有 HTTP 代理**：在安装向导里填地址，全程走代理（最稳）
+- **没有代理**：自动在「直连 + 国内 GitHub 加速镜像」之间**并行竞速**，哪个快用哪个；PyPI 走清华镜像
+- 单路下载 20 秒内平均低于 20 KB/s 会被判定为龟速并主动放弃，不会卡住
 
-**另一个关键点 —— SQLite**：Python 自带的 `sqlite3` 只是个壳，真正的能力来自它链接的 `libsqlite3`。应用中心的 Python 链的是系统库 **3.40.1**，会命中 Hermes 的 WAL-reset 门（安全窗口 `[3.44.6,3.45.0) ∪ [3.50.7,3.51.0) ∪ ≥3.51.3`）→ `state.db` 降级为 `journal_mode=DELETE`，且 doctor 的 FTS 探针（用了 3.42+ 才有的 `flush`）会**误报**「state.db FTS 损坏」。`python-build-standalone` 的 CPython 静态内嵌较新的 SQLite，**实测 3.14.7 = 3.53.1**，过门、WAL 正常。这正是默认走自带模式的核心原因。
+安装失败时，可到「应用设置」补代理后重启应用重试；启动流程会检测环境缺失并自动补齐。
 
-### 运行时模式（默认自带，可选复用系统）
+### 关于 Python 与 SQLite
 
-| 模式 | 触发 | 说明 |
-|---|---|---|
-| **自带 CPython 3.14**（默认） | 直接构建 | 随包分发 CPython 3.14.7（PBS），运行期**零联网、零 pip**，不依赖 NAS 上装了什么。**自带 SQLite 3.53.1**，WAL 正常、doctor 无假 FTS 报错 |
-| 复用系统 Python | `HERMES_USE_SYSTEM_PYTHON=1` | ⚠ **v0.22.x 起不可用**：核心依赖全钉在 3.14，系统 Python（3.11/3.12）会把它们全过滤掉。档保留该模式供旧版 fpk 回退，且系统 libsqlite3 偏旧（Debian 12 = 3.40.1）→ state.db 降级 DELETE |
+Python 版本由上游 `pm/lock.json` 决定（v0.22.5 为 3.14.9），不写死在本仓库。上游发新版时自动跟随。
 
-> 可用 `HERMES_PY_VERSION=3.14.x` 或 `HERMES_PBS_TAG=YYYYMMDD` 覆盖。
-
-## 安装
-
-1. 从 [Releases](../../releases) 下载 `hermes-<版本>.fpk`；
-2. 应用中心 → 手动安装 → 选择 fpk 文件；
-3. 安装向导里设置**面板登录用户名 / 密码**（至少 8 位）；
-4. 安装完成后从桌面图标打开（iframe 内嵌）；
-5. 首次打开在控制台里配置模型与 API Key（`hermes model` 等价的操作在 Web 界面里完成）。
+`python-build-standalone` 的 CPython 静态内嵌较新的 SQLite（实测 3.53.1），过 Hermes 的 WAL-reset 门（安全窗口 `[3.44.6,3.45.0) ∪ [3.50.7,3.51.0) ∪ ≥3.51.3`）。系统 Python 3.11/3.12 链接的 libsqlite3 是 3.40.1，会命中危险区 → `state.db` 降级为 `journal_mode=DELETE`，因此**不使用系统 Python**。
 
 ## 访问方式（两条，共用同一套密码）
 
@@ -162,10 +150,10 @@ hermes.sock（Unix Socket，由 gateway-proxy.py 监听）
 
 ## 构建
 
-前置：`bash`、`curl`、`tar`、`git`、`python3`（仅构建脚本自用）、`node`/`npm`（前端构建）、`uv`（可选，装了更快）。
+前置：`bash`、`curl`、`tar`、`git`、`python3`（构建脚本自用）、`node`/`npm`（前端构建）。
 
 ```bash
-# 完整构建（会克隆上游、下载 CPython、装依赖、构建前端、打包）
+# 完整构建（克隆上游源码、构建前端、打包）
 bash packaging/fnOS/scripts/build.sh
 
 # 复用已有源码树
@@ -174,15 +162,11 @@ bash packaging/fnOS/scripts/build.sh --src /path/to/hermes-agent
 # 跳过前端构建（复用已有 web_dist）
 bash packaging/fnOS/scripts/build.sh --skip-web
 
-# 复用系统 Python（需 3.11–3.13），不打包 CPython（注意：系统 SQLite 偏旧，WAL 会降级）
-HERMES_USE_SYSTEM_PYTHON=1 bash packaging/fnOS/scripts/build.sh
-
-# 覆盖版本号 / CPython 版本 / PBS 标签
+# 覆盖版本号
 HERMES_VERSION=0.2.0 bash packaging/fnOS/scripts/build.sh
-HERMES_PY_VERSION=3.13.15 HERMES_PBS_TAG=20260929 bash packaging/fnOS/scripts/build.sh
 ```
 
-产物：`packaging/fnOS/dist/hermes-<version>.fpk`。
+产物：`packaging/fnOS/dist/hermes-<version>.fpk`（约 5 MB）。
 
 `fnpack` 可用时走 `fnpack build`；否则回退 tar 等价打包（fpk 就是 tar.gz，布局与 fnpack 产物一致）。
 
@@ -192,14 +176,16 @@ HERMES_PY_VERSION=3.13.15 HERMES_PBS_TAG=20260929 bash packaging/fnOS/scripts/bu
 packaging/fnOS/
 ├── manifest                  # 应用元信息（platform=x86、网关声明、9119）
 ├── cmd/                      # 生命周期脚本（main / install / upgrade / uninstall / config）
-│   └── main                  # 含 update 子命令
-├── config/                   # privilege（run-as: package）与 resource（共享目录 + hermes-update 命令）
+├── config/                   # privilege（run-as: package）与 resource（共享目录 + bin/hermes）
 ├── ui/config                 # 飞牛桌面入口（iframe → 统一网关）
 ├── wizard/                   # 安装向导与应用设置页
 ├── ui-images/                # 图标
-├── scripts/build.sh          # 构建脚本
-├── scripts/gateway-proxy.py  # 网关适配层（Unix Socket → 回环 TCP）+ 更新控制端点
-└── scripts/hermes-update.py  # 在线更新引擎
+├── scripts/
+│   ├── build.sh              # 构建脚本（源码 + 前端 + 打包）
+│   ├── install-runtime.sh    # 安装期：uv → 源码 → PM 建 venv 装依赖
+│   ├── gateway-proxy.py      # 网关适配层（Unix Socket → 回环 TCP）
+│   ├── web-build.mjs         # 前端构建（注入 /app/hermes 前缀）
+│   └── envfile.sh            # .env 读写（与 python-dotenv 逐字节一致）
 fnos.version                  # fpk 版本号（单一事实来源）
 upstream.version              # 钉住的上游 ref
 ```
@@ -209,15 +195,23 @@ upstream.version              # 钉住的上游 ref
 ```
 app/
 ├── runtime/
-│   ├── python/       # CPython 3.14（可重定位，自带 SQLite 3.53.1）
-│   ├── hermes-git.git/  # 上游 .git（移出工作树，供在线更新 + 堵 hermes update 自伤）
-│   ├── hermes/       # 上游源码树（含 .git，供在线更新）
-│   ├── web_dist/     # 预构建前端
-│   └── deps.txt      # 依赖清单（系统 Python 模式用）
+│   ├── web_dist/          # 预构建前端（必须随包，NAS 上不保证有 node）
+│   └── install-stamp.json # 版本来源戳
+├── scripts/install-runtime.sh
 ├── gateway-proxy.py
-├── hermes-update.py
-├── bin/hermes-update # CLI 包装（usr-local-linker 注册进 PATH）
+├── envfile.sh
+├── upstream-ref           # 安装期要 clone 的上游 ref
+├── bin/hermes             # CLI 入口（usr-local-linker 注册进 PATH）
 └── ui/{config,images}
+```
+
+运行期数据（`<数据目录>` = `/vol1/@appdata/hermes`）：
+
+```
+src/                  # 上游源码（git clone，带 .git）
+installs/<key>/       # PM 管理：facts.json + environments/<gen>/venv
+.pm-bootstrapped      # 安装完成标记（可选）
+workspace/ state/ log/ .env
 ```
 
 ## 构建已验证

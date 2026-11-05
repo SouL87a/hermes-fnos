@@ -39,19 +39,11 @@ if [ -z "${TRIM_APPDEST}" ]; then
 fi
 
 RUNTIME="${TRIM_APPDEST}/runtime"
-PY="${RUNTIME}/python/bin/python3"
 
 # fnpack 把文件权限拍平成 0666，这里补回可执行位。
-# 自带 CPython：bin/ 下的可执行文件 + lib/ 下的共享库都要补位。
-if [ -d "${RUNTIME}/python/bin" ]; then
-    find "${RUNTIME}/python/bin" -type f -exec chmod +x {} \; 2>/dev/null || true
-fi
-if [ -d "${RUNTIME}/python/lib" ]; then
-    find "${RUNTIME}/python/lib" -name '*.so' -o -name '*.so.*' 2>/dev/null | while read -r so; do
-        chmod +x "${so}" 2>/dev/null || true
-    done
-fi
+# 运行期不再有包内 Python；需要执行位的是脚本与代理。
 [ -f "${TRIM_APPDEST}/gateway-proxy.py" ] && chmod +x "${TRIM_APPDEST}/gateway-proxy.py" 2>/dev/null || true
+[ -f "${TRIM_APPDEST}/scripts/install-runtime.sh" ] && chmod +x "${TRIM_APPDEST}/scripts/install-runtime.sh" 2>/dev/null || true
 
 mkdir -p "${TRIM_PKGVAR}/log" "${TRIM_PKGVAR}/workspace" "${TRIM_PKGVAR}/state"
 
@@ -77,9 +69,11 @@ if [ ! -f "${FEATURES_FILE}" ]; then
     printf '{\n  "schema": 1,\n  "extras": [\n    "messaging",\n    "web"\n  ]\n}\n' > "${FEATURES_FILE}" 2>/dev/null || true
     echo "  PM 功能基线：已写入 ${FEATURES_FILE}（web + messaging）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
 else
-    # 读取现有 extras 与基础项取并集（保留用户额外装的），用包内解释器做 JSON 操作。
-    _py_merge="${RUNTIME}/python/bin/python3"
-    if [ -x "${_py_merge}" ]; then
+    # 读取现有 extras 与基础项取并集（保留用户额外装的）。
+    # ⚠ 此刻运行期还没装完（无 Python 可用），只能用系统 python3 做 JSON 操作；
+    #   系统 python3 不一定存在 → 失败就保留原文件不动（不阻断安装）。
+    _py_merge="$(command -v python3 2>/dev/null || true)"
+    if [ -n "${_py_merge}" ] && [ -x "${_py_merge}" ]; then
         "${_py_merge}" - "${FEATURES_FILE}" ${FEATURES_BASE} <<'PYEOF' 2>/dev/null || true
 import json, sys
 path, base = sys.argv[1], sys.argv[2:]
@@ -101,175 +95,87 @@ fi
 chmod 644 "${FEATURES_FILE}" 2>/dev/null || true
 chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${FEATURES_FILE}" 2>/dev/null || true
 
-### 系统 Python 模式：构建时放了 .use-system-python 标记，这里在 NAS 上建 venv 并装依赖。
-### 打包模式（自带 CPython）跳过此段 —— 依赖已随包分发。
-if [ -f "${RUNTIME}/.use-system-python" ]; then
-    VENV_DIR="${TRIM_PKGVAR}/venv"
-    LOG="${TRIM_PKGVAR}/info.log"
-    echo "系统 Python 模式：创建 venv 并安装依赖（需联网）…" >> "${LOG}"
-
-    ### ⚠ 代理必须【尽早】进入环境：安装期的 uv 下载与 uv pip install 都会发
-    ### 网络请求，而向导填的 wizard_proxy 原先只在末尾写 .env —— 安装时用不上，
-    ### 结果直连境外源龟速（实测 18KB/s，下 20MB 要 18 分钟）。
-    ### 这里立刻：写 .env + export 成环境变量（curl/uv/pip 都认 HTTP(S)_PROXY）。
-    PROXY="${wizard_proxy:-}"
-    case "${PROXY}" in *$'\n'*) PROXY="" ;; esac
-    if [ -n "${PROXY}" ] && printf '%s' "${PROXY}" | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
-        export HTTP_PROXY="${PROXY}" HTTPS_PROXY="${PROXY}" ALL_PROXY="${PROXY}"
-        export http_proxy="${PROXY}" https_proxy="${PROXY}" all_proxy="${PROXY}"
-        export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local"
-        echo "  已启用代理：${PROXY}（供 uv/pip/curl 使用）" >> "${LOG}"
-    else
-        ### 无代理：走国内 PyPI 镜像，避免直连 pypi.org 龟速
-        export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
-        export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
-        echo "  未配置代理：使用清华 PyPI 镜像 ${UV_DEFAULT_INDEX}" >> "${LOG}"
-    fi
-    ### 兜底索引。⚠ 有代理时【不能】用国内镜像：实测「清华镜像 + HTTP 代理」
-    ### 会 SSL_ERROR_SYSCALL 失败，而 pypi.org 走代理很快（实测 23MB/s）。
-    if [ -n "${PROXY}" ]; then
-        : "${UV_DEFAULT_INDEX:=https://pypi.org/simple}"
-    else
-        : "${UV_DEFAULT_INDEX:=https://pypi.tuna.tsinghua.edu.cn/simple}"
-    fi
-
-    ### Python 解释器候选（按优先级）：
-    ###   1. 应用中心的 python312（实测 = Python 3.12.4，真名就是 python312）
-    ###   2. 系统 /usr/bin/python3（实测 3.11.2）
-    ###   3. PATH 上的 python3
-    ### 版本必须落在上游 stable 的 >=3.11,<3.14 内。
-    ### ⚠ 不能只看 /usr/bin/python3 —— 它可能是 3.11.2，虽能过版本校验，
-    ###   但用户明明装了 python312 却用不上（第三轮实机报告指出）。
-    SYS_PY=""
-    PY_CANDS="/vol1/@appcenter/python312/bin/python3"
-    for d in /vol*/@appcenter/python3*/bin/python3; do
-        [ -e "${d}" ] && PY_CANDS="${PY_CANDS} ${d}"
-    done
-    PY_CANDS="${PY_CANDS} /var/apps/python312/target/bin/python3"
-    PY_CANDS="${PY_CANDS} /usr/bin/python3 /usr/local/bin/python3"
-    _path_py="$(command -v python3 2>/dev/null)"
-    [ -n "${_path_py}" ] && PY_CANDS="${PY_CANDS} ${_path_py}"
-
-    for cand in ${PY_CANDS}; do
-        [ -n "${cand}" ] && [ -x "${cand}" ] || continue
-        # 版本校验：上游 stable 要求 >=3.11,<3.14
-        if "${cand}" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] < (3,14) else 1)' 2>/dev/null; then
-            SYS_PY="${cand}"
-            break
-        fi
-    done
-    if [ -z "${SYS_PY}" ]; then
-        echo "未找到合适的 Python（需 3.11–3.13）。请在飞牛应用中心安装「Python 3.12」后重试。" > "${TRIM_TEMP_LOGFILE}"
-        exit 1
-    fi
-    echo "  使用 ${SYS_PY} ($("${SYS_PY}" --version 2>&1))" >> "${LOG}"
-
-    ### ⚠ uv 在跑任何子命令前都会先初始化 cache（默认 $HOME/.cache/uv）。
-    ### 本脚本由 appcenter 以应用用户拉起，HOME 继承自 root 服务（/root，不可写），
-    ### 而应用用户自己的 home 在安装期也还没建 → uv venv 第一步就
-    ### "Failed to initialize cache at /root/.cache/uv: Permission denied (os error 13)"
-    ### → 整个安装 10238 失败（用户实机两连复现）。
-    ### 显式指向应用数据目录（属 hermes、可写）；uv venv 与 uv pip install 都吃这两个变量。
-    export HOME="${TRIM_PKGVAR}"
-    export UV_CACHE_DIR="${TRIM_PKGVAR}/.uv-cache"
-    mkdir -p "${UV_CACHE_DIR}"
-
-    ### uv：按顺序找，尽量避开联网下载。
-    ###   1. python312 应用自带（有就最省事）
-    ###   2. PM store 里的（tools/uv-*/uv）
-    ###   3. 包内/数据目录
-    ###   4. 系统 PATH
-    ### 都没有才联网取（走代理/镜像）。
-    UV=""
-    for cand in /vol*/@appcenter/python312/bin/uv /var/apps/python312/target/bin/uv \
-                "${RUNTIME}/bin/uv" "${TRIM_PKGVAR}/bin/uv" \
-                /vol*/@appdata/hermes/tools/uv-*/uv "$(command -v uv 2>/dev/null)"; do
-        [ -n "${cand}" ] && [ -x "${cand}" ] && { UV="${cand}"; break; }
-    done
-    if [ -z "${UV}" ]; then
-        mkdir -p "${TRIM_PKGVAR}/bin"
-        echo "  未找到本地 uv，联网获取…" >> "${LOG}"
-        ### 优先用清华 PyPI 上的 uv wheel（国内快），失败再退回 astral.sh
-        _UV_TMP="$(mktemp -d 2>/dev/null || echo /tmp/uvget.$$)"
-        mkdir -p "${_UV_TMP}"
-        if command -v curl > /dev/null 2>&1; then
-            # 从清华源取 uv wheel 并解出二进制（wheel 就是 zip）
-            ### ⚠ 清华 simple 页面的 href 是【相对路径】（../../packages/...），
-            ### 用 grep 'https://...' 永远抓不到（实测 0 命中）→ 只能退回 astral.sh。
-            ### 改用解释器做 urljoin（此时 SYS_PY 已就绪）。
-            _WHEEL_URL="$("${SYS_PY}" - <<'PYEOF' 2>/dev/null
-import re, urllib.parse, urllib.request
-base = "https://pypi.tuna.tsinghua.edu.cn/simple/uv/"
-try:
-    html = urllib.request.urlopen(base, timeout=30).read().decode("utf-8", "replace")
-except Exception:
-    raise SystemExit(0)
-rels = re.findall(r'href="([^"]*manylinux[^"]*x86_64\.whl[^"]*)"', html)
-if rels:
-    print(urllib.parse.urljoin(base, rels[-1]).split("#")[0])
-PYEOF
-)"
-            if [ -n "${_WHEEL_URL}" ] && curl -fsSL --max-time 180 -o "${_UV_TMP}/uv.whl" "${_WHEEL_URL}" 2>/dev/null; then
-                ( cd "${_UV_TMP}" && unzip -oq uv.whl 2>/dev/null ) || true
-                # wheel 内二进制常见位置：uv/uv（或根目录 uv）
-                for p in "${_UV_TMP}/uv/uv" "${_UV_TMP}/uv"; do
-                    # unzip 不一定恢复执行位；cp 后补 chmod，否则下面 [ -x ] 判定失败
-                    [ -f "${p}" ] && [ ! -d "${p}" ] && { cp "${p}" "${TRIM_PKGVAR}/bin/uv" && chmod 0755 "${TRIM_PKGVAR}/bin/uv"; break; }
-                done
-            fi
-            # 回退：astral.sh（走代理时快）
-            if [ ! -x "${TRIM_PKGVAR}/bin/uv" ]; then
-                curl -fsSL --max-time 180 https://astral.sh/uv/install.sh 2>/dev/null | \
-                    env UV_INSTALL_DIR="${TRIM_PKGVAR}/bin" UV_NO_MODIFY_PATH=1 sh > /dev/null 2>&1 || true
-            fi
-        fi
-        rm -rf "${_UV_TMP}" 2>/dev/null || true
-        [ -x "${TRIM_PKGVAR}/bin/uv" ] && UV="${TRIM_PKGVAR}/bin/uv"
-    fi
-    if [ -z "${UV}" ]; then
-        echo "无法获取 uv（本地没有、联网也失败）。请在 NAS 上配好 HTTP 代理后重试，或手动放置 uv 到 ${TRIM_PKGVAR}/bin/uv。" > "${TRIM_TEMP_LOGFILE}"
-        exit 1
-    fi
-    echo "  使用 uv：${UV}" >> "${LOG}"
-
-    rm -rf "${VENV_DIR}"
-    "${UV}" venv --python "${SYS_PY}" "${VENV_DIR}" >> "${LOG}" 2>&1 \
-        || { { echo "venv 创建失败："; tail -n 20 "${LOG}" 2>/dev/null; } > "${TRIM_TEMP_LOGFILE}"; exit 1; }
-
-    # 依赖清单在构建时抽好，随包分发（runtime/deps.txt）
-    DEPS="${RUNTIME}/deps.txt"
-    if [ -f "${DEPS}" ]; then
-        ### 装依赖：显式带索引（代理缺失时用清华镜像；代理在则直连也快）
-        "${UV}" pip install --python "${VENV_DIR}/bin/python3" \
-            --default-index "${UV_DEFAULT_INDEX}" -r "${DEPS}" \
-            >> "${LOG}" 2>&1 \
-            || { { echo "依赖安装失败："; tail -n 30 "${LOG}" 2>/dev/null; } > "${TRIM_TEMP_LOGFILE}"; exit 1; }
-    else
-        echo "缺少依赖清单（${DEPS}）" > "${TRIM_TEMP_LOGFILE}"; exit 1
-    fi
+### 运行期安装：uv → 源码 → PM 建 venv 装依赖。
+### 与官方 scripts/install.sh 一致：本包不再预置 Python/依赖/源码。
+### 脚本封装在 ${TRIM_APPDEST}/scripts/install-runtime.sh（随包分发）。
+RUNTIME_SH="${TRIM_APPDEST}/scripts/install-runtime.sh"
+if [ ! -f "${RUNTIME_SH}" ]; then
+    # fnOS 把 cmd/ 放在 /var/apps/<app>/cmd，scripts/ 在 app 内容树里
+    RUNTIME_SH="/var/apps/${APP}/target/scripts/install-runtime.sh"
 fi
+if [ ! -f "${RUNTIME_SH}" ]; then
+    echo "安装包缺少 scripts/install-runtime.sh" > "${TRIM_TEMP_LOGFILE}"
+    exit 1
+fi
+chmod +x "${RUNTIME_SH}" 2>/dev/null || true
 
-# 完整性校验。
-# ⚠ 模式感知：系统 Python 模式的解释器是 NAS 上现建的 venv，包内【没有】
-# runtime/python/ —— 直接判 ${PY} 会 100% 失败（实机报「安装包缺少 Python
-# 运行时（/vol1/@appcenter/hermes/runtime/python/bin/python3）」）。
-if [ -f "${RUNTIME}/.use-system-python" ]; then
-    PY_CHECK="${TRIM_PKGVAR}/venv/bin/python3"
+### 代理：向导里填了就一直生效（uv/git/curl 都认）。
+### ⚠ 有代理时【不】用国内 PyPI 镜像：实测「清华镜像 + HTTP 代理」会
+###   SSL_ERROR_SYSCALL，而 pypi.org 走代理很快。
+PROXY_RAW="${wizard_proxy:-}"
+case "${PROXY_RAW}" in *$'\n'*) PROXY_RAW="" ;; esac
+if [ -n "${PROXY_RAW}" ] && printf '%s' "${PROXY_RAW}" \
+        | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
+    export HTTP_PROXY="${PROXY_RAW}" HTTPS_PROXY="${PROXY_RAW}" ALL_PROXY="${PROXY_RAW}"
+    export http_proxy="${PROXY_RAW}" https_proxy="${PROXY_RAW}" all_proxy="${PROXY_RAW}"
+    export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local"
+    echo "  已启用代理：${PROXY_RAW}" >> "${TRIM_PKGVAR}/log/install.log"
+    PYPI_INDEX="https://pypi.org/simple"
 else
-    PY_CHECK="${PY}"
+    PROXY_RAW=""
+    PYPI_INDEX="${wizard_pypi_index_url:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+    echo "  未配置代理，PyPI 源：${PYPI_INDEX}" >> "${TRIM_PKGVAR}/log/install.log"
 fi
-if [ ! -x "${PY_CHECK}" ]; then
-    echo "安装包缺少 Python 运行时（${PY_CHECK}）" > "${TRIM_TEMP_LOGFILE}"
+
+### GitHub 镜像（仅未填代理时使用；填了代理通常直连更快）
+GH_MIRROR=""
+if [ -z "${PROXY_RAW}" ] && [ -n "${wizard_github_mirror:-}" ]; then
+    GH_MIRROR="${wizard_github_mirror}"
+fi
+
+### ⚠ HOME / UV_CACHE_DIR 必须显式指向可写目录：
+###   安装期由 appcenter 以应用用户拉起，HOME 继承 root 的 /root（不可写），
+###   uv 第一步就 Permission denied（实机两连复现）。
+export HOME="${TRIM_PKGVAR}"
+export UV_CACHE_DIR="${TRIM_PKGVAR}/.uv-cache"
+mkdir -p "${UV_CACHE_DIR}"
+
+UPSTREAM_REF=""
+if [ -f "${TRIM_APPDEST}/upstream-ref" ]; then
+    UPSTREAM_REF="$(tr -d '[:space:]' < "${TRIM_APPDEST}/upstream-ref" 2>/dev/null || true)"
+fi
+
+echo "开始获取运行期（源码 + Python + 依赖），可能需要几分钟…" >> "${TRIM_PKGVAR}/log/install.log"
+if ! HERMES_REF="${UPSTREAM_REF:-v0.22.5}" \
+     HERMES_PYPI_INDEX="${PYPI_INDEX}" \
+     HERMES_GH_MIRROR="${GH_MIRROR}" \
+     bash "${RUNTIME_SH}" "${TRIM_PKGVAR}" "${TRIM_APPDEST}" >> "${TRIM_PKGVAR}/log/install.log" 2>&1; then
+    {
+        echo "运行期安装失败。请检查网络或到「应用设置」填写 HTTP 代理后重试。"
+        echo "详细日志：${TRIM_PKGVAR}/log/install-runtime.log"
+        tail -20 "${TRIM_PKGVAR}/log/install-runtime.log" 2>/dev/null
+    } > "${TRIM_TEMP_LOGFILE}"
     exit 1
 fi
-if [ ! -d "${RUNTIME}/hermes/hermes_cli" ]; then
-    echo "安装包缺少 Hermes 源码树（${RUNTIME}/hermes/hermes_cli）" > "${TRIM_TEMP_LOGFILE}"
+echo "✓ 运行期安装完成" >> "${TRIM_PKGVAR}/log/install.log"
+
+### 完整性校验：PM 环境 + 源码树 + 前端。
+_PM_PY="$(find "${TRIM_PKGVAR}/installs" -maxdepth 8 -type f \
+            -path '*/environments/*/venv/bin/python3' 2>/dev/null | head -n 1)"
+if [ -z "${_PM_PY}" ] || [ ! -x "${_PM_PY}" ]; then
+    echo "安装后未找到 PM 的 venv（${TRIM_PKGVAR}/installs/*/environments/*/venv/bin/python3）" > "${TRIM_TEMP_LOGFILE}"
     exit 1
 fi
-if [ ! -f "${RUNTIME}/web_dist/index.html" ]; then
-    echo "安装包缺少预构建前端（${RUNTIME}/web_dist/index.html）" > "${TRIM_TEMP_LOGFILE}"
+if [ ! -d "${TRIM_PKGVAR}/src/hermes_cli" ]; then
+    echo "安装后缺少源码树（${TRIM_PKGVAR}/src/hermes_cli）" > "${TRIM_TEMP_LOGFILE}"
     exit 1
 fi
+if [ ! -f "${TRIM_APPDEST}/runtime/web_dist/index.html" ]; then
+    echo "安装包缺少预构建前端（${TRIM_APPDEST}/runtime/web_dist/index.html）" > "${TRIM_TEMP_LOGFILE}"
+    exit 1
+fi
+
+
 
 ### 属主修正：全新安装时数据目录是新建的、条目很少 → 递归没问题；
 ### 但「卸载保留数据后重装」或升级路径下该目录可能有 168,510 个条目 / 12 GB，

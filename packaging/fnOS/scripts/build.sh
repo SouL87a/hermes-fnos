@@ -117,6 +117,10 @@ case "${ARCH}" in
 esac
 echo "[build] 架构 ${ARCH} (${PBS_TRIPLE})"
 
+### 构建缓存（ripgrep 等可选组件；不再用于 CPython/依赖）
+PBS_CACHE="${PKG_DIR}/.cache"
+mkdir -p "${PBS_CACHE}"
+
 # ── 上游源码树 ───────────────────────────────────────────────
 if [ -n "${SRC_DIR_ARG}" ]; then
     SRC="${SRC_DIR_ARG}"
@@ -146,333 +150,33 @@ echo "[build] 源码树：${SRC} ($(cd "${SRC}" && git rev-parse --short HEAD 2>
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}" "${APP_DIR}" "${DIST}" "${RT}"
 
-# ── 1. Python 运行时 ─────────────────────────────────────────
-# 默认【自带 CPython】（python-build-standalone），依赖预装进其 site-packages，
-#   运行期零联网、不 pip、不依赖应用中心的 Python。
+# ── 1. 运行期不由构建期提供 ────────────────────────────────
+# 本包不再预置 CPython / 依赖 / 源码树 / .git。
+# 这些由 cmd/install_callback 调 scripts/install-runtime.sh 在 NAS 上获取：
+#   1. uv（锁定版本 + sha256）
+#   2. git clone 源码 → <data>/src（保留 .git，支持 hermes update）
+#   3. pm install（PM 下 Python、建真实 venv、装依赖）
+# 这样得到的是上游原生的 venv，不需要任何补丁。
 #
-# 为什么默认自带（而非复用应用中心 Python 3.12）：
-#   · SQLite：应用中心的 Python 3.12 链的是系统 libsqlite3 **3.40.1**，命中 Hermes
-#     的 WAL-reset 门（安全窗口 [3.44.6,3.45.0) ∪ [3.50.7,3.51.0) ∪ ≥3.51.3）
-#     → state.db 降级成 journal_mode=DELETE（写并发/持久性变差），且 doctor 的
-#     FTS 探针用 3.42+ 才有的 `flush` 命令 → 它报「FTS 损坏」是假阳性。
-#     PBS 自带 CPython 静态内嵌 SQLite —— 实测 cpython-3.14.7 = **3.53.1**，达标。
-#   · 安装期零联网：不必在 NAS 上 uv 建 venv 装依赖（代理/镜像那套复杂度一并消失）。
-#   · 不绑应用中心 Python 路径：用户卸载/升级 python312 不会让 venv 失效。
-#   代价：包体积大一个数量级（~127MB → ~500MB）。
-#
-# 想改回「复用系统 Python」：设 HERMES_USE_SYSTEM_PYTHON=1（商店装 Python 3.12，
-#   安装时在 NAS 上建 venv 装依赖 —— 会重新受系统 SQLite 3.40.1 拖累）。
-#
-# ⚠ 为什么是 3.14（v0.22.2 起）：
-#   上游从 v0.21.6 的「新 stable 发布管线」起，把 **全部核心依赖都钉了
-#   `python_version >= '3.14'` 环境标记**（45 条全带），而 requires-python 仍写
-#   >=3.11,<3.15 —— 元数据自相矛盾。用 3.12 构建时这些依赖会被标记过滤掉，
-#   只剩下零散传递依赖（实测只装上 37/56，cryptography/PIL/psutil 全缺，校验失败）。
-#   故必须用 3.14。实测 cpython-3.14.7：56 个依赖全部有 cp314 wheel（零源码编译），
-#   cryptography/PIL/psutil/fastapi/... 均可导入。
-PY_VERSION="${HERMES_PY_VERSION:-3.14.7}"
-PBS_TAG="${HERMES_PBS_TAG:-20260929}"     # 自带模式下的 PBS 标签
-PBS_CACHE="${PKG_DIR}/.cache"
-mkdir -p "${PBS_CACHE}"
+# 构建期仍需预构建前端（web_dist），因为不保证 NAS 上有 node/npm。
 
-pbs_url() {
-    # 资产名形如：cpython-<ver>+<tag>-<triple>-install_only.tar.gz
-    local base="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}"
-    local asset="cpython-${PY_VERSION}+${PBS_TAG}-${PBS_TRIPLE}-install_only.tar.gz"
-    # 国内可设 HERMES_GH_MIRROR 走加速（如 https://ghfast.top），显著提速
-    echo "${HERMES_GH_MIRROR:+${HERMES_GH_MIRROR}/}${base}/${asset}"
-}
-
-PBS_TGZ="${PBS_CACHE}/cpython-${PY_VERSION}-${PBS_TRIPLE}.tar.gz"
-if [ "${HERMES_USE_SYSTEM_PYTHON:-0}" = "1" ]; then
-    # 复用系统 Python（飞牛应用中心的 3.12）：不打包 CPython，运行期用
-    # NAS 上现成的 python3 建 venv。构建机只需能跑 python3 来抽依赖清单/写 stamp。
-    echo "[build] 系统 Python 模式（HERMES_USE_SYSTEM_PYTHON=1）：跳过打包 CPython，安装时在 NAS 上建 venv"
-    PYBIN="$(command -v python3 || command -v python)"
-    [ -n "${PYBIN}" ] || { echo "✗ 本机找不到 python3（构建脚本自用）"; exit 1; }
-    "${PYBIN}" --version
-    # 标记：cmd/main / install_callback 见到此文件即改用 NAS 上的 venv
-    : > "${RT}/.use-system-python"
-else
-    if [ ! -f "${PBS_TGZ}" ]; then
-        URL="$(pbs_url)"
-        echo "[build] 下载 CPython ${PY_VERSION} → ${URL}"
-        if ! curl -fL --retry 3 -o "${PBS_TGZ}.part" "${URL}"; then
-            rm -f "${PBS_TGZ}.part"
-            echo "✗ 下载 CPython 失败。请确认 PBS_TAG/PY_VERSION 组合存在："
-            echo "  https://github.com/astral-sh/python-build-standalone/releases"
-            echo "  可用 HERMES_PBS_TAG=YYYYMMDD HERMES_PY_VERSION=3.14.x 覆盖。"
-            exit 1
-        fi
-        mv "${PBS_TGZ}.part" "${PBS_TGZ}"
-    fi
-    echo "[build] 解包 CPython → runtime/python"
-    mkdir -p "${RT}/python"
-    tar -xzf "${PBS_TGZ}" -C "${RT}/python" --strip-components=1
-    PYBIN="${RT}/python/bin/python3"
-    [ -x "${PYBIN}" ] || { echo "✗ CPython 解包异常，缺 ${PYBIN}"; exit 1; }
-    "${PYBIN}" --version
-
-    # ── 瘦身（实测 runtime/python 443MB → 262MB，-181MB）──────────
-    # 依据（在 NAS 上对 runtime/python 内【全部 ELF】做了扫描，比 ldd 更确凿）：
-    #   命中 libpython3 的文件只有 2 个：libpython3.14.so.1.0 它自己，以及
-    #   libpython3.so（16KB 的开发用链接桩）。bin/python3.14 是【静态链接】CPython，
-    #   site-packages 里所有扩展 .so 也都不链 libpython。
-    #   另外懒安装走 pm/environment.py 的 `--no-index --only-binary :all:`，
-    #   只装 wheel、永不编译源码 → include/（C 头文件）同样没有存在意义。
-    # 因此 libpython*.so 与 include/ 直接【删除】，不是 strip（多省 35MB + 少两个文件）。
-    # ⚠ 直接后果：包内不能再编译 C 扩展（Python.h 与 libpython 都不在）。
-    #   该约束成立的前提是上游保持 --only-binary :all:。若该策略被放开，
-    #   必须把 include/ 与 libpython*.so 加回来（见本段末尾的详细说明）。
-    _before="$(du -sm "${RT}/python" 2>/dev/null | cut -f1)"
-    # 三个实体文件 + 指向它们的符号链接（否则删完留悬空链接）：
-    #   libpython3.14.so.1.0   131MB 实际库
-    #   libpython3.so           16KB 开发用链接桩
-    #   libpython3.14.so        → .so.1.0 的软链
-    rm -f "${RT}/python/lib/libpython3.14.so.1.0" \
-          "${RT}/python/lib/libpython3.so" \
-          "${RT}/python/lib/libpython3.14.so"
-    # 运行期用不到：C 头文件、ensurepip（pip 已在 site-packages）、idlelib（IDE）。
-    # ⚠ 不要删 __pycache__（删了每次启动重编译，反而更慢）。
-    rm -rf "${RT}/python/include" \
-           "${RT}/python/lib/python3.14/ensurepip" \
-           "${RT}/python/lib/python3.14/idlelib"
-    # 只对可执行文件 strip：75MB → ~30MB。
-    # ⚠ 必须用 eu-strip（elfutils），【不能用 GNU strip】：
-    #   PBS 二进制带 .gnu.version* 符号版本节，GNU strip 会剥掉它们 →
-    #   "no version information available" + "symbol lookup error: undefined
-    #   symbol" → Python 完全起不来（已实测，--strip-unneeded 也一样）。
-    if [ -f "${RT}/python/bin/python3.14" ]; then
-        if command -v eu-strip > /dev/null 2>&1; then
-            eu-strip --strip-all -o "${RT}/python/bin/python3.14.stripped" \
-                    "${RT}/python/bin/python3.14" 2>/dev/null \
-                && mv -f "${RT}/python/bin/python3.14.stripped" "${RT}/python/bin/python3.14" \
-                || { rm -f "${RT}/python/bin/python3.14.stripped"; echo "  ⚠ eu-strip 失败，保留原二进制"; }
-        else
-            echo "  ⚠ 未找到 eu-strip（elfutils），跳过 strip（体积会多 ~45MB）"
-        fi
-    fi
-    _after="$(du -sm "${RT}/python" 2>/dev/null | cut -f1)"
-    [ -n "${_before}" ] && [ -n "${_after}" ] && \
-        echo "[build] runtime/python 瘦身：${_before}MB → ${_after}MB"
-    # 瘦身后必须仍可运行（防止 strip/删除出错把包打废）。
-    # 校验点专门挑【运行期 dlopen】最密集的模块：ctypes（dlopen 本身）、
-    # ssl（OpenSSL）、sqlite3、hashlib（_hashlib/_sha*）、socket/select、
-    # asyncio（epoll/selector），再加上三方 C 扩展。
-    "${PYBIN}" -c "
-import ctypes, ssl, sqlite3, hashlib, json, socket, select, asyncio, multiprocessing
-import sys
-print('[build] 瘦身后自检 OK:', sys.version.split()[0], sqlite3.sqlite_version)
-" || { echo "✗ 瘦身后 Python 无法运行（check eu-strip 版本 / 是否误删了必要 .so）"; exit 1; }
-    ### ⚠ 约束（删除 include/ + libpython 的代价，务必保留此说明）：
-    ### 包内【无法再编译 C 扩展】——报错会是 "Python.h: No such file" 或
-    ### 链接阶段找不到 libpython3.14.so。
-    ### 当前安全，因为懒安装走 pm/environment.py 的
-    ###   `--no-index --only-binary :all:`
-    ### 只装 wheel、永不编译 sdist。若哪天有人放开 --only-binary（或允许源码包），
-    ### 必须同时把 include/ 与 libpython*.so 加回来，否则安装会在构建阶段失败。
-fi
-
-# ── 2. 依赖 ──────────────────────────────────────────────────
-# 打包模式：装进包内 CPython 的 site-packages，运行期零联网。
-# 系统 Python 模式：构建期无法往 NAS 的系统解释器里装，改为安装时（install_callback）
-#   用 uv 在 NAS 上建 venv 并装依赖 —— 见 cmd/install_callback。
-### 无论哪种模式，都先从源码树抽依赖清单（系统 Python 模式随包分发，安装时用）。
-DEPS_TXT="${RT}/deps.txt"
-"${PYBIN}" - "${SRC}/pyproject.toml" > "${DEPS_TXT}" <<'PY'
-import sys, tomllib, pathlib
-p = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-proj = p["project"]
-deps = list(proj.get("dependencies", []))
-extras = proj.get("optional-dependencies", {})
-# 装哪些 extra：
-#   web       —— dashboard 服务端（fastapi/uvicorn）
-#   messaging —— 消息平台适配器（aiohttp 等）。缺它则 QQ/Telegram 等
-#                适配器建不出来，gateway 日志报 "No adapter available"
-#                （用户实测报告 qqbot-channel-status-report.md）。
-for name in ("web", "messaging"):
-    deps += list(extras.get(name, []))
-# 过滤自引用（形如 hermes-agent[xxx]），避免把项目本身拉进来
-out = [d for d in deps if not d.strip().lower().startswith("hermes-agent")]
-print("\n".join(out))
-PY
-[ -s "${DEPS_TXT}" ] || { echo "✗ 依赖清单抽取失败（${DEPS_TXT}）"; exit 1; }
-echo "[build] 依赖条数：$(grep -c . "${DEPS_TXT}")"
-
-if [ "${HERMES_USE_SYSTEM_PYTHON:-0}" = "1" ]; then
-    echo "[build] 系统 Python 模式：跳过构建期依赖安装（依赖清单已随包，安装时 uv 装）"
-else
-echo "[build] 安装 Python 依赖（core + [web]）→ site-packages"
-
-### 只装依赖，不装项目本身。
-### 为什么：`pip install -e <源码树>` 会把**构建机绝对路径**写进 .pth，装到 NAS 后
-### 该路径不存在 → import hermes_cli 直接失败。而普通（非 editable）安装会把项目
-### 拷进 site-packages，导致 PROJECT_ROOT 指向 site-packages，随包的 skills/ 等
-### 顶层数据目录丢失。正解：依赖进 site-packages，代码从随包的源码树跑
-### （cmd/main 里 PYTHONPATH=runtime/hermes，PROJECT_ROOT 因此指向源码树）。
-### 依赖清单已在上方抽好（${DEPS_TXT}）。
-if command -v uv > /dev/null 2>&1; then
-    UV="uv"
-elif [ -x "${HOME}/.local/bin/uv" ]; then
-    UV="${HOME}/.local/bin/uv"
-elif [ -x "${HOME}/.cargo/bin/uv" ]; then
-    UV="${HOME}/.cargo/bin/uv"
-else
-    UV=""
-fi
-
-### ⚠ 交叉构建的可移植性：只取预编译 wheel，禁止本地源码编译。
-### 原因：构建机 glibc 可能比目标（fnOS = Debian 12 / glibc 2.36）新，
-### 本地编译出的 .so 会链接到更新的 glibc 符号版本，装到 NAS 上直接报
-### "GLIBC_2.3x not found"。manylinux wheel 是针对老 glibc 构建的，安全。
-### 代价：若某依赖无 cp314 wheel，构建会**明确失败**而非悄悄产出不可移植的包
-### —— 这正是我们要的（宁可失败也不要装上去才崩）。
-### 逃生阀：HERMES_ALLOW_SOURCE_BUILD=1 可放开（自担风险，需目标机有工具链）。
-BINARY_FLAGS=()
-if [ "${HERMES_ALLOW_SOURCE_BUILD:-0}" != "1" ]; then
-    BINARY_FLAGS=(--only-binary=:all:)
-    echo "[build] 强制仅用预编译 wheel（保证 glibc 可移植性）"
-else
-    echo "[build] ⚠ HERMES_ALLOW_SOURCE_BUILD=1：允许本地源码编译（可能不可移植）"
-fi
-
-### 国内可设 HERMES_PIP_INDEX 走镜像加速（如 https://pypi.tuna.tsinghua.edu.cn/simple）
-INDEX_FLAGS=()
-if [ -n "${HERMES_PIP_INDEX:-}" ]; then
-    INDEX_FLAGS=(-i "${HERMES_PIP_INDEX}")
-    echo "[build] 使用 PyPI 镜像：${HERMES_PIP_INDEX}"
-fi
-
-### ⚠ 上游依赖冲突的 override（v0.22.5 起必需）
-### v0.22.5 的 pyproject.toml 里：
-###   · 核心依赖要求 Pillow==13.0.0
-###   · browser-harness==0.1.13 内部 pin 了 pillow==12.3.0（精确 ==）
-### 上游自己用 [tool.uv] override-dependencies 解决（注释里写明 browser-harness
-### 只做 open/convert/compose，13.0.0 兼容；等它放开 Pillow 13 后该行可删）。
-### 但我们用 `uv pip install -r deps.txt`，【不读 pyproject 的 [tool.uv]】，
-### 所以必须显式把同样的 overrides 传给 uv —— 否则解析直接报
-###   "No solution found ... browser-harness depends on pillow==12.3.0
-###    and you require pillow==13.0.0 ... unsatisfiable"（已实测）。
-### 维护提示：上游改了这个 override 时，同步更新下方列表。
-OVERRIDES_TXT="${PKG_DIR}/.cache/uv-overrides.txt"
-mkdir -p "$(dirname "${OVERRIDES_TXT}")"
-printf '%s\n' "Pillow==13.0.0" > "${OVERRIDES_TXT}"
-OVERRIDE_FLAGS=(--overrides "$(winpath "${OVERRIDES_TXT}")")
-
-if [ -n "${UV}" ]; then
-    echo "[build] 使用 uv：${UV}"
-    "${UV}" pip install --python "$(winpath "${PYBIN}")" --no-config \
-        "${BINARY_FLAGS[@]}" "${INDEX_FLAGS[@]}" "${OVERRIDE_FLAGS[@]}" \
-        -r "$(winpath "${DEPS_TXT}")"
-else
-    echo "[build] uv 不可用，回退 pip（较慢）"
-    ### pip 没有 --overrides；改用 constraints（约束同样能压住传递依赖的 pin，
-    ### 但若直接冲突仍会失败）。装完后校验会兜底。
-    "$PYBIN" -m pip install --upgrade pip > /dev/null
-    "$PYBIN" -m pip install "${BINARY_FLAGS[@]}" "${INDEX_FLAGS[@]}" \
-        -c "$(winpath "${OVERRIDES_TXT}")" -r "$(winpath "${DEPS_TXT}")"
-fi
-# 注意：不删 deps.txt —— 它是包内产物（runtime/deps.txt），
-# 系统 Python 模式安装时要用它装依赖，最终自检也要它。
-
-# 校验关键依赖已就位（此时源码树还没拷进包，只验第三方依赖）
-"${PYBIN}" - <<'PY' || { echo "✗ 依赖校验失败"; exit 1; }
-import importlib
-for m in ("fastapi", "uvicorn", "starlette", "pydantic", "cryptography", "PIL", "psutil"):
-    importlib.import_module(m)
-print("deps ok: fastapi, uvicorn, starlette, pydantic, cryptography, PIL, psutil")
-PY
-fi  # 结束「打包模式」分支
-
-# ── 3. 源码树拷进包 ──────────────────────────────────────────
-echo "[build] 拷贝源码树 → runtime/hermes"
-mkdir -p "${RT}/hermes"
-### ⚠ .git 刻意 **不放进工作树** —— 放到 runtime/hermes-git.git（见下方 3a）。
-### 原因（第三轮审计 P0）：工作树里有 .git 会让上游 sealed_steward() 直接
-### return None → `hermes update` 的准入判定放行 → 用户敲一次就 git reset --hard
-### 覆盖代码树（自伤）。移出工作树后 sealed_steward 走 stamp 的 distribution
-### 分支 → 被正确拒绝并提示走应用中心；而我们的 hermes-update.py 用
-### GIT_DIR/GIT_WORK_TREE 定向，在线更新功能不受影响。
-### 排除桌面端/测试代码（NAS 版不需要，且显著减小包体积）：
-###   apps/desktop   Electron 桌面端源码 —— 4,119 条目（占全包 17%）
-###   测试文件       1,872 个（.test.* / .spec.*）
-### 实测：全包 24,679 条目 → 排除后约 18,700（-24%）。
-### 安全性：venv_sync.py 只"探测" apps/desktop/dist/index.html 是否存在来决定
-###   是否构建桌面端（不存在→desktop=False），不做硬依赖；`hermes desktop`
-###   子命令在 NAS 上本就不可用。apps/shared 与 bootstrap-installer 只有 109
-###   条目，保守保留（避免影响前端构建脚本）。
-### 背景：fnOS 覆盖升级曾在解包阶段失败（临时目录只解出 cmd/config/wizard，
-###   runtime 未解出）——减小体积/文件数可降低此类失败概率。
-( cd "${SRC}" && tar -cf - \
-    --exclude='.git' \
-    --exclude='node_modules' \
-    --exclude='web/node_modules' \
-    --exclude='ui-tui/node_modules' \
-    --exclude='apps/*/node_modules' \
-    --exclude='apps/desktop' \
-    --exclude='__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='.venv' \
-    --exclude='tests' \
-    --exclude='tests-js' \
-    --exclude='evals' \
-    --exclude='website' \
-    --exclude='*.test.ts' --exclude='*.test.tsx' \
-    --exclude='*.test.js' --exclude='*.test.jsx' \
-    --exclude='*.spec.ts' --exclude='*.spec.tsx' \
-    --exclude='__tests__' --exclude='__mocks__' \
-    --exclude='contributors/emails' \
-    . ) | ( cd "${RT}/hermes" && tar -xf - )
-
-# ── 3a. .git 移到工作树外（保留在线更新能力，同时堵住 hermes update 自伤）──
-if [ -d "${SRC}/.git" ]; then
-    echo "[build] 移出 .git → runtime/hermes-git.git（并补 origin）"
-    rm -rf "${RT}/hermes-git.git"
-    cp -a "${SRC}/.git" "${RT}/hermes-git.git"
-    # 记录 origin 与 HEAD，供 hermes-update.py 用
-    git -C "${SRC}" remote get-url origin > "${RT}/.origin-url" 2>/dev/null || true
-    git -C "${SRC}" rev-parse HEAD > "${RT}/.git-head" 2>/dev/null || true
-    ORIGIN_URL="$(cat "${RT}/.origin-url" 2>/dev/null || true)"
-    if [ -n "${ORIGIN_URL}" ]; then
-        GIT_DIR="${RT}/hermes-git.git" git remote remove origin 2>/dev/null || true
-        GIT_DIR="${RT}/hermes-git.git" git remote add origin "${ORIGIN_URL}" 2>/dev/null || true
-    fi
-    # 新增文件模式下 git 认为工作树"全脏"（fnpack 会拍平权限）→ 关掉 filemode 检测
-    GIT_DIR="${RT}/hermes-git.git" git config core.filemode false 2>/dev/null || true
-fi
-
-# ── 3b. install-stamp.json（构建信息戳）─────────────────────
-# ⚠ 上游 stable 的版本号【不读这个文件】——它来自源码树的 hermes_cli/__init__.py
-#   （__version__）与 pyproject.toml。install-stamp.json 只有 Electron 桌面端在用，
-#   我们的 web dashboard 运行时不碰它。写它只为留构建来源信息（commit/日期/发行方），
-#   对自更新【没有】作用，别再靠它拦自伤。
-#
-# 【拦自伤的真实机制】工作树里没有 .git → 上游 `hermes update` 在 Linux 上直接
-#   `✗ Not a git repository. Please reinstall:` 退出（update_cmd.py 的
-#   _prepare_git_command）。build.sh 把 .git 移到 runtime/hermes-git.git（工作树外），
-#   既让我们的 hermes-update.py 能用 GIT_DIR 走 git 更新，又让上游 update 无从下手。
-#   见第三轮审计 P0。
-echo "[build] 生成 install-stamp.json"
-STAMP="${RT}/hermes/install-stamp.json"
-# .git 已在 3a 移出工作树 → 用 GIT_DIR/GIT_WORK_TREE 定向
-STAMP_GIT_ENV=(env "GIT_DIR=${RT}/hermes-git.git" "GIT_WORK_TREE=${RT}/hermes")
-STAMP_COMMIT="$("${STAMP_GIT_ENV[@]}" git rev-parse HEAD 2>/dev/null || echo '')"
-STAMP_BRANCH="$("${STAMP_GIT_ENV[@]}" git branch --show-current 2>/dev/null || echo '')"
-STAMP_DATE="$("${STAMP_GIT_ENV[@]}" git log -1 --format=%ct 2>/dev/null || echo '')"
-# 从上游 ref 推导基础版本：v0.21.4+canary.xxx → 0.21.4；v2026.9.24 → 2026.9.24
-# 与 fpk 版本统一（同一份推导，避免两处漂移）
-STAMP_BASE="${VERSION}"
-UPSTREAM_REF="${UPSTREAM_REF_V}"
+# ── 3. install-stamp.json（构建信息戳）─────────────────────
+# 只记录版本来源；不再写 distribution/payload —— 源码在数据目录且带 .git，
+# 上游 sealed_steward() 见到 .git 即返回 None，允许 hermes update。
+# 写 distribution 反而可能让某些路径误判为"受管安装"而拒绝更新。
+STAMP="${RT}/install-stamp.json"
+STAMP_COMMIT="$("git" -C "${SRC}" rev-parse HEAD 2>/dev/null || echo '')"
+STAMP_BRANCH="$("git" -C "${SRC}" branch --show-current 2>/dev/null || echo '')"
+STAMP_DATE="$("git" -C "${SRC}" log -1 --format=%ct 2>/dev/null || echo '')"
 [ -n "${STAMP_COMMIT}" ] || STAMP_COMMIT="$(printf '0%.0s' $(seq 1 40))"
 
-# 用构建机上任意可用的 python 写 stamp（不需要包内运行时）
 STAMP_PY=""
-for cand in "${PYBIN}" python3 python; do
-    if command -v "${cand}" > /dev/null 2>&1; then STAMP_PY="${cand}"; break; fi
+for cand in python3 python; do
+    command -v "${cand}" > /dev/null 2>&1 && { STAMP_PY="${cand}"; break; }
 done
 [ -n "${STAMP_PY}" ] || { echo "✗ 找不到 python 用于生成 install-stamp.json"; exit 1; }
 
-"${STAMP_PY}" - "$(winpath "${STAMP}")" "$STAMP_COMMIT" "$STAMP_BASE" "$STAMP_BRANCH" "$STAMP_DATE" <<'PY'
+"${STAMP_PY}" - "$(winpath "${STAMP}")" "${STAMP_COMMIT}" "${VERSION}" "${STAMP_BRANCH}" "${STAMP_DATE}" <<'PY'
 import json, sys, datetime
 out, commit, base, branch, cdate = sys.argv[1:6]
 stamp = {
@@ -482,19 +186,16 @@ stamp = {
     "branch": branch or None,
     "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "dirty": False,
-    "source": "local",          # 非 commit-build/docker/nix → 不触发额外拒绝
-    "distribution": "fnOS App Center",   # 仅作发行标记（上游不读；见上方说明）
-    "updateMechanism": "external",  # 仅作标记：更新由本包的 hermes-update.py 管理
+    "source": "local",
     "baseVersion": base,
     "displayVersion": base,
     "distance": 0,
 }
-# payload 字段刻意不写：写了 bundled/light/runtime 会被判为"不可自更新"，
-# 这里要保持与 external 一致但语义清晰。
-open(out, "w", encoding="utf-8").write(json.dumps(stamp, ensure_ascii=False, indent=2) + "\n")
-print(f"[build]   stamp: base={base} commit={commit[:12] or '(none)'} mechanism=external")
+open(out, "w", encoding="utf-8").write(json.dumps(stamp, ensure_ascii=False, indent=2) + chr(10))
 PY
 [ -f "${STAMP}" ] || { echo "✗ install-stamp.json 生成失败"; exit 1; }
+# 记录上游 ref，安装期 install-runtime.sh 要用它 clone 对应版本
+echo "${UPSTREAM_REF_V:-v0.22.5}" > "${APP_DIR}/upstream-ref"
 
 # ── 4. 前端预构建（web_dist）────────────────────────────────
 # 实测踩到的坑：
@@ -521,7 +222,7 @@ else
 
     if [ "${HERMES_WEB_TYPECHECK:-0}" = "1" ]; then
         echo "[build] 前端构建（上游完整入口，含 TypeScript 类型检查，较慢）"
-        ( cd "${SRC}" && "${PYBIN}" -c "
+        ( cd "${SRC}" && "${STAMP_PY}" -c "
 from pathlib import Path
 from hermes_cli.main_web_build import _build_web_ui
 import sys
@@ -545,56 +246,14 @@ fi
 # 前端按 base=/app/hermes/ 构建，而 dashboard 只挂 /assets；经飞牛网关时代理会剥前缀，
 # 直连时不会 → 命中 SPA 兜底路由、以 text/html 返回 → module 脚本被 MIME 拒绝 → 白屏
 # （2026-11-02 实机报告）。给前缀建一个指向自身的软链即可。
-# ⚠ 打包与运行期都要有：cmd/main 启动时、hermes-update.py 重建后都会再补一次（幂等）。
+# ⚠ 打包与运行期都要有：cmd/main 启动时补一次（幂等）。
 mkdir -p "${RT}/web_dist/app"
 ln -sfn .. "${RT}/web_dist/app/hermes"
 echo "[build] web_dist ✓ ($(du -sh "${RT}/web_dist" | cut -f1))，已建 /app/hermes 前缀别名"
 
-# 把前端构建脚本随包分发 —— 在线更新（hermes-update.py）重建 web_dist 时
-# 必须用它，否则会走上游 npm run build（不带 base 注入）→ 前缀丢失 → 黑屏。
+# 把前端构建脚本随包分发 —— 在线更新重建 web_dist 时需要它注入 /app/hermes 前缀，
+# 否则会走上游 npm run build（不带 base）→ 前缀丢失 → 白屏。
 cp "${HERE}/web-build.mjs" "${RT}/web-build.mjs"
-
-# ── 4b. TUI bundle（对话页底部终端依赖它）────────────────────
-# 上游 main_tui_launch 按序查找 entry.js：
-#   $HERMES_TUI_DIR/dist/entry.js → hermes_cli/tui_dist/entry.js → <repo>/ui-tui/dist/entry.js
-# 缺它则对话页终端是黑框（实测报告缺陷 3）。官方 trim.hermes 自带该文件。
-# 这里用上游 scripts/build/tui.mjs（esbuild）构建，产出落到 hermes_cli/tui_dist/。
-if [ "${SKIP_TUI:-0}" = "1" ] && [ -f "${SRC}/hermes_cli/tui_dist/entry.js" ]; then
-    echo "[build] --skip-tui：复用已有 tui_dist"
-else
-    # TUI 构建入口随上游布局而变：
-    #   canary/main → scripts/build/tui.mjs（自定义，--source/--out 参数）
-    #   stable      → ui-tui/scripts/build.mjs（在工作区内构建到 ui-tui/dist）
-    mkdir -p "${SRC}/hermes_cli/tui_dist"
-    if [ -f "${SRC}/scripts/build/tui.mjs" ]; then
-        echo "[build] 构建 TUI bundle（scripts/build/tui.mjs）"
-        TUI_OUT="${PKG_DIR}/.cache/tui-out"
-        rm -rf "${TUI_OUT}"
-        ( cd "${SRC}" && node scripts/build/tui.mjs --source "${SRC}" \
-            --out "${TUI_OUT}" ) \
-          || { echo "✗ TUI 构建失败"; exit 1; }
-        if [ -f "${TUI_OUT}/dist/entry.js" ]; then
-            cp "${TUI_OUT}/dist/entry.js" "${SRC}/hermes_cli/tui_dist/entry.js"
-        fi
-    elif [ -f "${SRC}/ui-tui/scripts/build.mjs" ]; then
-        echo "[build] 构建 TUI bundle（ui-tui/scripts/build.mjs）"
-        ( cd "${SRC}/ui-tui" && node scripts/build.mjs ) \
-          || echo "⚠ TUI 构建失败（不阻断，对话页终端将不可用）"
-    else
-        echo "⚠ 上游无 TUI 构建脚本，跳过（对话页终端将不可用）"
-    fi
-    # 兜底：把 ui-tui/dist/entry.js 复制到 hermes_cli/tui_dist/（上游查找位置之一）
-    if [ ! -f "${SRC}/hermes_cli/tui_dist/entry.js" ] && [ -f "${SRC}/ui-tui/dist/entry.js" ]; then
-        cp "${SRC}/ui-tui/dist/entry.js" "${SRC}/hermes_cli/tui_dist/entry.js"
-    fi
-fi
-if [ -f "${SRC}/hermes_cli/tui_dist/entry.js" ]; then
-    mkdir -p "${RT}/hermes/hermes_cli/tui_dist"
-    cp "${SRC}/hermes_cli/tui_dist/entry.js" "${RT}/hermes/hermes_cli/tui_dist/entry.js"
-    echo "[build] tui_dist ✓ ($(du -h "${RT}/hermes/hermes_cli/tui_dist/entry.js" | cut -f1))"
-else
-    echo "⚠ 未产出 tui_dist/entry.js —— 对话页终端将不可用"
-fi
 
 # ── 5. 桌面入口 + 网关代理（ui 必须在 app/ 内）───────────────
 mkdir -p "${APP_DIR}/ui/images"
@@ -605,23 +264,13 @@ cp "${PKG_DIR}/ui-images/icon_256.png" "${APP_DIR}/ui/images/icon_256.png"
 cp "${HERE}/gateway-proxy.py" "${APP_DIR}/gateway-proxy.py"
 # .env 读写助手（cmd/main 与 cmd/*_callback 共用，保证与 python-dotenv 逐字节一致）
 cp "${HERE}/envfile.sh" "${APP_DIR}/envfile.sh"
-# 在线更新引擎
-cp "${HERE}/hermes-update.py" "${APP_DIR}/hermes-update.py"
-# CLI 包装：usr-local-linker 会把 app/bin/hermes-update 链接进 PATH，
-# 于是 SSH 里可直接 `hermes-update check|apply`。
-mkdir -p "${APP_DIR}/bin"
-cat > "${APP_DIR}/bin/hermes-update" <<'WRAP'
-#!/bin/bash
-# Hermes 在线更新 CLI（fnOS）。转发到 hermes-update.py。
-APP_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-DATA="${TRIM_PKGVAR:-/var/apps/hermes/var}"
-# 解释器优先级：系统 Python 模式（NAS 上建的 venv）→ 自带 CPython → PATH
-PY="${DATA}/venv/bin/python3"
-[ -x "${PY}" ] || PY="${APP_DIR}/runtime/python/bin/python3"
-[ -x "${PY}" ] || PY="$(command -v python3)"
-exec env HERMES_APP_ROOT="${APP_DIR}" HERMES_DATA_ROOT="${DATA}" "${PY}" "${APP_DIR}/hermes-update.py" "$@"
-WRAP
-chmod 755 "${APP_DIR}/bin/hermes-update"
+# 运行期安装脚本（uv → 源码 → PM 建 venv 装依赖）
+mkdir -p "${APP_DIR}/scripts"
+cp "${HERE}/install-runtime.sh" "${APP_DIR}/scripts/install-runtime.sh"
+chmod 755 "${APP_DIR}/scripts/install-runtime.sh"
+# 注：不再提供 bin/hermes-update。源码在数据目录且带 .git，
+# 直接用上游 `hermes update`（CLI 入口在 bin/hermes）。
+
 # hermes CLI：usr-local-linker 会把 app/bin/hermes 链接进 PATH，
 # 于是 SSH 里可直接 `hermes doctor` / `hermes setup` / `hermes model` …
 # 不加它，doctor 输出里的所有「run 'hermes …'」建议都不可执行（command not found）。
@@ -630,12 +279,13 @@ chmod 755 "${APP_DIR}/bin/hermes-update"
 #   裸 SSH 会话里没有 fnOS 注入的 TRIM_* 变量 —— 尤其工作区，若不单独探
 #   /vol*/@appshare/hermes/workspace，HERMES_WRITE_SAFE_ROOT 会错算成
 #   ${DATA}/workspace，让 CLI 的写安全边界指到错误目录（真机实测发现）。
+mkdir -p "${APP_DIR}/bin"
 cat > "${APP_DIR}/bin/hermes" <<'WRAP'
 #!/bin/bash
 # Hermes CLI —— fnOS 打包版。
 # 目的：让 `hermes <子命令>`（doctor/setup/skills/status/cron/tools/auth/mcp…）可用。
 # 上游 install.sh 靠 venv console script 生成该入口；本包是「自带 CPython +
-# python -m hermes_cli.main」，没有 venv，故补上。机制同 bin/hermes-update
+# python -m hermes_cli.main」。机制同 usr-local-linker 的其它入口
 # （fnOS 把 fpk 的 bin/ 里每个文件软链到 /usr/local/bin）。
 # 路径/解释器/node/工作区解析逐条对齐 cmd/main → 跨卷、跨 node 版本、
 # 跨「系统 Python ↔ 自带 CPython」模式切换都成立。
@@ -660,9 +310,9 @@ else
     DATA_DIR="${APP_DIR}/../var"
 fi
 
-SRC_DIR="${APP_DIR}/runtime/hermes"
+# 新布局：源码在数据目录（git clone 自带 .git，支持 hermes update）
+SRC_DIR="${DATA_DIR}/src"
 WEB_DIST="${APP_DIR}/runtime/web_dist"
-LAZY_SITE="${DATA_DIR}/site-packages"
 
 # 工作区：与 cmd/main 的 resolve_workspace() 同逻辑
 WS=""
@@ -686,10 +336,17 @@ if [ -z "${WS}" ]; then
 fi
 [ -n "${WS}" ] || WS="${DATA_DIR}/workspace"
 
-# 解释器：系统 Python 模式（NAS 上建的 venv）→ 包内自带 CPython → PATH
-PY="${DATA_DIR}/venv/bin/python3"
-[ -x "${PY}" ] || PY="${APP_DIR}/runtime/python/bin/python3"
-[ -x "${PY}" ] || PY="$(command -v python3)"
+_py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+# 解释器：PM 管理的 venv（从 facts.json 读当前 generation）→ PATH 兜底
+PY=""
+if [ -d "${DATA_DIR}/installs" ]; then
+    _facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
+    if [ -n "${_facts}" ] && [ -n "${_py}" ]; then
+        _venv="$("${_py}" -c "import json,sys;d=json.load(open(sys.argv[1],encoding='utf-8-sig'));print(((d.get('packages') or {}).get('venv') or {}).get('environment') or '')" "${_facts}" 2>/dev/null)"
+        [ -n "${_venv}" ] && [ -x "${_venv}/bin/python3" ] && PY="${_venv}/bin/python3"
+    fi
+fi
+[ -n "${PY}" ] || PY="$(command -v python3)"
 
 # node：与 cmd/main 的 find_node_bin() 同逻辑（TUI 终端要用）。
 # ⚠ 按【版本】分层（v24 → v22），每档覆盖 /var/apps 与跨卷 @appcenter 两种形态；
@@ -765,7 +422,7 @@ _err="$(mktemp 2>/dev/null || echo "${DATA_DIR}/.hermes-shim-err.$$")"
 trap 'rm -f "${_err}"' EXIT
 env \
     HOME="${DATA_DIR}" \
-    PYTHONPATH="${SRC_DIR}:${LAZY_SITE}" \
+    PYTHONPATH="${SRC_DIR}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HERMES_HOME="${DATA_DIR}" \
@@ -829,13 +486,15 @@ if grep -rn -e '{port}' -e '{display_name}' "${APP_DIR}/ui" > /dev/null 2>&1; th
     echo "✗ ui/ 里仍有 {port} / {display_name} 占位符 → 桌面图标会点了没反应"
     exit 1
 fi
-if [ "${HERMES_USE_SYSTEM_PYTHON:-0}" = "1" ]; then
-    [ -f "${RT}/.use-system-python" ] || { echo "✗ 系统 Python 模式缺标记文件"; exit 1; }
-    [ -f "${RT}/deps.txt" ] || { echo "✗ 系统 Python 模式缺依赖清单 runtime/deps.txt"; exit 1; }
-else
-    [ -d "${RT}/python/lib" ] || { echo "✗ 缺 Python 标准库目录"; exit 1; }
-fi
-[ -f "${RT}/deps.txt" ] || { echo "✗ 缺依赖清单 runtime/deps.txt"; exit 1; }
+# 运行期不再预置：不应出现 python/ 或源码树
+[ -d "${RT}/python" ] && { echo "✗ 仍打包了 runtime/python（本版应在安装期获取）"; exit 1; }
+[ -d "${RT}/hermes" ] && { echo "✗ 仍打包了源码树（本版应在安装期 clone）"; exit 1; }
+[ -f "${RT}/deps.txt" ] && { echo "✗ 仍打包了 deps.txt（本版应在安装期由 PM 解析）"; exit 1; }
+# 必须有的安装期组件
+[ -f "${APP_DIR}/scripts/install-runtime.sh" ] || { echo "✗ 缺 scripts/install-runtime.sh"; exit 1; }
+[ -f "${APP_DIR}/upstream-ref" ] || { echo "✗ 缺 upstream-ref"; exit 1; }
+[ -f "${RT}/install-stamp.json" ] || { echo "✗ 缺 install-stamp.json"; exit 1; }
+[ -f "${RT}/web_dist/index.html" ] || { echo "✗ 缺预构建前端 web_dist/index.html"; exit 1; }
 
 # ── 7. manifest / cmd / config / wizard ─────────────────────
 echo "[build] 写 manifest"
@@ -856,12 +515,12 @@ chmod 755 "${STAGE}/cmd/"*
 find "${STAGE}" -type d -exec chmod 755 {} \; 2>/dev/null || true
 
 
-# config/resource 里 usr-local-linker 列了 bin/hermes、bin/hermes-update、bin/rg。
+# config/resource 里 usr-local-linker 列了 bin/hermes 与 bin/rg。
 # rg 是可选下载（见步骤 5），失败时它不在 app 里 —— 此时把 "bin/rg" 从 resource
-# 摘掉，避免 linker 指向不存在的文件。hermes/hermes-update 恒存在，不动。
+# 摘掉，避免 linker 指向不存在的文件。bin/hermes 恒存在，不动。
 # python3 在构建机必然可用（build.sh 前置就用它抽 deps.txt/写 stamp）。
 if [ ! -f "${APP_DIR}/bin/rg" ] && grep -q '"bin/rg"' "${STAGE}/config/resource"; then
-    "${PYBIN}" - "${STAGE}/config/resource" <<'PY'
+    "${STAMP_PY}" - "${STAGE}/config/resource" <<'PY'
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p, encoding="utf-8"))
