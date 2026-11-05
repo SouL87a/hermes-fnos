@@ -243,10 +243,21 @@ print(d['packages']['python']['version'])" "${SRC}/pm/lock.json" 2>/dev/null || 
                --extra wake-openwakeword --extra uvloop)
     ( cd "${SRC}" && uv "${UV_EXPORT[@]}" -o "${RT}/requirements.lock" ) \
         || { echo "✗ uv export 失败"; exit 1; }
-    echo "[build]   下载 wheelhouse…"
-    ( cd "${SRC}" && uv pip download -r "${RT}/requirements.lock" \
-        -d "${RT}/wheelhouse" ${HERMES_PIP_INDEX:+--index-url "${HERMES_PIP_INDEX}"} ) \
-        || { echo "✗ wheelhouse 下载失败"; exit 1; }
+    echo "[build]   下载 wheelhouse（pip download，用构建机 python3 的 pip）…"
+    # ⚠ uv 没有 `pip download` 子命令（实测 0.13.5：unrecognized subcommand）。
+    #   用标准 pip download：构建机 python3 自带 pip，语义一致
+    #   （-r 需求清单 → 下载 wheel 到目录）。指定 cp314/linux 平台，
+    #   避免拉到源码包或其它平台的 wheel。
+    PIP_ARGS=(download
+        -r "${RT}/requirements.lock"
+        -d "${RT}/wheelhouse"
+        --only-binary :all:
+        --python-version 3.14
+        --platform manylinux2014_x86_64
+        --implementation cp
+        --abi cp314)
+    [ -n "${HERMES_PIP_INDEX:-}" ] && PIP_ARGS+=(--index-url "${HERMES_PIP_INDEX}")
+    "${STAMP_PY}" -m pip "${PIP_ARGS[@]}" >> "${LOG}" 2>&1         || { echo "✗ wheelhouse 下载失败（详见构建日志）"; exit 1; }
     echo "[build]   wheelhouse ✓ ($(ls "${RT}/wheelhouse" | wc -l) 个, $(du -sh "${RT}/wheelhouse" | cut -f1))"
 fi
 
