@@ -94,6 +94,25 @@ hermes update            # 应用更新（git 拉取 + PM 同步依赖）
 
 安装失败时，可到「应用设置」补代理后重启应用重试；启动流程会检测环境缺失并自动补齐。
 
+**排障：升级时提示 `Git executable not found`**
+
+上游 `pm/workspace.py` 会剥掉 `[tool.uv] exclude-newer`，导致 uv 认为 lock 过期并重新做
+universal 解析 —— 该解析必须读取 Android 专用的 `psutil @ git+…` 依赖，因此**需要系统 git**。
+
+本包已在 `pm install` 前把 `/usr/local/bin:/usr/bin:/bin` 显式拼进 PATH，正常情况下不会遇到。
+若仍报此错，检查 `log/install-runtime.log` 里的 `PATH(交给 pm)=` 与 `git=` 两行。
+
+**排障：安装中断后残留**
+
+失败可能留下 `<数据目录>/installs/<key>/`（有 `facts.json` 但 `environments/` 为空）。
+本包会自动跳过这类残留，但可手工清理：
+
+```bash
+# 先确认哪个是当前在用的（有可执行 venv 的那个）
+ls -d /vol1/@appdata/hermes/installs/*/environments/*/venv/bin/python3 2>/dev/null
+# 删除没有 venv 的残留目录
+```
+
 ### 关于 Python 与 SQLite
 
 Python 版本由上游 `pm/lock.json` 决定（v0.22.5 为 3.14.9），不写死在本仓库。上游发新版时自动跟随。
