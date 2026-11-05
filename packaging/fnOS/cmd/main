@@ -398,6 +398,17 @@ GATEWAY_WANT_FILE="${TRIM_PKGVAR}/gateway.want"   # 存在=期望运行；删除
 ### gateway_want 存在 → 持续拉起；被删除 → 循环退出（用于正常停止）。
 gateway_supervisor_loop() {
     local ws="$1"
+    ### ⚠ 本函数以【独立进程】运行（cmd/main __gateway_supervisor），
+    ### 顶部定义的 PY 是空字符串 —— 必须在循环体内自行解析，否则
+    ### gateway 的 exec env 会拿到空解释器路径。
+    ### 这也解释了为什么网关重启路径此前依赖调用方先解析 PY：不可靠。
+    PY="$(pm_venv_python)"
+    if [ -z "${PY}" ] || [ ! -x "${PY}" ]; then
+        log_msg "supervisor: 拿不到 PM venv 解释器，退出"
+        return 1
+    fi
+    PATTERN="${PY} -m ${MODULE}"
+
     ### node 环境不靠参数传递：runuser 分支只传了 ws，参数化会在那条路径上丢失。
     ### 循环体自行用 node_env() 解析（HERMES_NODE + PATH，见其说明）。
     local gw_node="" _ne
