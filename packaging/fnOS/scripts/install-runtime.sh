@@ -217,8 +217,12 @@ install_source() {
                 || die "本地修改既无法 stash 也无法还原，请手工处理 ${SRC}"
             log "⚠ 检测到本地修改，已备份到 ${pbak} 并暂存（升级后请重打本地补丁）"
         fi
-        if git -C "${SRC}" fetch --depth 1 origin "refs/tags/${HERMES_REF}" >> "${LOG}" 2>&1 \
-           && git -C "${SRC}" checkout --detach "FETCH_HEAD" >> "${LOG}" 2>&1; then
+        # ⚠ fetch 必须带目标 refspec（refs/tags/X:refs/tags/X）：
+        #   只写 refs/tags/X 的话 git 只更新 FETCH_HEAD，不落地 refs/tags/X
+        #   → checkout 后 git describe --tags 失败 → 版本串退化成 git.<sha> →
+        #   面板显示 vunknown（实机 P5，2026-11-05）。
+        if git -C "${SRC}" fetch --depth 1 origin "refs/tags/${HERMES_REF}:refs/tags/${HERMES_REF}" >> "${LOG}" 2>&1 \
+           && git -C "${SRC}" checkout --detach "refs/tags/${HERMES_REF}" >> "${LOG}" 2>&1; then
             log "✓ 源码已切换到 ${HERMES_REF} ($(git -C "${SRC}" rev-parse --short HEAD))"
             # 自动重打本地补丁（报告建议 C）：脚本对跨版本冲突的处理是
             # 「冲突就报冲突、不强打」，用户能拿到明确清单。

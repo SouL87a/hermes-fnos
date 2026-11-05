@@ -869,7 +869,11 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         # 的按钮接到上游 update（git 拉取 + PM 同步依赖），体验才连贯。
         _base_path = up_path.split("?")[0]
         if _base_path in ("/api/hermes/update", "/api/hermes/update/check"):
-            await handle_native_update_proxy(method, _base_path, headers, client_writer, from_root)
+            # ⚠ 必须传完整 up_path（含 ?force=true）：前端用 query 区分
+            #   首屏静默查 vs 按钮强制查。剥掉 query 会让按钮分支误判为
+            #   非强制 → 无缓存时返回「未检查更新」（网关入口失效、直连正常，
+            #   实机 2026-11-05）。
+            await handle_native_update_proxy(method, up_path, headers, client_writer, from_root)
             return
 
         # 接管 dashboard 的网关启停按钮（restart / start / stop）。

@@ -252,10 +252,11 @@ jobs:
           NOTES="$(mktemp)"
           PREV_TAG="$(git tag --list 'v*' --sort=-v:refname | grep -vx "${TAG}" | head -n 1 || true)"
           if [ -n "${PREV_TAG}" ]; then
-            CHANGES="$(git log --no-merges --pretty=format:'- %s (%h)' "${PREV_TAG}..HEAD")"
-            CHANGE_HEADER="自 \`${PREV_TAG}\` 以来："
+            # 只取 commit 标题第一行、去掉常规前缀（修 xxx：/CI：等），限量 8 条
+            CHANGES="$(git log --no-merges --pretty=format:'%s' "${PREV_TAG}..HEAD"               | sed -E 's/^[^：:]{1,12}[：:] //' | head -n 8               | sed 's/^/- /')"
+            CHANGE_HEADER="自 \`${PREV_TAG}\` 以来（共 $(git rev-list --count "${PREV_TAG}..HEAD") 个提交，节选）："
           else
-            CHANGES="$(git log --no-merges --pretty=format:'- %s (%h)' -n 10)"
+            CHANGES="$(git log --no-merges --pretty=format:'- %s (%h)' -n 5)"
             CHANGE_HEADER="最近提交："
           fi
           [ -n "${CHANGES}" ] || CHANGES="- （无 commit 说明）"
@@ -263,16 +264,17 @@ jobs:
           ## Hermes Agent ${VERSION} · 飞牛 fnOS 原生版
 
           - 上游 ref: \`${UPSTREAM_REF}\`
-          - 内置运行时: CPython 3.14（python-build-standalone，自带 SQLite 3.53.1）
+          - 运行环境: 安装期由上游 PM 创建真实 venv（Python 版本跟随上游 pm/lock.json）
           - 构建: Actions run ${GITHUB_RUN_ID}
           - \`${BASENAME}\` sha256: \`${SUM}\`
 
           ### 安装
-          应用中心 → 手动安装 → 选择 \`${BASENAME}\`。桌面图标走飞牛统一网关，无需令牌。
+          应用中心 → 手动安装 → 选择 \`${BASENAME}\`。**首次安装需联网**下载源码与依赖
+          （约 900 MB；网络受限请在向导里填代理），耗时 1–5 分钟。
 
           ### 在线更新
-          安装后可在 dashboard 内（\`/app/hermes/__hermes/update/ui\`）或 SSH 里
-          \`hermes-update check|apply\` 更新到上游新版本。
+          安装后可用上游原生 \`hermes update\` 跟随上游新版本（源码带 .git），
+          dashboard「系统」页或 SSH 均可。
 
           ### 变更
           ${CHANGE_HEADER}
