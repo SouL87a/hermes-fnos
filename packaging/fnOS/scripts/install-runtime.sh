@@ -405,11 +405,38 @@ PY
     return 0
 }
 
-if [ "${MODE}" != "--force" ] && pm_env_ok && [ -d "${SRC}/hermes_cli" ]; then
+if [ "${MODE}" != "--force" ] && pm_env_ok; then
     log "✓ 运行期已就绪（PM 环境 + 源码），跳过安装"
     log "=== 完成 $(date -Is)（幂等跳过）==="
     exit 0
 fi
+
+### 归档「不属于当前源码」的旧 PM 环境。
+### 为什么放在这里而不是 upgrade_callback：安装失败会中止升级流程，
+### upgrade_callback 根本不会被调用（实机 2026-11-05 的 upgrade.log 只有
+### upgrade_init，没有 upgrade_callback），旧环境就一直留着。
+### 放在真正执行安装的脚本里，无论从哪条路径进来都能收敛。
+archive_stale_envs() {
+    [ -d "${DATA_DIR}/installs" ] || return 0
+    local want_key
+    want_key="$( (command -v python3 >/dev/null 2>&1 && python3 -c         "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])" "${SRC}") 2>/dev/null || true)"
+    [ -n "${want_key}" ] || { log "⚠ 无法计算 install key，跳过旧环境归档"; return 0; }
+    local arch="${DATA_DIR}/installs.archived-$(date +%Y%m%d-%H%M%S)" moved=0 d name
+    for d in "${DATA_DIR}/installs"/*/; do
+        [ -d "${d}" ] || continue
+        name="$(basename "${d%/}")"
+        case "${name}" in
+            *.disabled-*) continue ;;      # 历史归档，不动
+            "${want_key}") continue ;;     # 当前 key，保留
+        esac
+        mkdir -p "${arch}" 2>/dev/null || true
+        if mv "${d%/}" "${arch}/${name}" 2>/dev/null; then moved=$((moved + 1)); fi
+    done
+    if [ "${moved}" -gt 0 ]; then
+        log "已归档 ${moved} 个旧 PM 环境 → ${arch}（当前 key=${want_key}）"
+    fi
+}
+archive_stale_envs
 
 ensure_uv
 install_source
