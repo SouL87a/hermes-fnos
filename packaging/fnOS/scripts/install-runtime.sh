@@ -301,9 +301,28 @@ PY
     for e in ${extras}; do args+=(--extra "$e"); done
 
     log "执行 pm ${args[*]}…"
+    # ⚠ 关键：显式把系统目录放进 PATH。
+    #
+    # 实机 2026-11-05 定位：安装回调由 appcenter 拉起，PATH 可能与运行期
+    # 进程不同（可能缺 /usr/bin）。而 pm/workspace.py 会剥掉
+    # [tool.uv] exclude-newer → uv 判定 lock 过期 → 重新做 universal 解析
+    # → 必须拉 android 专用的 psutil git 依赖 → 需要 git。
+    # git 不在 PATH 里时的报错是「Git executable not found」，与线上逐字一致。
+    #
+    # 这里保证 /usr/local/bin:/usr/bin:/bin 一定在 PATH 前部（系统 git/node 在这）。
+    local syspath="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    local curpath="${PATH:-}"
+    case ":${curpath}:" in
+        *":/usr/bin:"*) : ;;                      # 已有，不重复加
+        *) curpath="${syspath}${curpath:+:${curpath}}" ;;
+    esac
+    log "PATH(交给 pm)=${curpath}"
+    log "git=$(command -v git 2>/dev/null || echo '<未找到>')"
+
     # 用数组传环境变量，避免 URL 含空格时被分词
     local -a envs=(
         "HOME=${DATA_DIR}"
+        "PATH=${curpath}"
         "UV_CACHE_DIR=${DATA_DIR}/.uv-cache"
         "UV_PYTHON_INSTALL_DIR=${DATA_DIR}/pythons"
         "PYTHONPATH=${SRC}"
