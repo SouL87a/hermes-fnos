@@ -64,10 +64,33 @@ mkdir -p "${TRIM_PKGVAR}/log" "${TRIM_PKGVAR}/workspace" "${TRIM_PKGVAR}/state"
 ### 已存在（用户装过额外 feature）时不覆盖，但要补齐我们构建时带的基础项 ——
 ### 旧版本包从未写过该文件，升级上来的用户正是靠这一步拿到基线。
 FEATURES_FILE="${TRIM_PKGVAR}/enabled-features.json"
-FEATURES_BASE='messaging web'
+# 基线 extras：
+#   web + messaging   基础（dashboard 服务端 + 消息平台适配器）
+#   mcp               MCP 客户端。缺它 MCP 服务器全部连不上（实机 2026-11-05：
+#                     思源/rea 等 0 个可连，errors.log 每 60s 刷 discovery 失败）
+#   仅占 ~0.5 MB，没有理由砍掉
+#   computer-use      电脑操作（含 mcp）
+#   vercel            Vercel 部署工具
+#   wake-openwakeword 唤醒词（轻量版，仅 pyopen-wakeword）
+# ⚠ 不加 `wake`（25.7 MB，含 sherpa/porcupine/sounddevice）；需要的人可自行 pm install
+FEATURES_BASE='messaging web mcp computer-use vercel wake-openwakeword'
 if [ ! -f "${FEATURES_FILE}" ]; then
-    printf '{\n  "schema": 1,\n  "extras": [\n    "messaging",\n    "web"\n  ]\n}\n' > "${FEATURES_FILE}" 2>/dev/null || true
-    echo "  PM 功能基线：已写入 ${FEATURES_FILE}（web + messaging）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+    # ⚠ 必须用 FEATURES_BASE 生成，不能硬编码 —— 两处不一致会悄悄砍掉功能
+    #   （实机 2026-11-05：这里写死 web+messaging，导致 MCP 全挂）。
+    {
+        echo '{'
+        echo '  "schema": 1,'
+        echo '  "extras": ['
+        _first=1
+        for _e in ${FEATURES_BASE}; do
+            if [ "${_first}" = "1" ]; then _first=0; else echo ','; fi
+            printf '    "%s"' "${_e}"
+        done
+        echo ''
+        echo '  ]'
+        echo '}'
+    } > "${FEATURES_FILE}" 2>/dev/null || true
+    echo "  PM 功能基线：已写入 ${FEATURES_FILE}（${FEATURES_BASE}）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
 else
     # 读取现有 extras 与基础项取并集（保留用户额外装的）。
     # ⚠ 此刻运行期还没装完（无 Python 可用），只能用系统 python3 做 JSON 操作；

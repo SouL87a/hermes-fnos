@@ -379,30 +379,50 @@ log "=== install-runtime $(date -Is) mode=${MODE} ==="
 ###   只判断「有 venv」会命中旧环境 → 幂等跳过 → 新源码下无法运行。
 pm_env_ok() {
     [ -d "${SRC}/hermes_cli" ] || return 1
+    local boot=""
+    boot="$(command -v python3 2>/dev/null)" || return 1
     local want_key
-    want_key="$( (command -v python3 >/dev/null 2>&1 && python3 -c \
-        "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])" "${SRC}") 2>/dev/null || true)"
+    want_key="$("${boot}" -c \
+        "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])" "${SRC}" 2>/dev/null || true)"
     [ -n "${want_key}" ] || return 1
 
     local facts="${DATA_DIR}/installs/${want_key}/facts.json"
     [ -f "${facts}" ] || return 1
 
-    local boot
-    boot="$(command -v python3 2>/dev/null)" || return 1
-    local venv
-    venv="$("${boot}" - "${facts}" <<'PY' 2>/dev/null
+    # 要求 extras 覆盖 enabled-features.json 的基线，否则视为需重装。
+    # ⚠ 这条必须有：实机 2026-11-05 升级时只查了「venv 可用」→ 跳过安装
+    #   → 基线从 computer-use/wake 收窄成 web+messaging 后，MCP 等模块从此缺失，
+    #   而幂等检查永远认为「已就绪」，再也不会补装。
+    local feat="${DATA_DIR}/enabled-features.json"
+    "${boot}" - "${facts}" "${feat}" <<'PY' 2>/dev/null
 import json, sys
+from pathlib import Path
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
 except (OSError, ValueError):
-    raise SystemExit(0)
+    raise SystemExit(1)
 env = ((d.get("packages") or {}).get("venv") or {}).get("environment")
-print(env if isinstance(env, str) else "")
+if not isinstance(env, str) or not env:
+    raise SystemExit(1)
+if not (Path(env) / "bin" / "python3").is_file():
+    raise SystemExit(1)
+have = {str(e).lower() for e in (((d.get("packages") or {}).get("venv") or {}).get("extras") or [])}
+if "all" in have:
+    raise SystemExit(0)
+want = set()
+try:
+    feat = json.load(open(sys.argv[2], encoding="utf-8-sig"))
+    if isinstance(feat.get("extras"), list):
+        want = {str(e).lower() for e in feat["extras"] if str(e).strip()}
+except (OSError, ValueError, AttributeError):
+    pass
+missing = want - have
+if missing:
+    print("missing extras: " + ",".join(sorted(missing)), file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(0)
 PY
-)"
-    [ -n "${venv}" ] && [ -x "${venv}/bin/python3" ] || return 1
-    "${venv}/bin/python3" -c "import fastapi, aiohttp" 2>/dev/null || return 1
-    return 0
+    return $?
 }
 
 if [ "${MODE}" != "--force" ] && pm_env_ok; then
