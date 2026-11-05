@@ -406,7 +406,7 @@ fi
 #   v22 档校验 engines 下限（^22.22.0，应用中心的 22.18.0 会被跳过）。
 #   <data>/node 是 Hermes 按需下载的托管 node（通常过时），只作兜底。
 NODE=""
-for _mj in 24 22; do
+for _mj in 26 24 22; do
     [ -n "${NODE}" ] && break
     for d in /var/apps/nodejs_v${_mj}/target/bin/node \
              /var/apps/nodejs_v${_mj}/bin/node \

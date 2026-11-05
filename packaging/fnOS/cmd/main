@@ -311,7 +311,7 @@ port_owner() {
 ###   版本随上游 lock 变化且通常过时；放首位会让"v24 优先"形同虚设。
 find_node_bin() {
     local d mj ver
-    for mj in 24 22; do
+    for mj in 26 24 22; do
         for d in /var/apps/nodejs_v${mj}/target/bin/node \
                  /var/apps/nodejs_v${mj}/bin/node \
                  /vol*/@appcenter/nodejs_v${mj}/bin/node; do

@@ -18,5 +18,5 @@ gatewaySocket         = hermes.sock
 service_port          = 9119
 checkport             = true
 ctl_stop              = true
-install_dep_apps      = nodejs_v24
+install_dep_apps      = nodejs_v26
 changelog             = 改为与官方一致的安装方式：安装时拉取上游源码并由 Hermes 自带的包管理器创建虚拟环境，不再预置运行时，也不再需要为本包打补丁；源码保留 .git，支持应用内 hermes update 跟随官方版本。
