@@ -13,4 +13,4 @@
 # 上游发新 stable 后改这一行即可 —— build.sh 会自动改 fpk 版本号与 stamp，
 # 在线的「检查更新」按 stable 通道跟随（见 hermes-update.py 的 channel）：
 # 它优先走 GitHub Releases API（按发布时间倒序），不依赖 tag 命名规则。
-v0.22.5
+v0.22.7

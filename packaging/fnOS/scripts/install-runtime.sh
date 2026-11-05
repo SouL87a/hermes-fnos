@@ -256,6 +256,21 @@ bootstrap_python() {
         log "✓ 复用已有 Python: ${py}"
     elif py="$("${UV}" python find --system --no-project "${pyver}" 2>>"${LOG}")"; then
         log "✓ 使用系统 Python: ${py}"
+    elif [ -f "${APP_DIR}/runtime/python.tar.gz" ]; then
+        # 档位 B：包内预置了 Python 压缩包 → 解压到 uv 的 managed 目录，跳过下载。
+        # ⚠ 目录布局必须与 `uv python install` 一致：
+        #   <UV_PYTHON_INSTALL_DIR>/cpython-<ver>-<triple>/bin/python3.x
+        log "解压预置 Python ${pyver}…"
+        local pydir="${DATA_DIR}/pythons/cpython-${pyver}-x86_64-unknown-linux-gnu"
+        if [ "$(uname -m)" = "aarch64" ]; then
+            pydir="${DATA_DIR}/pythons/cpython-${pyver}-aarch64-unknown-linux-gnu"
+        fi
+        mkdir -p "${pydir}"
+        tar -xzf "${APP_DIR}/runtime/python.tar.gz" -C "${pydir}" --strip-components=1 \
+            || die "预置 Python 解压失败"
+        py="$(UV_SYSTEM_PYTHON=1 UV_NO_PROJECT=1 UV_PYTHON_INSTALL_DIR="${DATA_DIR}/pythons" \
+              "${UV}" python find --managed-python "${pyver}")" || die "预置 Python 未被 uv 识别"
+        log "✓ 使用预置 Python: ${py}"
     else
         log "下载 Python ${pyver}…"
         UV_PYTHON_INSTALL_DIR="${DATA_DIR}/pythons" \
@@ -334,6 +349,15 @@ PY
         envs+=("UV_INDEX_URL=${HERMES_PYPI_INDEX}")
     fi
     log "PyPI 源: ${HERMES_PYPI_INDEX:-默认}"
+
+    # 档位 B：包内预置了 wheelhouse → uv 优先从本地取 wheel（找不到才联网）。
+    # ⚠ 这只加速「装包」；universal 解析仍可能需要 git（拉 android 的 psutil 元数据）。
+    #   用 find-links 而不是 --no-index：lock 里若有 wheelhouse 没有的包（如新插件依赖），
+    #   还能回落到网络，不至于直接失败。
+    if [ -d "${APP_DIR}/runtime/wheelhouse" ]; then
+        envs+=("UV_FIND_LINKS=${APP_DIR}/runtime/wheelhouse")
+        log "预置 wheelhouse: ${APP_DIR}/runtime/wheelhouse ($(ls "${APP_DIR}/runtime/wheelhouse" | wc -l) 个)"
+    fi
     (
         cd "${SRC}" || exit 1
         env "${envs[@]}" "${BOOT_PY}" -m pm.cli "${args[@]}"

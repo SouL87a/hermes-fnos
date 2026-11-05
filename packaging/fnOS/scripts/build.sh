@@ -36,10 +36,12 @@ RT="${APP_DIR}/runtime"                             # python/ + hermes/ + web_di
 # ── 参数 ─────────────────────────────────────────────────────
 SRC_DIR_ARG=""
 SKIP_WEB=0
+PRESET=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --src)      SRC_DIR_ARG="${2:-}"; shift 2 ;;
         --skip-web) SKIP_WEB=1; shift ;;
+        --preset)   PRESET="${2:-}"; shift 2 ;;   # B = 预置 Python 压缩包 + wheelhouse
         -h|--help)  sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)          echo "未知参数：$1"; exit 1 ;;
     esac
@@ -196,6 +198,57 @@ PY
 [ -f "${STAMP}" ] || { echo "✗ install-stamp.json 生成失败"; exit 1; }
 # 记录上游 ref，安装期 install-runtime.sh 要用它 clone 对应版本
 echo "${UPSTREAM_REF_V:-v0.22.5}" > "${APP_DIR}/upstream-ref"
+
+# ── 3b. 档位 B 预置（--preset B）────────────────────────────
+# 在线版（默认）安装期要下 ~900 MB（uv 16M + 源码 60M + Python 73M + 依赖 venv）。
+# 档位 B 把其中最大的两块打进 fpk：
+#   · Python 压缩包（~73 MB）→ 安装期解压到 <data>/pythons，uv python find 直接命中
+#   · wheelhouse（~50 MB）  → PM 解析后 uv 从本地装 wheel（仍需 git 做 universal 解析）
+# 收益：安装期下载 900 MB → ~60 MB（只剩源码 clone，保留 .git 与 hermes update）
+# 代价：fpk 4 MB → ~130 MB
+if [ "${PRESET}" = "B" ]; then
+    echo "[build] 档位 B：预置 Python 压缩包 + wheelhouse"
+    PY_VERSION="${HERMES_PY_VERSION:-}"
+    PBS_TAG="${HERMES_PBS_TAG:-}"
+    if [ -z "${PY_VERSION}" ] || [ -z "${PBS_TAG}" ]; then
+        # 与 PM 的锁定版本对齐：从源码树的 pm/lock.json 读（如 "3.14.9+20261021"）
+        [ -n "${STAMP_PY}" ] || { echo "✗ 缺 python 用于解析 pm/lock.json"; exit 1; }
+        LOCKED="$("${STAMP_PY}" -c "
+import json,sys
+d=json.load(open(sys.argv[1],encoding='utf-8'))
+print(d['packages']['python']['version'])" "${SRC}/pm/lock.json" 2>/dev/null || true)"
+        [ -n "${LOCKED}" ] || { echo "✗ 无法从 pm/lock.json 读 Python 版本"; exit 1; }
+        PY_VERSION="${PY_VERSION:-${LOCKED%%+*}}"
+        PBS_TAG="${PBS_TAG:-${LOCKED##*+}}"
+    fi
+    echo "[build]   预置 Python ${PY_VERSION}+${PBS_TAG}（与 pm/lock.json 对齐）"
+
+    PBS_TGZ="${PBS_CACHE}/cpython-${PY_VERSION}-${PBS_TRIPLE}.tar.gz"
+    if [ ! -f "${PBS_TGZ}" ]; then
+        PBS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-${PY_VERSION}+${PBS_TAG}-${PBS_TRIPLE}-install_only.tar.gz"
+        PBS_URL="${HERMES_GH_MIRROR:+${HERMES_GH_MIRROR}/}${PBS_URL}"
+        echo "[build]   下载 PBS → ${PBS_URL}"
+        curl -fL --retry 3 -o "${PBS_TGZ}.part" "${PBS_URL}" \
+            && mv "${PBS_TGZ}.part" "${PBS_TGZ}" \
+            || { rm -f "${PBS_TGZ}.part"; echo "✗ PBS 下载失败"; exit 1; }
+    fi
+    cp "${PBS_TGZ}" "${RT}/python.tar.gz"
+    echo "[build]   python.tar.gz ✓ ($(du -h "${RT}/python.tar.gz" | cut -f1))"
+
+    # wheelhouse：从源码树的 uv.lock 导出精确依赖再下载（与 PM 同一解析结果）
+    echo "[build]   导出依赖清单…"
+    "${STAMP_PY}" -c "import uv" 2>/dev/null || need uv
+    UV_EXPORT=(export --frozen --no-hashes --no-dev --extra web --extra messaging
+               --extra mcp --extra computer-use --extra vercel
+               --extra wake-openwakeword --extra uvloop)
+    ( cd "${SRC}" && uv "${UV_EXPORT[@]}" -o "${RT}/requirements.lock" ) \
+        || { echo "✗ uv export 失败"; exit 1; }
+    echo "[build]   下载 wheelhouse…"
+    ( cd "${SRC}" && uv pip download -r "${RT}/requirements.lock" \
+        -d "${RT}/wheelhouse" ${HERMES_PIP_INDEX:+--index-url "${HERMES_PIP_INDEX}"} ) \
+        || { echo "✗ wheelhouse 下载失败"; exit 1; }
+    echo "[build]   wheelhouse ✓ ($(ls "${RT}/wheelhouse" | wc -l) 个, $(du -sh "${RT}/wheelhouse" | cut -f1))"
+fi
 
 # ── 4. 前端预构建（web_dist）────────────────────────────────
 # 实测踩到的坑：
