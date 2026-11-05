@@ -238,7 +238,8 @@ print(d['packages']['python']['version'])" "${SRC}/pm/lock.json" 2>/dev/null || 
     # wheelhouse：从源码树的 uv.lock 导出精确依赖再下载（与 PM 同一解析结果）
     echo "[build]   导出依赖清单…"
     "${STAMP_PY}" -c "import uv" 2>/dev/null || need uv
-    UV_EXPORT=(export --frozen --no-hashes --no-dev --extra web --extra messaging
+    UV_EXPORT=(export --frozen --no-hashes --no-dev --no-emit-project
+               --extra web --extra messaging
                --extra mcp --extra computer-use --extra vercel
                --extra wake-openwakeword --extra uvloop)
     ( cd "${SRC}" && uv "${UV_EXPORT[@]}" -o "${RT}/requirements.lock" ) \
