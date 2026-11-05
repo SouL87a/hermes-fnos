@@ -799,6 +799,14 @@ stop_process() {
     local _py; _py="$(pm_venv_python)"
     [ -n "${_py}" ] && PATTERN="${_py} -m ${MODULE}"
 
+    ### TERM 后的等待秒数。
+    ### ⚠ 不能太短：gateway 收到 TERM 后要做优雅 drain（断开平台适配器、
+    ###   flush 状态），多 profile 时实测可超 12s。被 KILL 就走不完退出路径，
+    ###   下次启动报 "Previous gateway life exited UNCLEANLY"（实机 2026-11-05）。
+    ###   可用环境变量 HERMES_STOP_TIMEOUT 覆盖，默认 30s。
+    local stop_timeout="${HERMES_STOP_TIMEOUT:-30}"
+    case "${stop_timeout}" in ''|*[!0-9]*) stop_timeout=30 ;; esac
+
     local pid
     pid="$(read_pid)"
     if [ -n "${pid}" ]; then
@@ -806,7 +814,7 @@ stop_process() {
             log_msg "send TERM signal to PID:${pid} ..."
             kill -TERM "${pid}" 2>/dev/null || true
             local count=0
-            while pid_alive "${pid}" && [ "${count}" -lt 12 ]; do
+            while pid_alive "${pid}" && [ "${count}" -lt "${stop_timeout}" ]; do
                 sleep 1
                 count=$((count + 1))
             done
@@ -833,7 +841,12 @@ stop_process() {
         log_msg "清理残留进程 (${PATTERN} / ${GATEWAY_PATTERN})"
         pkill -TERM -f -- "${PATTERN}" 2>/dev/null || true
         pkill -TERM -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
-        sleep 1
+        # 给兜底命中的进程同样的 drain 时间（它们可能刚收到 TERM）
+        local wait_left="${stop_timeout}"
+        while [ "${wait_left}" -gt 0 ] && own_pids > /dev/null 2>&1; do
+            sleep 1
+            wait_left=$((wait_left - 1))
+        done
         pkill -KILL -f -- "${PATTERN}" 2>/dev/null || true
         pkill -KILL -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
     fi

@@ -249,16 +249,12 @@ workspace/ state/ log/ .env
 | 前端构建（web_dist） | ✅ 3.2MB |
 | **fpk 产物结构** | ✅ 与官方包一致（manifest/cmd/config/ui/wizard + app.tgz） |
 
-## 已知风险 / 待真机验证
+## 已知限制 / 排障
 
-1. ~~**CPython 依赖的 wheel 可用性**~~ —— **已实测通过**（见上表）。头号风险已解除。
-2. **首次启动耗时**。Hermes 有 ~2000 个 Python 模块，冷启动 + SQLite 建库可能十几秒；`cmd/main` 的就绪探测给了 90 秒。
-3. **WebSocket 鉴权**。回环绑定时 dashboard 会给 index.html 注入一次性 `__HERMES_SESSION_TOKEN__` 供 `/api/ws` 用；需实测代理透传下 WS 握手是否通过。
-4. **PM 自管理**。Hermes 自带 `pm` 工具链会管理 venv/node/uv/ripgrep/ffmpeg。本方案用 `HERMES_HOME` / `HERMES_WEB_DIST` / `--skip-build` 绕开它的自安装路径，但需确认 dashboard 路径确实不会触发联网安装。
-5. **`install_dep_apps = nodejs_v22` 是否必要**。前端已预构建，dashboard 大概率不需要 Node；但**在线更新重建前端需要 npm**，所以保留声明更稳。
-6. **代码体量**。~17000 文件、源码树 + CPython + 依赖 + `.git`，包体积预计 400MB+。
-7. **在线更新的网络依赖**。`apply` 需要 NAS 能访问 GitHub（git fetch）与 PyPI（装依赖）。国内建议配 `HERMES_PIP_INDEX` 镜像。
-8. **系统 Python 模式的额外代价**（若用 `HERMES_USE_SYSTEM_PYTHON=1`）：安装时要联网装依赖，依赖 NAS 上 Python 的可用性与版本（3.11–3.13），且系统 `libsqlite3` 偏旧（Debian 12 = 3.40.1）→ WAL 降级 DELETE + doctor 假 FTS 报错。
+1. **QQ 语音（SILK 格式）**：`pilk`（SILK 解码库）只有 Windows 的 wheel，Linux 上需源码编译（NAS 无编译器）→ 收到 `.silk` 语音时降级用 ffmpeg/PCM 兜底。属上游依赖限制。
+2. **generation 磁盘占用**：PM 每次 sync 新建一个 ~440MB 的环境目录，旧的保留 24 小时（上游冷静期设计）后由 `pm gc` 回收。本包在每次安装/升级后会自动调一次 `pm gc`；若磁盘紧张也可手动执行 `hermes pm gc`。
+3. **安装失败后的残留**：失败的安装会留下 `<数据目录>/installs/<key>/`（有 facts.json 但 environments 为空）。本包会自动跳过并归档它们；也可手工删除。
+4. **`hermes update` 之后**：源码更新了但 PM 不会自动把新 extras 装进 venv —— 重启应用即可（启动检测会按 `enabled-features.json` 的基线补齐差异）。
 
 ## 后续
 

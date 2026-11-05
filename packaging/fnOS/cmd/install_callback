@@ -73,7 +73,8 @@ FEATURES_FILE="${TRIM_PKGVAR}/enabled-features.json"
 #   vercel            Vercel 部署工具
 #   wake-openwakeword 唤醒词（轻量版，仅 pyopen-wakeword）
 # ⚠ 不加 `wake`（25.7 MB，含 sherpa/porcupine/sounddevice）；需要的人可自行 pm install
-FEATURES_BASE='messaging web mcp computer-use vercel wake-openwakeword'
+#   uvloop（4.1 MB）：事件循环加速，白拿的性能
+FEATURES_BASE='messaging web mcp computer-use vercel wake-openwakeword uvloop'
 if [ ! -f "${FEATURES_FILE}" ]; then
     # ⚠ 必须用 FEATURES_BASE 生成，不能硬编码 —— 两处不一致会悄悄砍掉功能
     #   （实机 2026-11-05：这里写死 web+messaging，导致 MCP 全挂）。
