@@ -90,11 +90,10 @@ jobs:
           echo "--- glibc ---"
           ldd --version | head -1
 
+      # 构建期现在只做：源码树快照 + 前端构建 + 打包。
+      # 不再下载 CPython、不再装依赖（那些改为安装期由 PM 完成）。
+      # 注意：**不设**国内镜像 —— Actions runner 在海外，直连最快。
       - name: Build fpk
-        env:
-          # 构建期现在只做：源码树快照 + 前端构建 + 打包。
-          # 不再下载 CPython、不再装依赖（那些改为安装期由 PM 完成）。
-          # 注意：**不设**国内镜像 —— Actions runner 在海外，直连最快。
         run: |
           set -e
           bash packaging/fnOS/scripts/build.sh
