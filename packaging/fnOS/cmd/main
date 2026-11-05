@@ -572,11 +572,27 @@ start_process() {
         return 0
     fi
 
-    if [ ! -x "${PY}" ]; then
-        log_msg "启动失败：找不到 ${PY}"
-        echo "应用文件缺失：${PY}" > "${TRIM_TEMP_LOGFILE}"
+    # ⚠ 必须在任何检查之前解析 PY：PY 的初值是空字符串（见顶部定义），
+    #   要等 PM 环境就绪后才知道真路径。旧顺序先检查 [ -x "${PY}" ]，
+    #   此时 PY 为空 → 必然失败 → 报「应用文件缺失：（冒号后为空）」。
+    #   实机 2026-11-05 就是这样卡住的。
+    mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" 2>/dev/null || true
+    if ! pm_env_ready; then
+        log_msg "PM 环境未就绪，尝试同步安装…"
+        if ! pm_env_install_blocking; then
+            log_msg "启动失败：运行期环境未就绪"
+            echo "运行期环境未就绪，请检查网络/代理后重启应用，详见 ${DATA_DIR}/log/install-runtime.log" > "${TRIM_TEMP_LOGFILE}"
+            return 1
+        fi
+    fi
+    PY="$(pm_venv_python)"
+    if [ -z "${PY}" ] || [ ! -x "${PY}" ]; then
+        log_msg "启动失败：拿不到 PM venv 解释器"
+        echo "无法定位 PM 虚拟环境（见 ${DATA_DIR}/log/install-runtime.log）" > "${TRIM_TEMP_LOGFILE}"
         return 1
     fi
+    PATTERN="${PY} -m ${MODULE}"
+
     if [ ! -d "${SRC_DIR}/hermes_cli" ]; then
         log_msg "启动失败：找不到源码树 ${SRC_DIR}/hermes_cli"
         echo "应用文件缺失：${SRC_DIR}" > "${TRIM_TEMP_LOGFILE}"
@@ -593,14 +609,6 @@ start_process() {
     local ws
     ws="$(resolve_workspace)"
     mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "${ws}/tmp" "$(dirname "${PID_FILE}")"
-    # PM 环境必须就绪：安装回调若被平台超时打断，这里同步补齐（阻塞）。
-    if ! pm_env_ready; then
-        if ! pm_env_install_blocking; then
-            log_msg "启动失败：运行期环境未就绪"
-            echo "运行期环境未就绪，请检查网络/代理后重启应用，详见 ${DATA_DIR}/log/install-runtime.log" > "${TRIM_TEMP_LOGFILE}"
-            return 1
-        fi
-    fi
     # doctor 需要 ~/.local/bin/hermes（$HOME = HERMES_HOME = DATA_DIR）。
     # 本包走 /usr/local/bin/hermes（usr-local-linker），但上游 doctor 的
     # _check_command_installation() 只认 ~/.local/bin。
@@ -619,14 +627,6 @@ start_process() {
         fi
     fi
     rm -f "${GATEWAY_SOCKET}"
-
-    PY="$(pm_venv_python)"
-    [ -n "${PY}" ] && [ -x "${PY}" ] || {
-        log_msg "启动失败：拿不到 PM venv 解释器"
-        echo "无法定位 PM 虚拟环境" > "${TRIM_TEMP_LOGFILE}"
-        return 1
-    }
-    PATTERN="${PY} -m ${MODULE}"
 
     log_msg "Starting Hermes dashboard (gateway + loopback port) ..."
     log_msg "PY=${PY}  APP_DIR=${APP_DIR}  HOME=${DATA_DIR}  WS=${ws}  PORT=${PORT}  SOCK=${GATEWAY_SOCKET}"
