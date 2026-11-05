@@ -253,9 +253,18 @@ print(d['packages']['python']['version'])" "${SRC}/pm/lock.json" 2>/dev/null || 
     #   只给 manylinux2014 会漏掉它们 → 报 "No matching distribution"（实机 2026-11-05
     #   的 cbor2：PyPI 有 cp314+manylinux_2_28 wheel，但平台参数不含该标签族 → 失败）。
     #   一次报错就是失败（pip download 不会跳过单个包），所以宁可多列。
+    # ⚠ Pillow override：browser-harness 声明 pillow==12.3.0（精确 pin），
+    #   而核心要求 13.0.0 → pip 严格解析直接冲突。uv 能装是因为 uv.lock 的
+    #   manifest overrides 声明了 13.0.0；pip 不认那个语义 → 用 constraints
+    #   把 Pillow 钉到 13.0.0（constraints 只约束版本、不参与解析起点，
+    #   恰好实现"override"效果）。旧方案的 uv-overrides.txt 同源。
+    local OVR="${PBS_CACHE}/pip-constraints.txt"
+    printf '%s
+' "Pillow==13.0.0" > "${OVR}"
     PIP_ARGS=(download
         -r "${RT}/requirements.lock"
         -d "${RT}/wheelhouse"
+        --constraint "${OVR}"
         --only-binary :all:
         --python-version 3.14
         --platform manylinux2014_x86_64
