@@ -93,10 +93,15 @@ jobs:
       # 构建期现在只做：源码树快照 + 前端构建 + 打包。
       # 不再下载 CPython、不再装依赖（那些改为安装期由 PM 完成）。
       # 注意：**不设**国内镜像 —— Actions runner 在海外，直连最快。
+      # preset=B 时额外预置 Python 压缩包与 wheelhouse（安装期少下载 ~840MB）
       - name: Build fpk
+        env:
+          HERMES_PRESET: ${{ github.event.inputs.preset }}
         run: |
           set -e
-          bash packaging/fnOS/scripts/build.sh
+          ARGS=""
+          [ -n "${HERMES_PRESET}" ] && ARGS="--preset ${HERMES_PRESET}"
+          bash packaging/fnOS/scripts/build.sh ${ARGS}
 
       - name: Verify fpk
         run: |
