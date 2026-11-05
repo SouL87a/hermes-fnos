@@ -29,19 +29,22 @@ SRC="${DATA_DIR}/src"
 LOG="${DATA_DIR}/log/install-runtime.log"
 UV_STORE="${DATA_DIR}/tools"
 UV_VER="0.13.5"
-# 上游 ref：优先环境变量，否则读包内的 upstream-ref（构建期写入，与包版本一致）。
-# ⚠ 不能写死版本号：包升到 0.22.7 而这里还是 v0.22.5 时，安装出来的源码
-#   与 manifest/stamp 声明的版本不一致（实机 P4，2026-11-05）。
-if [ -z "${HERMES_REF:-}" ] && [ -f "${APP_DIR}/upstream-ref" ]; then
-    HERMES_REF="$(tr -d '[:space:]' < "${APP_DIR}/upstream-ref" 2>/dev/null || true)"
-fi
-HERMES_REF="${HERMES_REF:-v0.22.5}"
 REPO="NousResearch/hermes-agent"
 
 mkdir -p "${DATA_DIR}/log" "${UV_STORE}"
 
 log() { printf '%s\n' "$*" | tee -a "${LOG}"; }
 die() { log "✗ $*"; exit 1; }
+
+# 上游 ref：优先环境变量，否则读包内的 upstream-ref（构建期写入，与包版本一致）。
+# ⚠ 不能写死版本号：包升到 0.22.7 而这里还是 v0.22.5 时，安装出来的源码
+#   与 manifest/stamp 声明的版本不一致（实机 P4，2026-11-05）。
+if [ -z "${HERMES_REF:-}" ] && [ -f "${APP_DIR}/upstream-ref" ]; then
+    HERMES_REF="$(tr -d '[:space:]' < "${APP_DIR}/upstream-ref" 2>/dev/null || true)"
+fi
+# 读不到 upstream-ref 就明确失败，不能静默退回写死的版本号——
+# 那会把源码永久钉在旧 tag 且日志里看不出来（实机报告 P4 附带问题）。
+[ -n "${HERMES_REF:-}" ] || die "无法确定上游 ref（env HERMES_REF 与 ${APP_DIR}/upstream-ref 都不可用）"
 
 # ── 工具 ─────────────────────────────────────────────────────
 have() { command -v "$1" > /dev/null 2>&1; }
@@ -442,6 +445,16 @@ log "=== install-runtime $(date -Is) mode=${MODE} ==="
 ###   只判断「有 venv」会命中旧环境 → 幂等跳过 → 新源码下无法运行。
 pm_env_ok() {
     [ -d "${SRC}/hermes_cli" ] || return 1
+    # ⚠ 源码版本必须与包声明的一致（P4，2026-11-05）。
+    #   此前把版本校验写在 install_source() 里，但幂等跳过分支在它【之前】
+    #   exit 0 → 校验是死代码，五次升级 src 一直停在首次 clone 的 v0.22.5。
+    #   并入这里：每次判定「环境是否就绪」都包含「源码版本对不对」。
+    #   git describe 毫秒级，代价可忽略。
+    #   ⚠ hermes 用户可能遇到 dubious ownership（root 装的、hermes 跑）→ 加 -c safe.directory。
+    local cur_ver
+    cur_ver="$(git -C "${SRC}" -c safe.directory="${SRC}" describe --tags 2>/dev/null \
+        || git -C "${SRC}" -c safe.directory="${SRC}" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    [ "${cur_ver}" = "${HERMES_REF}" ] || return 1
     local boot=""
     boot="$(command -v python3 2>/dev/null)" || return 1
     local want_key

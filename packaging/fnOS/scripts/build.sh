@@ -487,7 +487,6 @@ env \
     HERMES_WEB_DIST="${WEB_DIST}" \
     HERMES_WRITE_SAFE_ROOT="${WS}" \
     HERMES_MANAGED_BY="trim-hermes-fnos" \
-    HERMES_LAZY_INSTALL_TARGET="${LAZY_SITE}" \
     HERMES_TUI_WS_ORPHAN_REAP_GRACE_S="300" \
     "${PY}" -m hermes_cli.main "$@" 2>"${_err}"
 _rc=$?
