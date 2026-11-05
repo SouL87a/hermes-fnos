@@ -451,9 +451,15 @@ pm_env_ok() {
     #   并入这里：每次判定「环境是否就绪」都包含「源码版本对不对」。
     #   git describe 毫秒级，代价可忽略。
     #   ⚠ hermes 用户可能遇到 dubious ownership（root 装的、hermes 跑）→ 加 -c safe.directory。
-    local cur_ver
-    cur_ver="$(git -C "${SRC}" -c safe.directory="${SRC}" describe --tags 2>/dev/null \
-        || git -C "${SRC}" -c safe.directory="${SRC}" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    #   ⚠ tarball 安装（无 .git）没有 describe：用 .tarball-ref 标记文件核对。
+    #     两者都没有/都不匹配 → 需重装。
+    local cur_ver=""
+    if [ -d "${SRC}/.git" ]; then
+        cur_ver="$(git -C "${SRC}" -c safe.directory="${SRC}" describe --tags 2>/dev/null \
+            || git -C "${SRC}" -c safe.directory="${SRC}" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    elif [ -f "${SRC}/.tarball-ref" ]; then
+        cur_ver="$(tr -d '[:space:]' < "${SRC}/.tarball-ref" 2>/dev/null || echo '?')"
+    fi
     [ "${cur_ver}" = "${HERMES_REF}" ] || return 1
     local boot=""
     boot="$(command -v python3 2>/dev/null)" || return 1
