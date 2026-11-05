@@ -249,14 +249,29 @@ print(d['packages']['python']['version'])" "${SRC}/pm/lock.json" 2>/dev/null || 
     #   用标准 pip download：构建机 python3 自带 pip，语义一致
     #   （-r 需求清单 → 下载 wheel 到目录）。指定 cp314/linux 平台，
     #   避免拉到源码包或其它平台的 wheel。
+    # ⚠ --platform 必须枚举全部标签族：上游新 wheel 用 manylinux_2_28 等新标签，
+    #   只给 manylinux2014 会漏掉它们 → 报 "No matching distribution"（实机 2026-11-05
+    #   的 cbor2：PyPI 有 cp314+manylinux_2_28 wheel，但平台参数不含该标签族 → 失败）。
+    #   一次报错就是失败（pip download 不会跳过单个包），所以宁可多列。
     PIP_ARGS=(download
         -r "${RT}/requirements.lock"
         -d "${RT}/wheelhouse"
         --only-binary :all:
         --python-version 3.14
         --platform manylinux2014_x86_64
+        --platform manylinux_2_17_x86_64
+        --platform manylinux_2_28_x86_64
+        --platform manylinux_2_34_x86_64
+        --platform manylinux_2_35_x86_64
+        --platform manylinux_2_36_x86_64
+        --platform manylinux_2_39_x86_64
+        --platform linux_x86_64
+        --platform any
         --implementation cp
-        --abi cp314)
+        --abi cp314
+        --abi cp313
+        --abi abi3
+        --abi none)
     [ -n "${HERMES_PIP_INDEX:-}" ] && PIP_ARGS+=(--index-url "${HERMES_PIP_INDEX}")
     # ⚠ 构建机 python3 可能没有 pip 模块（WSL Debian 实测就没有）→ 先 ensurepip。
     if ! "${STAMP_PY}" -m pip --version > /dev/null 2>&1; then
