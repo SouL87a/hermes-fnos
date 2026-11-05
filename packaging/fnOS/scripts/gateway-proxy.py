@@ -102,7 +102,7 @@ def _split_target(target: str):
 # ── 在线更新控制端点 ─────────────────────────────────────────
 # 路径：/__hermes/update/{check,apply,status,version}
 # 权限：必须带 X-Trim-Isadmin（飞牛管理员），否则 403。
-# 实现：调用同目录的 hermes-update.py（用同一个自带 python）。
+# 实现：调上游 `hermes update`（源码在数据目录且带 .git）。
 UPDATE_SCRIPT = os.environ.get("HERMES_UPDATE_SCRIPT", "")
 
 # 应用内容树根：本代理脚本部署在 <APP_ROOT>/gateway-proxy.py
@@ -142,14 +142,6 @@ def _gateway_action_status(name: str):
         _GATEWAY_ACTION_RESULTS.pop(name, None)
         return None
     return rec
-
-
-def _update_script_path() -> str:
-    if UPDATE_SCRIPT and os.path.exists(UPDATE_SCRIPT):
-        return UPDATE_SCRIPT
-    # 默认：与代理同目录
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, "hermes-update.py")
 
 
 def find_cmd_main() -> str | None:
@@ -237,7 +229,7 @@ def _is_admin(headers, from_root: bool = False) -> bool:
 #
 # 两条关键设计：
 #  ① 硬超时 UPDATE_CHECK_TIMEOUT：只用于 force（按钮）路径的兜底，要盖过
-#     hermes-update.py 内部的 60s + 重试，让用户拿到真结果（原先 3s 会先把
+#     上游 update 内部的 60s + 重试，让用户拿到真结果（原先 3s 会先把
 #     内部 20s 砍掉，重试永远轮不到）。
 #  ② 结果缓存：成功长 TTL（10 分钟）、失败短 TTL（90 秒）以便稍后自愈；
 #     这样首屏命中缓存能显示"有更新"，无需每次联网。
@@ -263,7 +255,7 @@ def _run_update_check_cached() -> dict:
     """同步执行一次检查并写缓存。被两条路径调用：
       · 后台线程（旧路径，已不用于首屏）；
       · "检查更新"按钮（force=true，走 run_in_executor 同步等结果）。
-    硬超时 UPDATE_CHECK_TIMEOUT（默认 150s）要盖过 hermes-update.py 内部的
+    硬超时 UPDATE_CHECK_TIMEOUT（默认 150s）要盖过上游 update 内部的
     60s+重试，让用户点按钮能拿到**真结果**而不是超时错误。"""
     d: dict = {}
     ok = False
@@ -281,7 +273,7 @@ def _run_update_check_cached() -> dict:
 
     # behind 的取值必须让前端「检查更新」按钮的判定链正确弹 toast
     # （SystemPage: update_available → success；behind===0 → "已是最新" success；
-    #   否则落到 message → error）。我们的 hermes-update.py 不算 behind，所以：
+    #   否则落到 message → error）。上游 update --check 不算 behind，所以：
     #   · 成功且已最新 → 0（前端弹 "You're on the latest version" ✅，而不是把
     #     "已是最新"当成错误弹出来）
     #   · 成功且有更新 → None（前端走 update_available 分支弹 "Update available"）
@@ -296,7 +288,7 @@ def _run_update_check_cached() -> dict:
         "behind": behind_val,
         "update_available": (bool(d.get("available")) if ok else None),
         "can_apply": True,
-        "update_command": "hermes-update apply",
+        "update_command": "hermes update",
         "message": d.get("message") or (
             f"可更新到 {d.get('ref')}" if d.get("available") else "已是最新版本"
         ),
@@ -394,25 +386,86 @@ $("#status").click();
 
 
 
+def _pm_venv_python() -> str | None:
+    """从 <data>/installs/<key>/facts.json 读出 PM venv 里的 python。
+
+    与 cmd/main 的 pm_venv_python 同一规则（排除 .disabled-*）。
+    源码与依赖都在数据目录，安装期由 install-runtime.sh 建好。
+    """
+    data = os.environ.get("HERMES_DATA_ROOT") or os.environ.get("TRIM_PKGVAR") or ""
+    if not data:
+        return None
+    installs = os.path.join(data, "installs")
+    if not os.path.isdir(installs):
+        return None
+    for name in sorted(os.listdir(installs)):
+        if ".disabled-" in name:
+            continue
+        facts = os.path.join(installs, name, "facts.json")
+        if not os.path.isfile(facts):
+            continue
+        try:
+            with open(facts, encoding="utf-8-sig") as fh:
+                doc = json.load(fh)
+            env = ((doc.get("packages") or {}).get("venv") or {}).get("environment")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(env, str) and env:
+            py = os.path.join(env, "bin", "python3")
+            if os.path.isfile(py) and os.access(py, os.X_OK):
+                return py
+    return None
+
+
 def _run_update(action: str, timeout: float = 3600) -> tuple[int, str]:
-    script = _update_script_path()
-    if not os.path.exists(script):
-        return 500, json.dumps({"ok": False, "message": f"缺少更新脚本：{script}"}, ensure_ascii=False)
-    py = sys.executable or "python3"
+    """调上游 `hermes update`。
+
+    历史：旧方案有自己的 hermes-update.py（因为包内源码无 .git）。
+    新方案源码在 <data>/src 且带 .git，上游 sealed_steward() 判定为 git
+    安装 → 允许就地更新，直接用它即可。
+    """
+    py = _pm_venv_python()
+    if not py:
+        return 500, json.dumps({
+            "ok": False,
+            "message": "找不到 PM 虚拟环境（可能尚未安装完成）。请重启应用或查看日志。",
+        }, ensure_ascii=False)
+    data = os.environ.get("HERMES_DATA_ROOT") or os.environ.get("TRIM_PKGVAR") or ""
+    src = os.path.join(data, "src")
+    if not os.path.isdir(src):
+        return 500, json.dumps({
+            "ok": False, "message": f"源码目录不存在：{src}",
+        }, ensure_ascii=False)
+
+    args = [py, "-m", "hermes_cli.main", "update"]
+    if action == "check":
+        args.append("--check")
+    elif action == "status":
+        # 没有专门的 status 子命令：用 --check 的结果代替（只读）
+        args.append("--check")
+    # apply → 不带参数即执行更新
+
+    env = dict(os.environ)
+    env["HOME"] = data
+    env["HERMES_HOME"] = data
+    env["PYTHONPATH"] = src
     try:
         proc = subprocess.run(
-            [py, script, action],
+            args, cwd=src, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=timeout, check=False, text=True,
         )
-        body = proc.stdout.strip()
-        # 脚本输出是 JSON；原样透传
-        return (200 if proc.returncode == 0 else 500), body
+        out = (proc.stdout or "").strip()
+        return (200 if proc.returncode == 0 else 500), json.dumps({
+            "ok": proc.returncode == 0,
+            "action": action,
+            "output": out[-4000:],
+        }, ensure_ascii=False)
     except subprocess.TimeoutExpired:
         return 504, json.dumps({"ok": False, "message": f"更新操作超时（{int(timeout)}s）"},
                                ensure_ascii=False)
     except OSError as exc:
-        return 500, json.dumps({"ok": False, "message": f"无法执行更新脚本：{exc}"}, ensure_ascii=False)
+        return 500, json.dumps({"ok": False, "message": f"无法执行更新：{exc}"}, ensure_ascii=False)
 
 
 async def handle_update_endpoint(method: str, up_path: str, headers, writer, from_root: bool = False) -> None:
@@ -576,7 +629,7 @@ async def handle_gateway_action_status(up_path: str, method: str, headers, write
 
 
 async def handle_native_update_proxy(method: str, path: str, headers, writer, from_root: bool = False) -> None:
-    """把 dashboard 原生更新入口接到本包的 hermes-update.py。
+    """把 dashboard 原生更新入口接到上游 hermes update。
 
     上游 dashboard 期望：
       GET  /api/hermes/update/check → UpdateCheckResponse
@@ -585,7 +638,7 @@ async def handle_native_update_proxy(method: str, path: str, headers, writer, fr
       POST /api/hermes/update       → ActionResponse
         {name, ok, pid, message?, update_command?}
 
-    我们的 hermes-update.py 输出自己的 JSON，这里做字段映射。
+    上游输出纯文本，这里转成前端期望的 JSON。
     """
     def respond(code: int, body: dict) -> None:
         raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -634,8 +687,8 @@ async def handle_native_update_proxy(method: str, path: str, headers, writer, fr
                 "behind": None,
                 "update_available": None,
                 "can_apply": True,
-                "update_command": "hermes-update apply",
-                "message": "未检查更新（点「检查更新」按钮，或 SSH 执行 hermes-update check）",
+                "update_command": "hermes update",
+                "message": "未检查更新（点「检查更新」按钮，或 SSH 执行 hermes update --check）",
             })
     else:
         code, body = await loop.run_in_executor(None, _run_update, "apply")
@@ -644,11 +697,11 @@ async def handle_native_update_proxy(method: str, path: str, headers, writer, fr
         except ValueError:
             d = {"ok": False, "message": body[:200]}
         resp = {
-            "name": "hermes-update",
+            "name": "hermes update",
             "ok": bool(d.get("ok")),
             "pid": None,
             "message": d.get("message") or ("更新完成" if d.get("ok") else "更新失败"),
-            "update_command": "hermes-update apply",
+            "update_command": "hermes update",
         }
         if d.get("restart_required"):
             resp["message"] = (resp["message"] or "") + "（请重启应用生效）"
@@ -810,10 +863,10 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
             await handle_update_endpoint(method, up_path, headers, client_writer, from_root)
             return
 
-        # 接管上游 dashboard 的原生更新入口 —— 转到本包的 hermes-update.py。
+        # 接管上游 dashboard 的原生更新入口 —— 转到上游 hermes update。
         # 原因：上游 `hermes update` 是 git 源码更新器，不认识本包「应用中心 + 外部
         # supervisor」的布局；且工作树里没有 .git，它只会报错退出。把 dashboard
-        # 的按钮接到我们自己的 hermes-update.py（git 更新 + 重启应用），体验才连贯。
+        # 的按钮接到上游 update（git 拉取 + PM 同步依赖），体验才连贯。
         _base_path = up_path.split("?")[0]
         if _base_path in ("/api/hermes/update", "/api/hermes/update/check"):
             await handle_native_update_proxy(method, _base_path, headers, client_writer, from_root)
