@@ -17,6 +17,10 @@ on:
         description: "Hermes 上游 ref（tag / branch / commit），留空用 upstream.version 里钉住的值"
         required: false
         default: ""
+      preset:
+        description: "打包档位：留空=在线版(~4MB)；B=预置 Python+wheelhouse(~130MB，安装期少下载)"
+        required: false
+        default: ""
       publish_release:
         description: "验证通过后发布 GitHub Release（勾选才发）"
         type: boolean
