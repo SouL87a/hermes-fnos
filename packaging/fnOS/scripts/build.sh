@@ -257,7 +257,12 @@ print(d['packages']['python']['version'])" "${SRC}/pm/lock.json" 2>/dev/null || 
         --implementation cp
         --abi cp314)
     [ -n "${HERMES_PIP_INDEX:-}" ] && PIP_ARGS+=(--index-url "${HERMES_PIP_INDEX}")
-    "${STAMP_PY}" -m pip "${PIP_ARGS[@]}" >> "${LOG}" 2>&1         || { echo "✗ wheelhouse 下载失败（详见构建日志）"; exit 1; }
+    # ⚠ 构建机 python3 可能没有 pip 模块（WSL Debian 实测就没有）→ 先 ensurepip。
+    if ! "${STAMP_PY}" -m pip --version > /dev/null 2>&1; then
+        echo "[build]   python3 缺 pip，ensurepip 补装…"
+        "${STAMP_PY}" -m ensurepip --upgrade >> /dev/null 2>&1             || { echo "✗ python3 无 pip 且 ensurepip 失败"; exit 1; }
+    fi
+    "${STAMP_PY}" -m pip "${PIP_ARGS[@]}" 2>&1 | tail -20         || { echo "✗ wheelhouse 下载失败（上方为 pip 输出）"; exit 1; }
     echo "[build]   wheelhouse ✓ ($(ls "${RT}/wheelhouse" | wc -l) 个, $(du -sh "${RT}/wheelhouse" | cut -f1))"
 fi
 
