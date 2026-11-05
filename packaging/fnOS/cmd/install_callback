@@ -160,10 +160,14 @@ fi
 echo "✓ 运行期安装完成" >> "${TRIM_PKGVAR}/log/install.log"
 
 ### 完整性校验：PM 环境 + 源码树 + 前端。
-_PM_PY="$(find "${TRIM_PKGVAR}/installs" -maxdepth 8 -type f \
+### ⚠ 不能用 `-type f`：venv 的 bin/python3 是【符号链接】（指向 python3.14），
+###   -type f 会排除它 → 明明装好了却报「未找到 PM 的 venv」。
+###   实机 2026-11-05：install-runtime 已输出「✓ 校验通过」，
+###   install_callback 却因这一行报错，导致整个升级被判失败。
+_PM_PY="$(find "${TRIM_PKGVAR}/installs" -maxdepth 8 \
             -path '*/environments/*/venv/bin/python3' 2>/dev/null | head -n 1)"
 if [ -z "${_PM_PY}" ] || [ ! -x "${_PM_PY}" ]; then
-    echo "安装后未找到 PM 的 venv（${TRIM_PKGVAR}/installs/*/environments/*/venv/bin/python3）" > "${TRIM_TEMP_LOGFILE}"
+    echo "安装后未找到可用的 PM venv。请查看 ${TRIM_PKGVAR}/log/install-runtime.log" > "${TRIM_TEMP_LOGFILE}"
     exit 1
 fi
 if [ ! -d "${TRIM_PKGVAR}/src/hermes_cli" ]; then
