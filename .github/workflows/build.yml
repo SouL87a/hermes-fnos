@@ -25,7 +25,7 @@ on:
 
 env:
   # 构建机必须 Linux：包里分发的是 Linux CPython 与 Linux .so，Windows/macOS 无法执行它们完成依赖安装。
-  NODE_VERSION: "22"
+  NODE_VERSION: "26"
 
 jobs:
   fpk:
