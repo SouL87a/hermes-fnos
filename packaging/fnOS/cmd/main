@@ -792,6 +792,11 @@ HERMES_GATEWAY_DEBUG='1' \
 
 stop_process() {
     log_msg "Stopping process ..."
+    # ⚠ PATTERN 在脚本顶部由（空的）PY 拼成，必须在这里重新解析，
+    #   否则 pkill 的 pattern 变成 " -m hermes_cli.main"（前导空格），
+    #   匹配不到真实进程 → 停不干净。
+    local _py; _py="$(pm_venv_python)"
+    [ -n "${_py}" ] && PATTERN="${_py} -m ${MODULE}"
 
     local pid
     pid="$(read_pid)"
@@ -843,6 +848,9 @@ stop_process() {
 }
 
 status() {
+    # 同 stop_process：PATTERN 需要真实 PY 才能匹配进程。
+    local _py; _py="$(pm_venv_python)"
+    [ -n "${_py}" ] && PATTERN="${_py} -m ${MODULE}"
     local pid
     pid="$(read_pid)"
     if [ -n "${pid}" ] && pid_alive "${pid}"; then
