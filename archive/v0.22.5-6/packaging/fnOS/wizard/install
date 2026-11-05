@@ -1,0 +1,72 @@
+[
+  {
+    "stepTitle": "Hermes Agent",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "Hermes Agent 是 Nous Research 的自我进化 AI Agent。安装后从桌面图标打开控制台，在里面配置模型与 API Key（支持 Nous Portal、OpenRouter、OpenAI、自建端点等）。\n\n访问方式有两种：\n  · 飞牛桌面图标 → 走统一网关（飞牛登录态）\n  · http://<NAS地址>:9119 → 局域网直连\n两者都需要下面设置的面板密码登录。数据与工作区保存在 NAS 上，手机 / 平板 / 电脑共用一份。首次打开可能需要几秒初始化。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "面板登录密码",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "设置访问 Hermes 控制台的用户名与密码（可选）。\n\n填了密码：桌面图标与 http://<NAS地址>:9119 两条路径都能用，均需登录。\n留空：只允许飞牛桌面图标访问（走飞牛登录态），更安全、开箱即用。\n\n为什么填了密码才能直连：控制台要监听局域网地址才能被 :9119 访问，而 Hermes 的安全加固要求这种情形下必须启用登录，否则拒绝启动。\n\n密码以 600 权限保存在应用数据目录的 .env 里。之后可在「设置」页修改或清空。\n⚠ 升级安装会再次显示此页：留空【不会】清除你之前设的密码。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_auth_user",
+        "label": "登录用户名",
+        "initValue": "admin",
+        "rules": [
+          {
+            "pattern": "^[A-Za-z0-9._@-]{1,64}$",
+            "message": "1–64 位，仅字母/数字/._@-"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_auth_password",
+        "label": "登录密码（至少 8 位；留空=仅飞牛网关）",
+        "rules": [
+          {
+            "pattern": "^$|^.{8,128}$",
+            "message": "密码至少 8 位；留空则只允许飞牛桌面访问"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "网络代理（可选）",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "如果 NAS 需要代理才能访问外网，在这里填 HTTP 代理地址；不需要就留空。\n\n用途：Hermes 的「检查更新 / 在线更新」要访问 github.com，装依赖要访问 PyPI —— 这两个域名国内经常连不上，配了代理能显著改善（也能让「系统」页的检查更新秒回）。\n\n格式：http://127.0.0.1:7890 或 http://192.168.1.10:7890。仅支持 http 代理；若你的代理软件只开 socks5，请在其中开启一个 http 端口。留空表示直连。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_proxy",
+        "label": "HTTP 代理地址（留空=直连）",
+        "rules": [
+          {
+            "pattern": "^$|^https?://[A-Za-z0-9._~:/?#\\[\\]@!$&'()*+,;=%\\-]+$",
+            "message": "请填 http://主机:端口 形式，或留空"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "stepTitle": "浏览器自动化（可选，按需装）",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "本包不含 Chromium（约 170 MB，多数人用不到），所以「浏览器 / 网页自动化」类工具默认不可用——doctor 里 browser-cdp / computer_use 显示「system dependency not met」属预期，不是故障。\n\n需要时在【终端】里装（SSH，或控制台里的终端页；不是 dashboard 网页上的按钮）：\n  hermes tools post-setup agent_browser\n首次会下载约 170 MB。装完浏览器类工具即可用。（也可交互式：hermes tools → 🌐 Browser Automation；不想装 Chromium 可选轻量的 Lightpanda 后端，纯文本、无截图。）\n\n若装完仍提示 Chromium 缺失：多为检测路径不一致，重启一次本应用即可（本包会自动把已安装的 Chromium 路径喂给 Hermes）。\n\n不装不影响主模型对话、定时任务等核心功能。"
+      }
+    ]
+  }
+]

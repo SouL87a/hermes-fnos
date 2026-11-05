@@ -1,0 +1,134 @@
+#!/bin/bash
+# 应用设置页保存后回调。
+#
+# 目前只有一个设置项：HTTP 代理（向导字段 wizard_proxy，安装向导与设置页共用）。
+# 落盘到 $HERMES_HOME/.env 的 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY —— Hermes 会读
+# 这三个变量（agent/process_bootstrap.py、agent/auxiliary_client.py），git 与
+# pip 也认它们。留空则清除（直连）。
+#
+# 修改后需重启应用生效。
+set -e
+
+APP="hermes"
+if [ -z "${TRIM_PKGVAR}" ] && [ -d "/var/apps/${APP}/var" ]; then
+    TRIM_PKGVAR="$(readlink -f "/var/apps/${APP}/var")"
+fi
+: "${TRIM_USERNAME:=${APP}}"
+: "${TRIM_GROUPNAME:=${TRIM_USERNAME}}"
+# env_get/env_kv 用 DATA_DIR 定位 .env；本脚本没有 cmd/main 里那行赋值，必须补上，
+# 否则它会去读 /.env（读到空 → 改密码时把 secret 也换掉，已有会话全部失效）。
+DATA_DIR="${TRIM_PKGVAR}"
+
+# .env 写入助手（与 cmd/main 共用同一套编解码，须与 python-dotenv 一致）
+for _lib in "${TRIM_APPDEST:+${TRIM_APPDEST}/envfile.sh}" "/var/apps/${APP}/target/envfile.sh" \
+            "$(dirname "$(readlink -f "$0")")/../scripts/envfile.sh"; do
+    [ -n "${_lib}" ] && [ -r "${_lib}" ] && { . "${_lib}"; break; }
+done
+if ! declare -F env_kv >/dev/null; then
+    echo "⚠ 缺少 envfile.sh，面板密码将以裸值写入（含 # 或首尾空格会失效）" >> "${TRIM_PKGVAR}/log/config.log" 2>/dev/null || true
+    env_kv() { printf '%s=%s' "$1" "$2"; }
+fi
+if ! declare -F env_get >/dev/null; then
+    # 没有 env_get 就读不到旧 secret → 改密码会让所有会话失效。兜底实现（够用于单行无引号值）。
+    env_get() {
+        grep -E "^[[:space:]]*(export[[:space:]]+)?$1=" "${DATA_DIR}/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"' | tr -d '\r'
+    }
+fi
+
+mkdir -p "${TRIM_PKGVAR}/log" "${TRIM_PKGVAR}/workspace" "${TRIM_PKGVAR}/state" 2>/dev/null || true
+
+ENV_FILE="${TRIM_PKGVAR}/.env"
+PROXY="${wizard_proxy:-}"
+
+# 纵深防御：只接受 http(s):// 开头或空值；拒绝含换行的注入
+case "${PROXY}" in
+    *$'\n'*) PROXY="" ;;
+esac
+if [ -n "${PROXY}" ]; then
+    if ! printf '%s' "${PROXY}" | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
+        echo "代理地址格式非法（需 http://主机:端口），已忽略" >> "${TRIM_PKGVAR}/info.log"
+        PROXY=""
+    fi
+fi
+
+# 管理与本机地址不走代理
+NO_PROXY_VAL="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local"
+
+### 就地更新 .env：删掉旧的四个代理键，再按需追加。其余行原样保留。
+touch "${ENV_FILE}"
+TMP="${ENV_FILE}.tmp.$$"
+# 连同上一轮的分节标题一起剔除，否则每次保存都会多一行重复注释。
+grep -vE '^[[:space:]]*(export[[:space:]]+)?(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)=|^#[[:space:]]*──[[:space:]]*HTTP 代理' \
+    "${ENV_FILE}" > "${TMP}" 2>/dev/null || true
+
+if [ -n "${PROXY}" ]; then
+    {
+        echo "# ── HTTP 代理（由应用设置页写入，改动后需重启）──"
+        echo "HTTP_PROXY=${PROXY}"
+        echo "HTTPS_PROXY=${PROXY}"
+        echo "ALL_PROXY=${PROXY}"
+        echo "NO_PROXY=${NO_PROXY_VAL}"
+    } >> "${TMP}"
+fi
+
+### 面板登录凭据（设置页 wizard_auth_user / wizard_auth_password）。
+### ⚠ 三个键在上面的 grep 里【已一并剔除】？没有 —— 代理那段只剔除 PROXY 四键，
+### 这里单独处理：
+###   两项都有值且密码 ≥8 位 → 写入/更新
+###   两项都为空              → 清除（退回仅飞牛网关，dashboard 绑回环）
+###   只填一项                → 视为误操作，保持原值不变（在日志里提示）
+AUTH_USER="${wizard_auth_user:-}"
+AUTH_PASS="${wizard_auth_password:-}"
+case "${AUTH_USER}" in *$'\n'*) AUTH_USER="" ;; esac
+case "${AUTH_PASS}" in *$'\n'*) AUTH_PASS="" ;; esac
+# 首尾空格必须去掉：上游 _settings() 用 os.environ[...].strip() 取密码（实测）。
+AUTH_USER="${AUTH_USER#"${AUTH_USER%%[![:space:]]*}"}"; AUTH_USER="${AUTH_USER%"${AUTH_USER##*[![:space:]]}"}"
+AUTH_PASS="${AUTH_PASS#"${AUTH_PASS%%[![:space:]]*}"}"; AUTH_PASS="${AUTH_PASS%"${AUTH_PASS##*[![:space:]]}"}"
+# 先剔除旧的三个键（无论后续写不写）+ 上一轮留下的分节标题，
+# 否则每次保存都会再追加一行「# ── 面板登录…」，几轮下来文件里全是重复注释。
+TMP2="${TMP}.2"
+grep -vE '^[[:space:]]*(export[[:space:]]+)?(BASIC_AUTH_USER|BASIC_AUTH_PASSWORD|BASIC_AUTH_SECRET)=|^#[[:space:]]*──[[:space:]]*面板登录' \
+    "${TMP}" > "${TMP2}" 2>/dev/null || true
+: > "${TMP2}.new"
+if [ -n "${AUTH_USER}" ] && [ -n "${AUTH_PASS}" ]; then
+    if [ "${#AUTH_PASS}" -lt 8 ]; then
+        echo "⚠ 面板密码少于 8 位，未更新（保留原凭据）" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
+        cat "${TMP}" > "${TMP2}.new"
+    else
+        # 保留已存在的 secret（否则改密码会让所有浏览器 session 失效）
+        # ⚠ 不能自己 sed/tr 取值：值现在是 env_kv 写的双引号形式，必须用同一套解码，
+        #   否则会把引号截坏、再把坏 secret 写回去（已有会话立刻全部失效）。
+        _old_secret="$(DATA_DIR="${TRIM_PKGVAR}" env_get BASIC_AUTH_SECRET 2>/dev/null || true)"
+        [ -n "${_old_secret}" ] || _old_secret="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        cp "${TMP2}" "${TMP2}.new"
+        {
+            echo "# ── 面板登录（由应用设置页写入，改动后需重启）──"
+            # 值一律走 env_kv（双引号 + 转义），与 python-dotenv 的解析保持一致
+            env_kv BASIC_AUTH_USER "${AUTH_USER}"; echo
+            env_kv BASIC_AUTH_PASSWORD "${AUTH_PASS}"; echo
+            env_kv BASIC_AUTH_SECRET "${_old_secret}"; echo
+        } >> "${TMP2}.new"
+        echo "已更新面板登录：用户 ${AUTH_USER}" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
+    fi
+elif [ -z "${AUTH_USER}" ] && [ -z "${AUTH_PASS}" ]; then
+    # 两项都空：清除凭据 → 下次启动退回仅回环（飞牛网关仍可用）
+    cp "${TMP2}" "${TMP2}.new"
+    echo "已清除面板登录凭据（dashboard 将仅绑回环，只走飞牛网关）" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
+else
+    # 只填了一项：保持原凭据不变
+    cat "${TMP}" > "${TMP2}.new"
+    echo "⚠ 面板登录只填了一项（用户名/密码需同时填写），未修改" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
+fi
+mv "${TMP2}.new" "${TMP}"
+rm -f "${TMP2}" "${TMP2}.new" 2>/dev/null || true
+
+mv "${TMP}" "${ENV_FILE}"
+chmod 600 "${ENV_FILE}" 2>/dev/null || true
+chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+
+if [ -n "${PROXY}" ]; then
+    echo "已设置 HTTP 代理：${PROXY}" >> "${TRIM_PKGVAR}/info.log"
+else
+    echo "已清除 HTTP 代理（直连）" >> "${TRIM_PKGVAR}/info.log"
+fi
+exit 0

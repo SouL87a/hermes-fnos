@@ -1,0 +1,1502 @@
+#!/bin/bash
+
+### Hermes Agent —— 飞牛 fnOS 服务生命周期
+###
+### 原生应用，两种运行时模式（构建时定）：
+###  - 自带 CPython 模式（默认）：依赖预装进包内 python-build-standalone 的
+###    site-packages，运行期零联网；不用 venv（venv 的 pyvenv.cfg/符号链接带构建机
+###    绝对路径，装到 NAS 后路径变化会失效）。自带 SQLite 较新，WAL 正常。
+###  - 系统 Python 模式：安装时在 NAS 上建 venv（${TRIM_PKGVAR}/venv），
+###    解释器取自应用中心「Python 3.12」，依赖装进该 venv。（系统 libsqlite3 偏旧
+###    → WAL 会被 Hermes 降级成 DELETE，doctor 报假 FTS 损坏，故不作默认。）
+### 两种模式都不需要在运行期 pip；web_dist 已预构建（--skip-build）。
+### 形态：hermes dashboard（FastAPI+uvicorn；默认仅绑 127.0.0.1，配置了面板密码
+###       时绑 0.0.0.0 以支持 http://<NAS>:端口 直连，并启用上游 basic auth）+
+###        gateway-proxy.py（监听 Unix Socket，反代到回环端口）。
+### 前端是 React Router SPA，原生支持路径前缀反代：代理只要发
+### X-Forwarded-Prefix: /app/hermes，服务端就改写 index.html 的资产 URL
+### 并注入 window.__HERMES_BASE_PATH__，所以代理层无需改写 HTML。
+###
+### ⚠ 应用/依赖可能装在任意存储空间（/vol1、/vol2、…）。所有路径从
+### TRIM_APPDEST 推导，绝不写死卷号。
+###
+### status 约定：运行中 exit 0，未运行 exit 3（不是 1）。
+
+APP="hermes"
+MODULE="hermes_cli.main"
+PORT="${TRIM_SERVICE_PORT:-9119}"
+GATEWAY_PREFIX="/app/hermes"
+
+### TRIM_APPDEST 兜底：必须落到 target 链接指向的真目录。
+### /var/apps/<app> 本身是真目录，readlink -f 不穿透它 —— 拿它当 APPDEST 会拼出
+### 不存在的路径，status/stop 会静默失效。
+if [ -z "${TRIM_APPDEST}" ]; then
+    if [ -d "/var/apps/${APP}/target" ]; then
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}/target")"
+    else
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}")"
+    fi
+fi
+### ⚠ 兜底值必须 export —— 不只是本脚本用：
+### cmd/main 拉起的 dashboard / gateway-proxy 会继承环境；用户在 dashboard 点
+### 「重启网关」时，proxy 以 subprocess 调用 `cmd/main gateway-restart`，
+### 【继承的是 proxy 的环境】。若兜底值没导出，proxy 里 TRIM_PKGVAR 为空 →
+### 子进程再次退化到 /info.log（实机：line 165/443 Permission denied，且
+### 杀掉了网关却起不来）。实测：不带 export 的子进程拿不到 :="兜底值"。
+export TRIM_APPDEST
+export TRIM_PKGVAR="${TRIM_PKGVAR:-/var/apps/${APP}/var}"
+export TRIM_USERNAME="${TRIM_USERNAME:-${APP}}"
+export TRIM_GROUPNAME="${TRIM_GROUPNAME:-${TRIM_USERNAME}}"
+
+### 必须在上面兜底【之后】定义（原先是反的 → 未注入时 LOG_FILE=/info.log，
+### 在根目录写日志失败/留垃圾）。
+LOG_FILE="${TRIM_PKGVAR}/info.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+### 面板凭据的启动脚本（600）：避免密码出现在 /proc/<pid>/cmdline。
+AUTH_ENV_FILE="${TRIM_PKGVAR}/.dashboard-auth.sh"
+
+APP_DIR="${TRIM_APPDEST}"
+SRC_DIR="${APP_DIR}/runtime/hermes"
+
+### 本脚本的绝对路径 / 所在目录。
+### ⚠ cmd/ 被 fnOS 装在 /var/apps/<app>/cmd/（= <appdata>/cmd），**不在**
+### 应用内容树 APP_DIR（= /vol1/@appcenter/<app>）里 —— 任何 `${APP_DIR}/cmd/main`
+### 都是错的路径。凡是需要引用本脚本自身的地方，一律用下面这两个变量。
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+APP_CTL_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
+### 两种运行时模式（由构建时的标记文件决定）：
+###  - 自带 CPython（默认）：PY=runtime/python/bin/python3，依赖在其 site-packages。
+###  - 系统 Python 模式：存在 .use-system-python 标记时用 NAS 上现建的
+###    venv（${TRIM_PKGVAR}/venv，路径是本机的、可移植性没问题）。
+if [ -f "${APP_DIR}/runtime/.use-system-python" ]; then
+    PY="${TRIM_PKGVAR}/venv/bin/python3"
+else
+    PY="${APP_DIR}/runtime/python/bin/python3"
+fi
+WEB_DIST="${APP_DIR}/runtime/web_dist"
+GATEWAY_SOCKET="${APP_DIR}/hermes.sock"
+GATEWAY_PROXY="${APP_DIR}/gateway-proxy.py"
+DATA_DIR="${TRIM_PKGVAR}"
+### 可选依赖的懒安装目标（TTS/STT/Bedrock 等首次使用时才装）。
+### 为什么必须显式给：自带 CPython 不是 venv，而 Hermes 的懒安装默认走
+### `uv pip install`（uv 无 venv 时会拒绝："No virtual environment found"），
+### 且它会强制设 VIRTUAL_ENV=<解释器上级>，连 UV_SYSTEM_PYTHON 都压不住、还会
+### 试图写只读的 TRIM_APPDEST（实测均失败）。设了这个变量后，上游改走
+### `uv pip install --target <此目录>`（上游明确为"非 venv 部署"设计，带 ABI 戳
+### 校验）—— 不需要 venv，且落在可写的数据目录。实测 --target 路径 exit=0。
+LAZY_SITE="${DATA_DIR}/site-packages"
+
+### PM（上游包管理器）依赖环境守卫。
+### ⚠ 实机事故（v0.22.2）：上游把 pm 模块加回来了，且 hermes_bootstrap 每次启动都调
+### pm.environments.activate_dependencies()。只要 <data>/installs/<key>/facts.json 存在，
+### 它就会【无条件清空 sys.path 上所有 site-packages 项】，改用 facts.json 记录的
+### venv —— 而我们的事实文件里 extras=[]（PM sync 时 feature_list 为空），该 venv
+### 缺 messaging 全栈（aiohttp/telegram/discord/slack…）→ 所有可选平台适配器失效：
+### 「No adapter available for enabled qqbot」。
+### 本包的依赖完整预装在包内 CPython 的 site-packages（86 个发行包），不应被这个
+### core-only venv 顶掉。故启动前把 installs/<key> 归档，让 committed_venv() 返回
+### None → 走 _require_own_dependencies()（非 store python 直接 return，保留原
+### sys.path）。
+### 归档而非删除：留作排查/回退。
+###
+### ⚠ 放行条件（2026-11-03 实机验证后补）：早先无条件归档，而功能基线
+### （enabled-features.json）修好后 PM venv 已经是完整的（extras 含
+### messaging/web，aiohttp 在）。此时再归档，等于把刚 sync 好的环境作废：
+### 用户装的插件依赖每次重启都要重新搬一遍、installs/ 无限增长、
+### 而 PM 的备份/回滚机制形同虚设。
+### 所以只在「这个 venv 真的缺本安装的基础 extra」时才归档 —— 即残缺
+### （core-only）环境，正是本条守卫要防的那种。
+### 判据取 venv 的 facts.json 里的 extras（PM 自己在 sync 时写的），不重新
+### 解析 pyproject，避免运行期依赖源码树。
+PM_REQUIRED_EXTRAS="messaging web"
+ensure_pm_env_ignored() {
+    local root="${DATA_DIR}/installs"
+    [ -d "${root}" ] || return 0
+    # ⚠ 与后台 bootstrap 互斥：bootstrap 正在写新 facts.json 时，这里若看到
+    #   「不完整的 facts.json」会把正在构建的目录整个归档 —— 45 秒白跑，还可能
+    #   留下半成品。用非阻塞锁：拿不到就说明别人正在动 PM 环境，本次直接跳过。
+    local _lock="${DATA_DIR}/pm-env.lock"
+    if command -v flock > /dev/null 2>&1; then
+        exec 201>>"${_lock}" 2>/dev/null || true
+        if ! flock -n 201 2>/dev/null; then
+            log_msg "PM 环境正被其他进程修改（bootstrap 进行中），本次守卫跳过"
+            return 0
+        fi
+    fi
+    local d archived=0
+    for d in "${root}"/*/; do
+        [ -d "${d}" ] || continue
+        # ⚠ 跳过已经归档过的目录：glob 会匹配 *.disabled-*（它们同样在 installs/
+        #   下、同样含 facts.json），否则每次启动都把它再改名一次 —— 实机见过
+        #   9 层叠加 ...disabled-20261018...disabled-20261019...，目录名逼近 PATH_MAX。
+        case "${d}" in *.disabled-*) continue ;; esac
+        [ -f "${d}facts.json" ] || continue
+        # 环境健全（含全部基础 extra）→ 放行，不动它。
+        if pm_env_is_complete "${d%/}"; then
+            continue
+        fi
+        # ⚠ 归档前先把「插件/懒安装依赖」迁移到 LAZY_SITE，否则 mem0 这类
+        #   插件依赖会跟整个 PM venv 一起消失（实机事故：mem0 backend 初始化失败）。
+        #   PM venv = 核心依赖(缺 messaging) + 插件依赖；我们只保住后者。
+        migrate_pm_venv_extras "${d%/}" || true
+        local bak="${d%/}.disabled-$(date +%Y%m%d%H%M%S)"
+        if mv "${d%/}" "${bak}" 2>/dev/null; then
+            archived=1
+        fi
+    done
+    if [ "${archived}" = "1" ]; then
+        log_msg "PM 依赖环境已归档（extras 缺 ${PM_REQUIRED_EXTRAS}，会被 core-only venv 顶掉；插件依赖已迁移到 ${LAZY_SITE}）"
+    fi
+    # 释放 PM 环境锁（fd 201）。关闭 fd 即解锁。
+    { exec 201>&-; } 2>/dev/null || true
+    return 0
+}
+
+### 解析 PM【当前选中】环境的 site-packages 路径；拿不到则输出空。
+###
+### 为什么不能 find 猜（2026-11-04 实机教训）：
+###   1) 真实深度是 7：
+###      installs/<key>/environments/<gen>/venv/lib/python3.14/site-packages
+###      用 -maxdepth 3 会一条都找不到 → prune 整段逻辑静默不执行。
+###   2) installs/ 下还有 *.disabled-* 归档目录，它们同样含 environments/ 与
+###      facts.json；不排除的话会拿到已被归档的旧环境，版本对比全错。
+### 正确来源：<data>/installs/<key>/facts.json 的 packages.venv.environment，
+### 再拼 site-packages。facts 缺失或路径不存在 → 输出空（调用方自行跳过）。
+pm_env_site_packages() {
+    local facts
+    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f \
+               -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
+    [ -n "${facts}" ] || return 0
+    "${PY}" - "${facts}" <<'PYEOF' 2>/dev/null
+import json, sys
+from pathlib import Path
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+except (OSError, ValueError):
+    raise SystemExit(0)
+env = ((data.get("packages") or {}).get("venv") or {}).get("environment")
+if not isinstance(env, str) or not env:
+    raise SystemExit(0)
+venv = Path(env)
+if not (venv / "pyvenv.cfg").is_file():
+    raise SystemExit(0)
+libs = sorted((venv / "lib").glob("python3*/site-packages"))
+print(str(libs[0]) if libs else "")
+PYEOF
+}
+
+### 活跃 install 的 state 目录（<data>/installs/<key>，不含 .disabled-*）；拿不到输出空。
+pm_env_state_dir() {
+    local facts
+    facts="$(find "${DATA_DIR}/installs" -maxdepth 2 -name facts.json -type f \
+               -not -path '*.disabled-*' 2>/dev/null | head -n 1)"
+    [ -n "${facts}" ] && dirname "${facts}"
+}
+
+### PM 是否已经提交过可用的环境。
+### ⚠ 不能只看「有没有 facts.json」：归档目录 .disabled-* 里也留着 facts.json，
+###   只看文件存在会误判成「已有环境」→ bootstrap 不跑 → 懒安装又坏
+###   （2026-11-04 实机指出，升级时旧环境被归档的场景会复发）。
+### 判据：排除 .disabled-*，且 facts 记录的 environment 真实存在。
+pm_env_committed() {
+    local site
+    site="$(pm_env_site_packages)"
+    [ -n "${site}" ] && [ -d "${site}" ]
+}
+
+### 该 PM 环境是否带有本安装要求的全部基础 extra。
+### 读 <installs>/<key>/facts.json 的 venv.extras（PM 在每次 sync 时写入）。
+### 文件不存在/解析失败 → 视为不完整（保守：宁可归档，退回包内完整依赖）。
+pm_env_is_complete() {
+    local state_dir="$1" facts="${1}/facts.json"
+    [ -r "${facts}" ] || return 1
+    "${PY}" - "${facts}" ${PM_REQUIRED_EXTRAS} <<'PYEOF' 2>/dev/null
+import json, sys
+path, required = sys.argv[1], set(sys.argv[2:])
+try:
+    data = json.load(open(path, encoding="utf-8-sig"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+venv = (data.get("packages") or {}).get("venv") or data.get("venv") or {}
+extras = venv.get("extras")
+if not isinstance(extras, list):
+    raise SystemExit(1)
+# 上游用 "all" 表示全量安装，视同覆盖所有要求。
+have = {str(e).lower() for e in extras}
+raise SystemExit(0 if ("all" in have or required <= have) else 1)
+PYEOF
+}
+
+### 把 PM venv 里「包内 site-packages 没有的」发行包迁到 LAZY_SITE。
+### 为什么：PM venv 同时承载核心依赖与插件依赖，整体归档会丢后者；而包内
+### site-packages 已含全部核心依赖，所以只补差集即可。按 dist-info 名判重，
+### 已存在的（含更高版本）跳过 —— 绝不让 pip 升级核心包（LAZY_SITE 在
+### PYTHONPATH 里优先于包内，升级核心包会遮蔽）。
+### 纯复制、不解析依赖关系（PM 装时已解析过）。
+migrate_pm_venv_extras() {
+    local state_dir="$1"
+    local vendir
+    # ⚠ 深度是 4：environments/<gen>/venv/lib/python3.14/site-packages。
+    #   原先 -maxdepth 3 永远找不到 → 归档 PM 环境时插件依赖从未被迁移过
+    #   （与 prune 的 -maxdepth 3 是同一类错误，2026-11-04 一并修正）。
+    vendir="$(find "${state_dir}/environments" -maxdepth 5 -type d -name site-packages 2>/dev/null | head -n 1)"
+    [ -n "${vendir}" ] && [ -d "${vendir}" ] || return 0
+    local bundled="${APP_DIR}/runtime/python/lib/python3.14/site-packages"
+    [ -d "${bundled}" ] || bundled="$(find "${APP_DIR}/runtime/python" -maxdepth 5 -type d -name site-packages 2>/dev/null | head -n 1)"
+    [ -n "${bundled}" ] && [ -d "${bundled}" ] || return 0
+    mkdir -p "${LAZY_SITE}" 2>/dev/null || true
+    "${PY}" - "${vendir}" "${bundled}" "${LAZY_SITE}" <<'PYEOF' >> "${LOG_FILE}" 2>&1
+import os, re, shutil, sys
+from pathlib import Path
+
+src, bundled, dst = map(Path, sys.argv[1:4])
+# 规范化发行包名（PEP 503）：Foo_Bar-1.0.dist-info -> foo-bar
+def norm(n: str) -> str:
+    return re.sub(r"[-_.]+", "-", n).lower()
+
+def dists(root: Path) -> dict:
+    out = {}
+    try:
+        for e in root.iterdir():
+            if e.is_dir() and e.name.endswith(".dist-info"):
+                out[norm(e.name[: -len(".dist-info")].rsplit("-", 1)[0])] = e.name
+    except OSError:
+        pass
+    return out
+
+have_bundled = dists(bundled)
+have_lazy = dists(dst)
+migrated, skipped = [], []
+for e in src.iterdir():
+    if not e.is_dir():
+        continue
+    name = e.name
+    if name.endswith(".dist-info"):
+        base = norm(name[: -len(".dist-info")].rsplit("-", 1)[0])
+    else:
+        continue
+    if base in have_bundled or base in have_lazy:
+        skipped.append(base)
+        continue
+    if (dst / name).exists():
+        skipped.append(base)
+        continue
+    shutil.copytree(e, dst / name, symlinks=True, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__"))
+    # __pycache__/RECORD 之外的顶层内容：dist-info 已复制，跳过重复
+    migrated.append(base)
+
+# 复制非 dist-info 的顶层文件/目录（纯 python 包体、.so、data 等）。
+# 用 RECORD 精确对照比按名字猜更稳，但为免复杂，这里只复制 dist-info 里列出、
+# dst 尚不存在的条目。
+migrated_files = 0
+for base in migrated:
+    # 找到该 base 对应的 dist-info（可能在 src 里）
+    di = None
+    for e in src.iterdir():
+        if e.is_dir() and norm(e.name[: -len(".dist-info")].rsplit("-", 1)[0]) == base and e.name.endswith(".dist-info"):
+            di = e
+            break
+    if di is None:
+        continue
+    rec = di / "RECORD"
+    if not rec.is_file():
+        continue
+    for line in rec.read_text(encoding="utf-8", errors="replace").splitlines():
+        rel = line.split(",", 1)[0].strip()
+        if not rel or rel.startswith("..") or rel.startswith("/"):
+            continue
+        s, t = src / rel, dst / rel
+        if t.exists() or not s.exists():
+            continue
+        t.parent.mkdir(parents=True, exist_ok=True)
+        if s.is_symlink():
+            try: t.symlink_to(os.readlink(s))
+            except OSError: pass
+        elif s.is_file():
+            shutil.copy2(s, t)
+            migrated_files += 1
+
+print(f"  [pm-migrate] 新增 {len(migrated)} 个发行包、{migrated_files} 个文件, 跳过 {len(skipped)} 个已存在")
+if migrated:
+    print("    ", ", ".join(sorted(migrated)[:12]) + (" …" if len(migrated) > 12 else ""))
+PYEOF
+    return 0
+}
+
+### 实际执行体（由 lazy_prune_redundant 通过 `"${PY}" -` 调用）
+lazy_prune_body() {
+    cat <<'PYEOF'
+import os, re, shutil, sys
+from pathlib import Path
+
+lazy, pm, archive = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+dry = "--dry" in sys.argv
+
+def norm(n):
+    return re.sub(r"[-_.]+", "-", n).lower()
+
+def dist_map(root):
+    out = {}
+    try:
+        for e in root.iterdir():
+            if e.is_dir() and e.name.endswith(".dist-info"):
+                stem = e.name[: -len(".dist-info")]
+                name, _, ver = stem.rpartition("-")
+                if name:
+                    out[norm(name)] = (e, ver)
+    except OSError:
+        pass
+    return out
+
+def ver_tuple(v):
+    parts = re.findall(r"\d+", v or "")
+    return tuple(int(p) for p in parts[:4]) if parts else ()
+
+lazy_d, pm_d = dist_map(lazy), dist_map(pm)
+redundant, keep = [], []
+for name, (di, ver) in sorted(lazy_d.items()):
+    if name not in pm_d:
+        keep.append((name, ver, "PM 没有"))
+        continue
+    pm_ver = pm_d[name][1]
+    lt, pt = ver_tuple(ver), ver_tuple(pm_ver)
+    if not lt or not pt:
+        keep.append((name, ver, "版本无法解析，保守保留"))
+        continue
+    if pt >= lt:
+        redundant.append((name, ver, pm_ver))
+    else:
+        keep.append((name, ver, "PM 版本更低(%s)" % pm_ver))
+
+print("[lazy-prune] LAZY=%d PM=%d 冗余=%d 保留=%d" % (len(lazy_d), len(pm_d), len(redundant), len(keep)))
+for n, v, pv in redundant:
+    print("  归档 %-22s LAZY=%-10s PM=%s" % (n, v, pv))
+for n, v, why in keep:
+    print("  保留 %-22s %-10s (%s)" % (n, v, why))
+
+if dry or not redundant:
+    raise SystemExit(0)
+
+moved = 0
+for name, _v, _pv in redundant:
+    di = lazy_d[name][0]
+    targets = {di}
+    rec = di / "RECORD"
+    if not rec.is_file():
+        print("  ! 跳过 %s: 缺少 RECORD，无法确定包体范围" % name)
+        continue
+    tops = set()
+    for line in rec.read_text(encoding="utf-8", errors="replace").splitlines():
+        rel = line.split(",", 1)[0].strip()
+        if not rel or rel.startswith(("..", "/")):
+            continue
+        top = rel.split("/", 1)[0]
+        if top and top != di.name:
+            tops.add(top)
+    for top in tops:
+        targets.add(lazy / top)
+    for src in sorted(targets):
+        if not src.exists():
+            continue
+        dest = archive / src.relative_to(lazy)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(src), str(dest))
+            moved += 1
+        except OSError as exc:
+            print("  ! 移动失败 %s: %s" % (src, exc))
+print("[lazy-prune] 已归档 %d 个条目 → %s" % (moved, archive))
+PYEOF
+}
+
+### 清理 LAZY_SITE 里「PM 环境已覆盖」的冗余包。
+###
+### 背景（实机 2026-11-04）：PM 接管运行时后，activate_dependencies() 会按
+### 【目录名】过滤掉所有叫 site-packages 的条目，LAZY_SITE 因此对主进程失效。
+### 实测 LAZY_SITE 里 13 个发行包有 12 个 PM venv 已在（版本 ≥ LAZY），
+### 只有 pyopen_wakeword 是游离的。把冗余的归档掉，可让三套依赖环境收敛成两套。
+###
+### 为什么不干脆清空 LAZY_SITE？
+### 因为 PM 环境并非永久有效：ensure_pm_env_ignored 在 extras 不完整时仍会归档
+### 整个 PM 环境、退回包内依赖 —— 那一刻 LAZY_SITE 重新变得可见，是插件依赖的
+### 唯一来源。只清「PM 已覆盖」的部分，两端都安全。
+###
+### ⚠ 三条实现红线：
+###   1. 只按 *.dist-info 判断，绝不能用目录名 —— google / grpc 是 protobuf /
+###      grpcio 的 namespace 包，没有 dist-info，按名字删会连带破坏它们。
+###   2. 只有「PM 版本 ≥ LAZY 版本」才归档；版本解析失败一律跳过（保守）。
+###   3. 只移动不删除，落到 <data>/lazy-site-archived/<时间戳>/，保留相对路径。
+###      PY_LAZY_PRUNE=dry 时只打印清单，不动文件。
+###
+### 环境变量：
+###   PY_LAZY_PRUNE=1|dry  执行/干跑（默认 dry，须显式开启才真归档）
+lazy_prune_redundant() {
+    local pm_site="$1" dry="${PY_LAZY_PRUNE:-dry}"
+    [ -d "${LAZY_SITE}" ] || return 0
+    if [ -z "${pm_site}" ] || [ ! -d "${pm_site}" ]; then
+        log_msg "LAZY_SITE 清理：找不到 PM 环境，跳过"
+        return 0
+    fi
+    local dir="${DATA_DIR}/lazy-site-archived/$(date +%Y%m%d%H%M%S)"
+    local out rc
+    if [ "${dry}" = "dry" ]; then
+        out="$(lazy_prune_body | "${PY}" - "${LAZY_SITE}" "${pm_site}" "${dir}" --dry 2>&1)"
+        rc=$?
+    else
+        out="$(lazy_prune_body | "${PY}" - "${LAZY_SITE}" "${pm_site}" "${dir}" 2>&1)"
+        rc=$?
+    fi
+    [ "${rc}" -eq 0 ] || { printf '%s\n' "${out}" >> "${LOG_FILE}"; return 0; }
+
+    if [ "${dry}" = "dry" ]; then
+        # 干跑预览会随每次应用启动重复出现；内容没变就不再写 info.log。
+        local cache="${DATA_DIR}/.lazy-prune-preview"
+        if [ -f "${cache}" ] && [ "$(cat "${cache}" 2>/dev/null)" = "${out}" ]; then
+            return 0
+        fi
+        printf '%s\n' "${out}" > "${cache}" 2>/dev/null || true
+        printf '%s\n' "${out}" >> "${LOG_FILE}"
+        log_msg "LAZY_SITE 清理预览（干跑，未改动文件；设 PY_LAZY_PRUNE=1 执行）"
+        return 0
+    fi
+
+    printf '%s\n' "${out}" >> "${LOG_FILE}"
+    log_msg "LAZY_SITE 清理完成（冗余包已归档到 ${dir}）"
+    # 真跑后清掉旧预览缓存，避免下次干跑误判"没变化"
+    rm -f "${DATA_DIR}/.lazy-prune-preview" 2>/dev/null || true
+    return 0
+}
+
+### 懒安装目录的 ABI 守卫。
+### ⚠ 惨痛教训（v0.22.2 升级实机）：LAZY_SITE 被放在 PYTHONPATH 里，且【优先于】
+### 包内解释器自己的 site-packages。上一个版本（CPython 3.12）的懒安装目录里
+### 残留着 cp312 编译的扩展（如 pydantic_core/_pydantic_core.cpython-312-*.so）。
+### 换成 CPython 3.14 后，这些目录仍在 PYTHONPATH 前部 → import 到 cp312 的包
+### → `ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'`
+### → dashboard 起不来（Bad Gateway）、gateway 的 agent 也全线失败。
+### 上游只在【下次懒安装时】才校验 ABI 戳（_ensure_target_ready），不会在启动时
+### 清理 —— 所以必须由我们在启动前处理：ABI 不匹配就把整个目录归档移走
+### （不删，留作排查/回退），让解释器用包内自带的 site-packages。
+### 当前解释器的 ABI 标记，形如 `cpython-314-x86_64-linux-gnu`（不含前后缀）。
+lazy_abi() {
+    "${PY}" -c 'import sysconfig; s=sysconfig.get_config_var("EXT_SUFFIX") or ""; print(s[1:-3] if s.startswith(".") and s.endswith(".so") else s)' 2>/dev/null
+}
+
+ensure_lazy_site_abi() {
+    [ -d "${LAZY_SITE}" ] || { mkdir -p "${LAZY_SITE}" 2>/dev/null || true; return 0; }
+    local want stamp have
+    want="$(lazy_abi)"
+    [ -n "${want}" ] || return 0
+    stamp="${LAZY_SITE}/.abi-stamp"
+    if [ -f "${stamp}" ]; then
+        have="$(tr -d '[:space:]' < "${stamp}" 2>/dev/null)"
+        [ "${have}" = "${want}" ] && return 0
+    else
+        # 没有戳：目录可能来自旧版本（或首次创建）→ 看里面有没有同构的 .so 能判断。
+        # 抽不到 ABI（abi3 稳定 ABI / 异常命名）→ 放行（宁可保留也不误删用户目录）。
+        local so abi=""
+        so="$(find "${LAZY_SITE}" -maxdepth 3 -name '*.so' 2>/dev/null | head -n 1)"
+        if [ -z "${so}" ]; then
+            printf '%s\n' "${want}" > "${stamp}" 2>/dev/null || true
+            return 0
+        fi
+        abi="$(basename "${so}" | sed -nE 's/^.*\.(cpython-[0-9]+[^.]*)\.so$/\1/p')"
+        if [ -z "${abi}" ] || [ "${abi}" = "${want}" ]; then
+            printf '%s\n' "${want}" > "${stamp}" 2>/dev/null || true
+            return 0
+        fi
+        have="${abi}"
+    fi
+    local bak="${LAZY_SITE}.abi-mismatch-$(date +%Y%m%d%H%M%S)"
+    log_msg "懒安装目录 ABI 不匹配（旧=${have:-?} 新=${want}）→ 归档到 ${bak} 并重建"
+    mv "${LAZY_SITE}" "${bak}" 2>/dev/null || rm -rf "${LAZY_SITE}" 2>/dev/null || true
+    mkdir -p "${LAZY_SITE}" 2>/dev/null || true
+    printf '%s\n' "${want}" > "${LAZY_SITE}/.abi-stamp" 2>/dev/null || true
+    return 0
+}
+
+### 进程识别：绝对路径匹配，不误伤其他 python。
+### ⚠ 系统 Python 模式下 dashboard 的 argv[0] 是 ${TRIM_PKGVAR}/venv/bin/python3，
+### 【不含】${APP_DIR}/runtime（实测该进程 cmdline 只有 venv 解释器 + 参数）。
+### 沿用旧 pattern 会让 pid_alive()/status() 恒判「未运行」：应用中心显示已停止 /
+### 启动失败，而 start 会重复拉起（端口冲突），stop 的兜底 pkill 也失效。
+### 改用「解释器 + 模块」前缀，两种运行时模式都精确命中。
+PATTERN="${PY} -m ${MODULE}"
+GATEWAY_PATTERN="${APP_DIR}/gateway-proxy.py"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+### 进程存活判定以 /proc 为准。
+### 不用 kill -0：非属主调用时它对活着的进程返回 EPERM，与"不存在"无法区分，
+### 会把 pidfile 误删（而 pidfile 是 fnOS 判定服务状态的依据）。
+pid_alive() {
+    local pid="$1" cmd state
+    [ -n "${pid}" ] || return 1
+    [ -d "/proc/${pid}" ] || return 1
+    state="$(cut -d' ' -f3 "/proc/${pid}/stat" 2>/dev/null)"
+    [ "${state}" = "Z" ] && return 1
+    cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)"
+    [ -z "${cmd}" ] && return 0
+    case "${cmd}" in *"${PATTERN}"*|*"${GATEWAY_PATTERN}"*) return 0 ;; esac
+    return 1
+}
+
+### 只认本应用自己的进程（绝对路径匹配）。
+### pgrep/pkill 的 pattern 前必须加 --，否则会被 procps 当成选项。
+own_pids() {
+    pgrep -f -- "${PATTERN}" 2>/dev/null
+    pgrep -f -- "${GATEWAY_PATTERN}" 2>/dev/null
+}
+
+read_pid() {
+    [ -r "${PID_FILE}" ] && head -n 1 "${PID_FILE}" | tr -d '[:space:]'
+}
+
+### 工作区：优先 TRIM_DATA_SHARE_PATHS 里名为 hermes/workspace 的共享目录，
+### 否则第一个共享路径，最终兜底 PKGVAR/workspace。
+resolve_workspace() {
+    local p
+    if [ -n "${TRIM_DATA_SHARE_PATHS}" ]; then
+        local IFS=':'
+        for p in ${TRIM_DATA_SHARE_PATHS}; do
+            case "${p}" in */hermes/workspace) printf '%s' "${p}"; return 0 ;; esac
+        done
+        for p in ${TRIM_DATA_SHARE_PATHS}; do
+            [ -n "${p}" ] && { printf '%s' "${p}"; return 0; }
+        done
+    fi
+    printf '%s' "${TRIM_PKGVAR}/workspace"
+}
+
+### .env 读写助手（env_get / env_kv）从共享库加载 —— 安装/设置回调也要用同一套
+### 编解码，必须与 python-dotenv 逐字节一致，否则上游 load_hermes_dotenv 会用
+### 「它解析出来的密码」覆盖我们 exec env 传进去的密码。
+if [ -r "${APP_DIR}/envfile.sh" ]; then
+    . "${APP_DIR}/envfile.sh"
+else
+    log_msg "警告：缺少 envfile.sh —— 面板密码含 # 或首尾空格时可能失效"
+fi
+
+### 面板鉴权（basic auth）环境变量。
+### 为什么需要：dashboard 要绑 0.0.0.0 才能用 `http://NAS:端口` 访问，而上游
+### 自 2026-06 的 0day 加固起，**非回环绑定强制要求 auth provider**
+### （--insecure 已失效）。上游内置 basic 密码 provider，从环境变量读取：
+###   HERMES_DASHBOARD_BASIC_AUTH_USERNAME / _PASSWORD / _SECRET
+### 密码在安装向导填写，落到 <data>/.env（见 install_callback / config_callback）。
+### secret 用于会话签名；不设则每次重启随机生成 → 用户每次重启都要重新登录，
+### 所以安装时生成一个固定的并持久化到 .env。
+###
+### 返回值是若干行 `export KEY='...'`，调用方【写入 600 权限的文件再 source】，
+### 不拼进命令行（密码否则会出现在 /proc/<pid>/cmdline）。
+### 值用单引号包裹并转义单引号 —— .env 里的密码可能含 $ / ` / \ / " 等任意字符，
+### 只有单引号形式在 shell 里是字面量。
+### 留空说明：.env 里没配 → 返回 1，调用方退回仅回环。
+dashboard_auth_env() {
+    local user pass secret
+    user="$(env_get BASIC_AUTH_USER 2>/dev/null || true)"
+    pass="$(env_get BASIC_AUTH_PASSWORD 2>/dev/null || true)"
+    secret="$(env_get BASIC_AUTH_SECRET 2>/dev/null || true)"
+    if [ -z "${user}" ] || [ -z "${pass}" ]; then
+        return 1
+    fi
+    [ -n "${secret}" ] || secret="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    # 单引号转义：' → '\''
+    # ⚠ 必须用 bash 参数替换而不是 sed：sed 的替换文本里 \ 会被再吃掉一层，
+    #   `s/'/\'\\''\''/g` 实际输出 it'''s（实测），单引号结尾直接语法错误。
+    local q="'\\''"
+    user="${user//\'/${q}}"
+    pass="${pass//\'/${q}}"
+    secret="${secret//\'/${q}}"
+    printf "export HERMES_DASHBOARD_BASIC_AUTH_USERNAME='%s'\n" "${user}"
+    printf "export HERMES_DASHBOARD_BASIC_AUTH_PASSWORD='%s'\n" "${pass}"
+    printf "export HERMES_DASHBOARD_BASIC_AUTH_SECRET='%s'\n" "${secret}"
+}
+
+### 端口是否已被监听。
+### ⚠ 必须锚定【本地地址】列（$2）且要求 LISTEN 状态（st == 0A）：
+###   原先是 `grep -q ":1F87"` 全行匹配，远端地址恰好是该端口的 TIME_WAIT
+###   连接也会命中 —— 那会让「已就绪」判定假阳性，掩盖真正的 bind 失败。
+### 让 web_dist 同时适配「网关带前缀」与「端口直连无前缀」两种访问方式。
+###
+### 背景：前端产物按 base=/app/hermes/ 构建（web-build.mjs 写死），index.html 里是
+###   <script src="/app/hermes/assets/index-xxx.js">
+### 而 dashboard 只把静态资源挂在 /assets（上游 web_server_dashboard.py 的 mount）。
+###   · 经飞牛网关：gateway-proxy 先剥掉 /app/hermes 再转发 → 上游看到 /assets/… ✓
+###   · 端口直连：没有代理剥前缀 → /app/hermes/assets/… 命中 SPA 兜底路由，
+###     返回 index.html（text/html）；`type="module"` 脚本因 MIME 不符被浏览器
+###     拒绝执行 → 登录页正常（服务端直出）、登录后白屏（实测报告 2026-11-02）。
+###
+### 修法：在 web_dist 里给前缀做个指向自身的软链（app/hermes -> ..）。
+### 上游的 SPA 兜底路由会按真实文件路径返回、并带正确 MIME，所以无需改上游代码。
+### 只创建一次、幂等；web_dist 被在线更新整体替换后会丢失，故启动与更新后都要补。
+ensure_web_prefix_alias() {
+    local dist="$1"
+    [ -d "${dist}" ] || return 0
+    if [ -e "${dist}/app/hermes" ] && [ ! -L "${dist}/app/hermes" ]; then
+        # 已存在实体目录：不覆盖（可能是用户/上游自己放的），只提示。
+        log_msg "提示：${dist}/app/hermes 已存在且不是软链，跳过前缀别名"
+        return 0
+    fi
+    mkdir -p "${dist}/app" 2>/dev/null || return 0
+    [ -L "${dist}/app/hermes" ] || ln -sfn .. "${dist}/app/hermes" 2>/dev/null || true
+}
+
+port_listening() {
+    local hex
+    hex="$(printf '%04X' "${PORT}")"
+    awk -v h=":${hex}" '$2 ~ h"$" && $4 == "0A" { found = 1 } END { exit(found ? 0 : 1) }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
+### 谁在监听 ${PORT}：输出 "pid 命令名"，找不到则输出空。
+### 只用于日志诊断（端口冲突时用户需要知道去关哪个应用）。
+port_owner() {
+    local hex pid fd inode inodes
+    hex="$(printf '%04X' "${PORT}")"
+    inodes="$(awk -v h=":${hex}" '$2 ~ h"$" && $4 == "0A" { print $10 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u)"
+    [ -n "${inodes}" ] || return 0
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        for fd in /proc/${pid}/fd/*; do
+            inode="$(readlink "${fd}" 2>/dev/null)"
+            case "${inode}" in
+                socket:\[*\])
+                    inode="${inode#socket:[}"; inode="${inode%]}"
+                    case " $(echo ${inodes} | tr '\n' ' ') " in
+                        *" ${inode} "*) printf '%s %s' "${pid}" "$(cat "/proc/${pid}/comm" 2>/dev/null)"; return 0 ;;
+                    esac
+                    ;;
+            esac
+        done
+    done
+    return 0
+}
+
+### 查找 node —— 对话页的 TUI 终端、以及 npx 驱动的流程（装浏览器 / MCP 依赖）需要它。
+### 为什么必须显式给：上游找 node 时优先读 $HERMES_NODE；未设时它会走自己的运行时
+### 定位路径，在离线/受限环境会**长时间无输出**（实测报告缺陷 4）。
+### 优先级：Hermes 托管的 node（<data>/node/bin/node，Hermes 自己的 dep_ensure 也优先它）
+### → 应用中心的 nodejs → PATH → 跨卷兜底。
+### 优先级（v24 优先，与 manifest 的 install_dep_apps=nodejs_v24 一致）：
+###   1) 应用中心 nodejs v24 → v22（每档都覆盖 /var/apps 与跨卷 @appcenter 两种形态）
+###   2) Hermes 托管的 <data>/node（兜底；旧布局/用户自装）
+###   3) PATH → 跨卷 v25/v26
+### ⚠ 两处必须按【版本】分层，不能按【路径】分层（实机报告 node-priority-fix）：
+###   · 跨卷的 v24 若排在 /var/apps 的 v22 之后，就会「降级」选到 v22；
+###   · 应用中心 v22 实测是 22.18.0，**低于** engines 下限 22.22.0，必须校验。
+### ⚠ <data>/node 不能放第一顺位：它是 Hermes 按需下载的（实测 v22.23.3），
+###   版本随上游 lock 变化且通常过时；放首位会让"v24 优先"形同虚设。
+find_node_bin() {
+    local d mj ver
+    for mj in 24 22; do
+        for d in /var/apps/nodejs_v${mj}/target/bin/node \
+                 /var/apps/nodejs_v${mj}/bin/node \
+                 /vol*/@appcenter/nodejs_v${mj}/bin/node; do
+            [ -x "${d}" ] || continue
+            # v22 档必须满足 engines（^22.22.0）；应用中心的 22.18.0 会被跳过。
+            if [ "${mj}" = "22" ]; then
+                ver="$("${d}" -v 2>/dev/null)"
+                [ "$(printf '%s\nv22.22.0\n' "${ver}" | sort -V | tail -n 1)" = "${ver}" ] || continue
+            fi
+            printf '%s' "${d}"; return 0
+        done
+    done
+    # 兜底：Hermes 托管 node（应用中心没有满足 versions 的版本时才用）。
+    [ -x "${DATA_DIR}/node/bin/node" ] && { printf '%s' "${DATA_DIR}/node/bin/node"; return 0; }
+    d="$(command -v node 2>/dev/null)" && [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
+    for d in /vol*/@appcenter/nodejs_v25/bin/node /vol*/@appcenter/nodejs_v26/bin/node; do
+        [ -x "${d}" ] && { printf '%s' "${d}"; return 0; }
+    done
+    return 1
+}
+
+### 构造 node 环境：HERMES_NODE + 把 node 目录前置进 PATH。
+### ⚠ 只设 HERMES_NODE 不够 —— npm/npx 的 shim 首行是 `#!/usr/bin/env node`，
+### env 只认 PATH，与 HERMES_NODE 无关。不把 node 目录加进 PATH，npx 驱动的流程
+### （装浏览器 / 装 MCP 依赖）会 `env: 'node': No such file or directory`，
+### 且上游会假报成功（实测报告问题 A/C）。输出形如 `HERMES_NODE='…' PATH='…'` 的
+### key='value' 串（供拼进 `exec env` 用），或空串。
+node_env() {
+    local nb
+    nb="$(find_node_bin)" || return 0
+    local ndir; ndir="$(dirname "${nb}")"
+    local newpath
+    case ":${PATH}:" in
+        *":${ndir}:"*) newpath="${PATH}" ;;
+        *)             newpath="${ndir}:${PATH}" ;;
+    esac
+    printf "HERMES_NODE='%s' PATH='%s'" "${nb}" "${newpath}"
+}
+
+### 浏览器（Chromium）环境：把 AGENT_BROWSER_EXECUTABLE_PATH 指向已安装的 chrome。
+### 为什么需要（实测报告问题 B）：`agent-browser install` 把 Chromium 装到
+### <data>/.agent-browser/browsers/chrome-*/chrome，而 Hermes 的就绪检测
+### （tools/browser_tool_install.py::_chromium_installed）只扫
+### AGENT_BROWSER_EXECUTABLE_PATH → PATH 上的 google-chrome/chromium → Playwright 的
+### <home>/.cache/ms-playwright。装的位置与找的位置不一致 → 装成功仍报「Chromium 缺失」。
+### 上游检测把本变量列第一顺位，且它指向不存在的路径时不会 fail-hard（继续往后判），
+### 所以由我们按实际安装位置指向最稳。用 glob 取最新版本目录（agent-browser 升级后
+### 自动跟上，无需人工维护软链）。未安装则输出空串。
+browser_env() {
+    local base="${DATA_DIR}/.agent-browser" p="" cand
+    # ⚠ 两个坑：
+    #  1) 必须按【版本号】排序取最新，不能用裸 glob 的"最后一项"——那是字典序，
+    #     chrome-99.x 会排在 chrome-155.x 之后（"9" > "1"），多版本并存时选到旧版。
+    #  2) 用 `while read` + 进程替换，不能用 `for in $(ls …)` —— 后者按空白分词，
+    #     路径含空格时会被拆碎（`[ -x ]` 判定失败）。glob 不匹配时列出字面量，
+    #     下面的 `[ -x ]` 自然过滤掉。
+    while IFS= read -r cand; do
+        [ -x "${cand}" ] && { p="${cand}"; break; }
+    done < <(printf '%s\n' "${base}/browsers/"*/chrome | sort -Vr)
+    # 兜底：用户手工建的稳定软链（若无 chrome-* 目录）
+    [ -n "${p}" ] || { [ -x "${base}/chrome-current" ] && p="${base}/chrome-current"; }
+    [ -n "${p}" ] && printf "AGENT_BROWSER_EXECUTABLE_PATH='%s'" "${p}"
+}
+
+### 面板入口说明（写给排查的人）：
+### ui/config 的入口是 /app/hermes（iframe）。飞牛统一网关把 /app/hermes/**
+### 转到 hermes.sock 且不剥前缀。gateway-proxy.py 剥掉前缀后转发到
+### 127.0.0.1:PORT，并给上游发 X-Forwarded-Prefix，让 dashboard 生成带前缀的
+### 资产 URL 与 __HERMES_BASE_PATH__。
+### 鉴权：两种模式——
+###   · 未配面板密码：dashboard 绑回环，不做 auth 门，网关侧用飞牛登录态（X-Trim-*）
+###   · 配了面板密码：dashboard 绑 0.0.0.0，启用 basic auth；网关转发来的请求
+###     也走同一套登录（飞牛登录态之外再加一层面板密码）
+
+GATEWAY_PID_FILE="${TRIM_PKGVAR}/gateway.pid"
+GATEWAY_WANT_FILE="${TRIM_PKGVAR}/gateway.want"   # 存在=期望运行；删除=停止
+
+### 消息网关 supervisor。
+### 为什么需要：dashboard 的「重启网关」会把 gateway 进程退出、指望外部 manager
+### 重新拉起（--external-supervisor 的语义就是"退出后交还给 manager"）。fnOS 没有
+### systemd/s6 那样自带的 manager，所以本脚本充当 supervisor：want 文件在 → 退出就拉起。
+### 官方 trim.hermes 用 Go wrapper 做同样的事。
+###
+### gateway_want 存在 → 持续拉起；被删除 → 循环退出（用于正常停止）。
+gateway_supervisor_loop() {
+    local ws="$1"
+    ### node 环境不靠参数传递：runuser 分支只传了 ws，参数化会在那条路径上丢失。
+    ### 循环体自行用 node_env() 解析（HERMES_NODE + PATH，见其说明）。
+    local gw_node="" _ne
+    _ne="$(node_env)" && [ -n "${_ne}" ] && gw_node="${_ne} \\"
+    # 浏览器环境（Chromium 路径）：同一个 gateway 进程要跑 browser_exec，也需要它。
+    local gw_browser="" _be
+    _be="$(browser_env)" && [ -n "${_be}" ] && gw_browser="${_be} \\"
+    ### 退出时带走自己 spawn 的 gateway 子进程。
+    ### 为什么必须：单例保护 / stop 会 kill 掉本 supervisor，但若它正卡在 `wait`，
+    ### 那个 gateway 会成孤儿、继续占着 profile → 新 supervisor 拉的 gateway 永远
+    ### exit 75。让 supervisor 自清子进程，kill 掉 supervisor 即等于 kill 掉它的 gateway。
+    local gwpid=""
+    _gw_cleanup() { [ -n "${gwpid}" ] && kill -TERM "${gwpid}" 2>/dev/null || true; }
+    trap '_gw_cleanup; exit 0' TERM INT
+
+    local GW_CMD
+    GW_CMD="cd '${SRC_DIR}' && exec env \
+HOME='${DATA_DIR}' \
+PYTHONPATH='${SRC_DIR}:${LAZY_SITE}' \
+PYTHONUNBUFFERED=1 \
+PYTHONDONTWRITEBYTECODE=1 \
+HERMES_HOME='${DATA_DIR}' \
+HERMES_BUNDLED_SKILLS='${SRC_DIR}/skills' \
+HERMES_OPTIONAL_SKILLS='${SRC_DIR}/optional-skills' \
+HERMES_BUNDLED_PLUGINS='${SRC_DIR}/plugins' \
+HERMES_BUNDLED_LOCALES='${SRC_DIR}/locales' \
+HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
+HERMES_WRITE_SAFE_ROOT='${ws}' \
+HERMES_MANAGED_BY='trim-hermes-fnos' \
+HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
+HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
+TMPDIR='${ws}/tmp' TMP='${ws}/tmp' TEMP='${ws}/tmp' \
+${gw_node}
+${gw_browser}
+'${PY}' -m ${MODULE} gateway run --external-supervisor"
+
+    ### 退避：上游用 exit 75 表示"已有实例在服务同一 profile，请 manager 稍后重试"
+    ### （gateway/restart.py 的 GATEWAY_SERVICE_RESTART_EXIT_CODE）。若本 supervisor
+    ### 因任何原因变成非唯一（历史上就出现过双 supervisor），固定 1s 重试会把它放大成
+    ### 每秒级重启风暴。按退出码退避：75/0 走指数退避，其余（真崩溃）保持 1s 快速自愈。
+    local backoff=1
+    while [ -f "${GATEWAY_WANT_FILE}" ]; do
+        # ⚠ 每次 fork 前都要过一遍 PM 守卫：本循环是 dashboard「重启网关」按钮、
+        #   SIGUSR1、崩溃 respawn 的共同入口，它们都不经过 start_process()。
+        #   漏掉这里 = 只要发生过一次 pm sync，下一次网关级重启就必然切到
+        #   core-only venv，平台适配器（QQ/Telegram/Discord）全部失效
+        #   （实机报告 2026-11-03，四次重启均复现）。
+        ensure_pm_env_ignored
+        log_msg "supervisor: 启动 gateway"
+        if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+            bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
+        else
+            runuser -u "${TRIM_USERNAME}" -- bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
+        fi
+        gwpid=$!   # 赋给外层变量，trap 才能看到（不要用 local，否则脱离 trap 作用域）
+        printf '%s' "${gwpid}" > "${GATEWAY_PID_FILE}"
+        local started_at; started_at="$(date +%s)"
+        wait "${gwpid}" 2>/dev/null
+        local rc=$?
+        # 被主动停止（want 文件已删）→ 退出循环
+        [ -f "${GATEWAY_WANT_FILE}" ] || break
+        # 稳定跑满 60s 后复位退避（说明上次是偶发，不是持续冲突）
+        [ $(( $(date +%s) - started_at )) -ge 60 ] && backoff=1
+        case "${rc}" in
+            75|0)
+                # 已有实例在服务同一 profile / 抢单例失败 → 退避重试
+                log_msg "supervisor: gateway 退出 (code=${rc})，${backoff}s 后重试"
+                sleep "${backoff}"
+                # 翻倍但封顶 30（对"翻倍结果"封顶，否则 16→32 会先冲过头再回落 30）
+                backoff=$(( backoff * 2 > 30 ? 30 : backoff * 2 )) ;;
+            *)
+                log_msg "supervisor: gateway 退出 (code=${rc})，1s 后重启"
+                sleep 1 ;;
+        esac
+    done
+    rm -f "${GATEWAY_PID_FILE}"
+    log_msg "supervisor: 退出"
+}
+
+### 列出所有 supervisor 循环体的 PID（去重），**排除自身与父进程**。
+### 覆盖两种 cmdline 形态：
+###  - 新版：exec 后的 `${SELF_PATH} __gateway_supervisor <ws>`
+###  - 旧版：以应用用户运行时 `gateway_supervisor_loop ... &` 只 fork 不 exec，
+###    子 shell 沿用调用者 cmdline（`cmd/main gateway-restart` / `gateway-start`）→
+###    必须按这些子命令匹配，否则 stop / 单例清理都杀不掉它，故障无法自愈（缺陷 B）。
+### ⚠ 排除自身：本函数会被 `restart_gateway`（自身 cmdline = `cmd/main gateway-restart`）
+###   调用，按该 pattern 匹配会把自己也算进去 → 自检误报 / pkill 自杀。
+supervisor_pids() {
+    local pat pid ppid out=""
+    # ① 精确：新版 exec 出来的循环体（cmdline = `${SELF_PATH} __gateway_supervisor`）
+    for pat in \
+        "${SELF_PATH} __gateway_supervisor" \
+        "cmd/main __gateway_supervisor"; do
+        for pid in $(pgrep -f -- "${pat}" 2>/dev/null); do
+            [ "${pid}" = "$$" ] || [ "${pid}" = "${PPID}" ] || out="${out}${pid}\n"
+        done
+    done
+    # ② 旧版（fork 子 shell）遗留：cmdline 与调用者一致（`cmd/main gateway-restart`
+    #    / `gateway-start`），【无法】与"用户恰好敲了同一命令的 shell"区分 ——
+    #    曾在诊断时误杀外层测试 shell。唯一可靠判据是【已孤儿化】：旧循环体的
+    #    父进程（那次 gateway-* 调用）早已退出 → PPID=1；用户活着的 shell 有正常
+    #    父进程。故只收 PPID=1 的。新版一律 exec（见 ①），不再产生这类遗留。
+    for pat in \
+        "${SELF_PATH} gateway-restart" \
+        "${SELF_PATH} gateway-start" \
+        "cmd/main gateway-restart" \
+        "cmd/main gateway-start"; do
+        for pid in $(pgrep -f -- "${pat}" 2>/dev/null); do
+            [ "${pid}" = "$$" ] && continue
+            [ "${pid}" = "${PPID}" ] && continue
+            ppid="$(awk '/^PPid:/{print $2}' "/proc/${pid}/status" 2>/dev/null)"
+            [ "${ppid}" = "1" ] && out="${out}${pid}\n"
+        done
+    done
+    printf '%b' "${out}" | sort -u
+}
+
+kill_supervisors() {
+    local pid
+    for pid in $(supervisor_pids); do
+        kill -"${1:-TERM}" "${pid}" 2>/dev/null || true
+    done
+}
+
+start_gateway_supervisor() {
+    local ws="$1"
+    # TMPDIR 指向 ${ws}/tmp（自动 TTS 等 tempdir 使用者要在写安全根内，见 env 块注释）。
+    # 本函数也能被 restart_gateway 单独调用，故在此也确保目录存在。
+    mkdir -p "${ws}/tmp" 2>/dev/null || true
+
+    ### 日志可写是后续所有重定向的前提。不可写就立刻失败 —— 否则 supervisor
+    ### 的重定向失败会被后台子 shell 吞掉，父进程照常打印 pid（假成功），
+    ### 而网关其实从未启动（实机报告 §4.3）。
+    if ! { : >> "${LOG_FILE}"; } 2>/dev/null; then
+        echo "日志不可写：${LOG_FILE}" >&2
+        echo "日志不可写：${LOG_FILE}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+        return 1
+    fi
+
+    ### 单例保护（缺陷 A）：本函数"调用即新建"，而 gateway-restart 会被面板连点 /
+    ### 前端超时重试触发多次 → 起出多份 supervisor → 各拉一个 gateway 抢单例 →
+    ### 后起者必 exit 75 → 无限重启风暴。所以起之前先清掉已有实例。
+    ### ⚠ 清理必须放在写 want 文件【之前】：否则旧 supervisor 正卡在 `wait` 时若看到
+    ###   want 复活，会再拉一个 gateway（虽随后被我们杀掉，但那个 gateway 会成孤儿）。
+    if [ -n "$(supervisor_pids)" ]; then
+        log_msg "supervisor 已在运行，先清理旧实例再重启"
+        kill_supervisors TERM
+        sleep 1
+        kill_supervisors KILL
+    fi
+    : > "${GATEWAY_WANT_FILE}"
+
+    ### 两个分支都必须 exec：fork 的子 shell 会沿用调用者 cmdline，stop 的兜底
+    ### pkill 匹配不到（缺陷 B），且 pgrep 单例检查也会误判。exec 后 cmdline 稳定为
+    ### `${SELF_PATH} __gateway_supervisor <ws>`，可被精确命中。
+    ### ⚠ `200>&-` 必须加：调用方（restart_gateway）持有 flock fd 200，fork 出的子进程
+    ###   会继承该 fd → 长命的 supervisor 会一直持有锁 → 之后每次 gateway-restart 都
+    ###   拿不到锁、静默 no-op（网关再也重启不了）。子进程主动关闭该 fd 即释放锁。
+    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+        bash -c "exec '${SELF_PATH}' __gateway_supervisor '${ws}'" >> "${LOG_FILE}" 2>&1 200>&- &
+    else
+        runuser -u "${TRIM_USERNAME}" -- bash -c \
+            "exec '${SELF_PATH}' __gateway_supervisor '${ws}'" >> "${LOG_FILE}" 2>&1 200>&- &
+    fi
+    local spid=$!
+    ### 不要立刻宣告成功：后台子 shell 可能因重定向/权限/exec 失败秒退。
+    ### 稍等再确认它真活着，否则返回非 0（调用方据此报失败，而不是假成功）。
+    sleep 1
+    if ! kill -0 "${spid}" 2>/dev/null; then
+        log_msg "启动消息网关 supervisor 失败（pid=${spid} 已退出）"
+        return 1
+    fi
+    log_msg "启动消息网关 supervisor (pid=${spid})"
+    return 0
+}
+
+### ── PM 环境 bootstrap ─────────────────────────────────────────
+### 为什么要做：上游 PM 的「按需安装」要求进程运行在 PM 选定的依赖环境里
+### （pm/client.py 的 running_from_selected_environment）。在一台从未跑过
+### `pm install` 的机器上，facts.json 不存在 → 判定为 False → 20+ 个可选功能
+### （telegram/discord/doc-extract/stt-whisper/唤醒词…）全部无法懒安装
+### （实机 2026-11-04 用临时 HOME 复现：committed_venv=None、running=False）。
+### 这里在启动后台补一次 sync，让 facts.json 出现，判定随即成立。
+###
+### ⚠ 三条硬约束：
+###   1. 绝不在前台跑：sync 要联网，本机实测 45s，离线机器会更久 —— 不能拖慢启动
+###   2. 绝不让失败影响应用：任何失败只记日志，下次启动按退避重试
+###   3. 成功与「试过」必须是两个标记文件，否则失败会被当成已成功
+PM_BOOTSTRAP_DONE="${TRIM_PKGVAR}/.pm-bootstrapped"
+PM_BOOTSTRAP_TRIES="${TRIM_PKGVAR}/.pm-bootstrap-attempts"
+
+### 取基线 extras（enabled-features.json 的 extras 数组）。
+### 读不到就退回默认值 —— 与 install_callback 写入的基础项一致。
+pm_bootstrap_extras() {
+    local f="${TRIM_PKGVAR}/enabled-features.json"
+    local out=""
+    [ -r "${f}" ] && out="$("${PY}" - "${f}" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+except (OSError, ValueError):
+    raise SystemExit(0)
+extras = data.get("extras")
+if isinstance(extras, list) and extras:
+    print(" ".join(str(e) for e in extras if str(e).strip()))
+PYEOF
+)"
+    # "all" 对我们没有意义（会装全部 extra，体积爆炸），过滤掉
+    out="$(printf '%s' "${out}" | tr ' ' '\n' | grep -vx 'all' | tr '\n' ' ')"
+    out="${out% }"
+    [ -n "${out}" ] || out="web messaging"
+    printf '%s' "${out}"
+}
+
+### 是否需要 bootstrap：facts.json 不存在，且未成功过，且退避未到。
+pm_bootstrap_needed() {
+    [ -f "${PM_BOOTSTRAP_DONE}" ] && return 1
+    # PM 已提交过【可用】环境 → 无需 bootstrap。
+    # ⚠ 用 pm_env_committed（排除 .disabled-* 且校验 environment 真实存在），
+    #   不能只 find 到 facts.json 就认定有环境 —— 归档目录里也留着 facts.json，
+    #   那种情况下 bootstrap 必须照常跑（实机 2026-11-04 指出）。
+    pm_env_committed && return 1
+    # 退避：失败后 10min → 1h → 6h → 24h，最多每小时一次，避免离线机器反复卡网络
+    [ -r "${PM_BOOTSTRAP_TRIES}" ] || return 0
+    local last count now wait
+    last="$(head -n 1 "${PM_BOOTSTRAP_TRIES}" 2>/dev/null | cut -d' ' -f1)"
+    count="$(head -n 1 "${PM_BOOTSTRAP_TRIES}" 2>/dev/null | cut -d' ' -f2)"
+    case "${last}" in ''|*[!0-9]*) return 0 ;; esac
+    case "${count}" in ''|*[!0-9]*) count=1 ;; esac
+    now="$(date +%s)"
+    case "${count}" in
+        1) wait=600 ;;      # 10 分钟
+        2) wait=3600 ;;     # 1 小时
+        3) wait=21600 ;;    # 6 小时
+        *) wait=86400 ;;    # 24 小时
+    esac
+    [ $(( now - last )) -ge "${wait}" ] && return 0
+    return 1
+}
+
+### 后台执行一次 bootstrap。本函数自身立刻返回，真正的工作在子 shell 里。
+pm_bootstrap_kick() {
+    pm_bootstrap_needed || return 0
+    local extras
+    extras="$(pm_bootstrap_extras)"
+    log_msg "PM 环境 bootstrap：后台安装基线依赖（${extras}）—— 完成后可选功能才能按需安装"
+
+    (
+        # 独立会话：父进程（App Center 的 start）退出后继续跑
+        # 输出单独存档，避免混进 info.log 淹没真正的启动错误
+        local blog="${TRIM_PKGVAR}/log/pm-bootstrap.log"
+        mkdir -p "$(dirname "${blog}")" 2>/dev/null || true
+        # 与 ensure_pm_env_ignored 共用同一把锁：bootstrap 写环境期间，守卫不会
+        # 把正在构建的 installs/<key> 当成「残缺环境」归档掉。
+        # 非阻塞：拿不到说明别人正在动 PM 环境，本次放弃（下次启动再试）。
+        if command -v flock > /dev/null 2>&1; then
+            exec 201>>"${DATA_DIR}/pm-env.lock" 2>/dev/null || true
+            if ! flock -n 201 2>/dev/null; then
+                log_msg "PM 环境 bootstrap：另有进程正在修改 PM 环境，本次跳过"
+                exit 0
+            fi
+        fi
+        {
+            echo "=== bootstrap started $(date -Is) extras=${extras} ==="
+            cd "${SRC_DIR}" || exit 1
+            # 与 cmd/main 启动环境一致，但故意【不】带 LAZY_SITE：
+            # bootstrap 的结果只应影响 PM 自己的环境。
+            env HOME="${DATA_DIR}" \
+                PYTHONPATH="${SRC_DIR}" \
+                PYTHONUNBUFFERED=1 \
+                PYTHONDONTWRITEBYTECODE=1 \
+                HERMES_HOME="${DATA_DIR}" \
+                HERMES_MANAGED_BY="trim-hermes-fnos" \
+                "${PY}" -m hermes_cli.main pm install --extra ${extras}
+            rc=$?
+            echo "=== bootstrap finished $(date -Is) rc=${rc} ==="
+        } >> "${blog}" 2>&1
+
+        if [ "${rc:-1}" -eq 0 ]; then
+            date +%s > "${PM_BOOTSTRAP_DONE}" 2>/dev/null || true
+            rm -f "${PM_BOOTSTRAP_TRIES}" 2>/dev/null || true
+            log_msg "PM 环境 bootstrap 完成：可选功能现在可以按需安装"
+        else
+            local prev=0
+            [ -r "${PM_BOOTSTRAP_TRIES}" ] && prev="$(head -n 1 "${PM_BOOTSTRAP_TRIES}" 2>/dev/null | cut -d' ' -f2)"
+            case "${prev}" in ''|*[!0-9]*) prev=0 ;; esac
+            printf '%s %s\n' "$(date +%s)" "$((prev + 1))" > "${PM_BOOTSTRAP_TRIES}" 2>/dev/null || true
+            log_msg "PM 环境 bootstrap 失败（rc=${rc}），详见 log/pm-bootstrap.log；将按退避重试"
+        fi
+    ) </dev/null >/dev/null 2>&1 &
+    # 不记录 PID：这是尽力而为的后台任务，应用停止时无需管理它的生命周期
+}
+
+start_process() {
+    if status > /dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ ! -x "${PY}" ]; then
+        log_msg "启动失败：找不到 ${PY}"
+        echo "应用文件缺失：${PY}" > "${TRIM_TEMP_LOGFILE}"
+        return 1
+    fi
+    if [ ! -d "${SRC_DIR}/hermes_cli" ]; then
+        log_msg "启动失败：找不到源码树 ${SRC_DIR}/hermes_cli"
+        echo "应用文件缺失：${SRC_DIR}" > "${TRIM_TEMP_LOGFILE}"
+        return 1
+    fi
+    if [ ! -f "${WEB_DIST}/index.html" ]; then
+        log_msg "启动失败：缺少预构建前端 ${WEB_DIST}/index.html"
+        echo "应用缺少预构建前端（web_dist）" > "${TRIM_TEMP_LOGFILE}"
+        return 1
+    fi
+    # 端口直连需要：产物里的 /app/hermes/assets/… 能落到真实文件（见函数注释）。
+    ensure_web_prefix_alias "${WEB_DIST}"
+
+    local ws
+    ws="$(resolve_workspace)"
+    mkdir -p "${DATA_DIR}" "${DATA_DIR}/log" "${ws}" "${ws}/tmp" "${LAZY_SITE}" "$(dirname "${PID_FILE}")"
+    # 懒安装目录 ABI 守卫：Python 大版本变更后，旧目录里的 cp3xx 扩展会让
+    # import 崩（pydantic_core 等），必须先归档。见 ensure_lazy_site_abi 注释。
+    ensure_lazy_site_abi
+    # PM 依赖环境守卫：facts.json 存在会让 PM 用 core-only venv 顶掉包内完整
+    # site-packages（qqbot 等适配器失效）。见 ensure_pm_env_ignored 注释。
+    ensure_pm_env_ignored
+    # LAZY_SITE 冗余收敛：PM 环境健全时，把 LAZY_SITE 里 PM 已覆盖的包归档。
+    # 默认干跑（只记日志）；确认无误后由用户设 PY_LAZY_PRUNE=1 才真执行。
+    # ⚠ 环境路径必须从 facts.json 读【当前选中的 generation】：
+    #   1) 不能靠 find 猜 —— 目录深度是 7（installs/<key>/environments/<gen>/venv/lib/python3.14/site-packages），
+    #      实机验证时 -maxdepth 3 导致整段逻辑从未执行（2026-11-04）。
+    #   2) 不能取 head -n 1 —— 会先命中 .disabled-* 里的旧环境，版本对比结果就错了。
+    # ⚠ 只在 PM 环境【健全】时清理：两个机制不能互相拆台 ——
+    #   prune 把 LAZY_SITE 的包归档后，如果 PM 环境之后又被
+    #   ensure_pm_env_ignored 归档（extras 不完整时），插件依赖就彻底没了。
+    #   所以额外要求 pm_env_is_complete（extras 含 messaging+web）。
+    local _pm_site=""
+    _pm_site="$(pm_env_site_packages)"
+    if [ -n "${_pm_site}" ]; then
+        local _pm_state _pm_facts
+        _pm_state="$(pm_env_state_dir)"
+        _pm_facts="${_pm_state}/facts.json"
+        if [ -n "${_pm_state}" ] && [ -r "${_pm_facts}" ] && pm_env_is_complete "${_pm_state}"; then
+            lazy_prune_redundant "${_pm_site}" || true
+        else
+            log_msg "LAZY_SITE 清理：PM 环境 extras 不完整，跳过（避免与归档守卫互相拆台）"
+        fi
+    fi
+    # doctor 需要 ~/.local/bin/hermes（$HOME = HERMES_HOME = DATA_DIR）。
+    # 本包走 /usr/local/bin/hermes（usr-local-linker），但上游 doctor 的
+    # _check_command_installation() 只认 ~/.local/bin。
+    # ⚠ 不能软链到 runtime/hermes/hermes：它的 shebang 是 `#!/usr/bin/env python3`，
+    #   在 fnOS 上会命中系统 python3（3.11），跑不了我们的 3.14 依赖。
+    #   doctor 对「非软链的普通文件」是 check_ok（"exists (non-symlink)"），
+    #   所以这里放一个**包装脚本**，用包内解释器转交。
+    _link="${DATA_DIR}/.local/bin/hermes"
+    [ -d "${DATA_DIR}/.local/bin" ] || mkdir -p "${DATA_DIR}/.local/bin" 2>/dev/null || true
+    if [ -x "${APP_DIR}/bin/hermes" ]; then
+        # 旧版可能留了指向 bin/hermes 的软链 → 换成包装脚本
+        [ -L "${_link}" ] && rm -f "${_link}" 2>/dev/null || true
+        if [ ! -e "${_link}" ]; then
+            printf '#!/bin/sh\nexec "%s" "$@"\n' "${APP_DIR}/bin/hermes" > "${_link}" 2>/dev/null \
+                && chmod 755 "${_link}" 2>/dev/null || true
+        fi
+    fi
+    rm -f "${GATEWAY_SOCKET}"
+
+    log_msg "Starting Hermes dashboard (gateway + loopback port) ..."
+    log_msg "PY=${PY}  APP_DIR=${APP_DIR}  HOME=${DATA_DIR}  WS=${ws}  PORT=${PORT}  SOCK=${GATEWAY_SOCKET}"
+
+    # 主服务：binding 由下方 dashboard_auth_env 决定（有密码→0.0.0.0 + basic auth；
+    # 无密码→仅回环，不触发上游的强制鉴权门）。
+    # 资源定位用上游官方的 HERMES_BUNDLED_* 机制（比靠 PROJECT_ROOT 推导更稳，
+    # 与官方 fnOS 包的 hermes-env 一致）：源码树即资源根。
+    # TUI 终端 + npx 驱动的流程（装浏览器 / MCP 依赖）用的 node。
+    # node_env() 同时给 HERMES_NODE 和 PATH（后者才是 npx shim 的 shebang 所需）。
+    local NODE_ENV="" _ne
+    if _ne="$(node_env)" && [ -n "${_ne}" ]; then
+        NODE_ENV="${_ne} \\"
+        log_msg "TUI node: $(find_node_bin)"
+    else
+        log_msg "警告：未找到 node —— 对话页终端不可用，且浏览器/MCP 依赖无法 npx 安装"
+    fi
+    # 浏览器环境（Chromium 路径，见 browser_env 说明）
+    local BROWSER_ENV="" _be
+    _be="$(browser_env)" && [ -n "${_be}" ] && BROWSER_ENV="${_be} \\"
+
+    ### 绑定地址与鉴权：配了面板密码 → 绑 0.0.0.0（支持 http://NAS:端口），
+    ### 并注入 basic auth 三个变量（上游非回环绑定强制要求 auth provider）。
+    ### 未配密码 → 退回 127.0.0.1 仅回环（飞牛网关仍可用，保持开箱即用）。
+    local BIND_HOST="127.0.0.1"
+    local AUTH_ENV="" _ae
+    ### 凭据【不进 argv】：把 AUTH_ENV 写成 600 权限的启动脚本，由 bash 去 source。
+    ### 理由：拼进 `bash -c "..."` 的话，`ps` / `/proc/<pid>/cmdline` 对同机所有用户
+    ### 可见（NAS 上常有多个账号），等于把面板密码挂在大厅里。
+    ### ⚠ 脚本内容里是 `export KEY='...'`，由 dashboard_auth_env 保证单引号已转义。
+    rm -f "${AUTH_ENV_FILE}"
+    if _ae="$(dashboard_auth_env)" && [ -n "${_ae}" ]; then
+        BIND_HOST="0.0.0.0"
+        ( umask 077; printf '%s\n' "${_ae}" > "${AUTH_ENV_FILE}" ) 2>/dev/null || {
+            log_msg "警告：无法写入 ${AUTH_ENV_FILE}，本次不启用面板鉴权"
+            BIND_HOST="127.0.0.1"
+        }
+        if [ "${BIND_HOST}" = "0.0.0.0" ]; then
+            AUTH_ENV=". '${AUTH_ENV_FILE}' || exit 1"
+            log_msg "面板鉴权已启用（basic auth），绑定 ${BIND_HOST}:${PORT}"
+        fi
+        ### 端口预检：checkport=true 只是向应用中心声明申请该端口，不保证真的拿到。
+        ### 若 9119 已被别的应用占用，dashboard 会 bind 失败退出，而 gateway socket
+        ### 仍会起来 → 飞牛桌面点进去是 502，且日志里只有一行 uvicorn 报错。
+        ### 这里提前检测并明确降级：退回仅回环（端口不再对外）+ 把占用者写进日志。
+        if port_listening; then
+            local _owner
+            _owner="$(port_owner 2>/dev/null)"
+            log_msg "警告：端口 ${PORT} 已被占用（${_owner:-未知进程}）→ 端口直连不可用；"
+            log_msg "      本次改为仅绑回环，飞牛统一网关入口不受影响。"
+            log_msg "      要启用 http://NAS:${PORT} 直连，请停用/卸载占用该端口的应用后重启本应用。"
+            BIND_HOST="127.0.0.1"
+            AUTH_ENV=""
+            rm -f "${AUTH_ENV_FILE}" 2>/dev/null || true
+        fi
+    else
+        log_msg "面板未配置密码 → 仅绑回环 127.0.0.1:${PORT}（仅飞牛网关可访问）"
+    fi
+
+    local CMD
+    CMD="cd '${SRC_DIR}' && exec env \
+HOME='${DATA_DIR}' \
+PYTHONPATH='${SRC_DIR}:${LAZY_SITE}' \
+PYTHONUNBUFFERED=1 \
+PYTHONDONTWRITEBYTECODE=1 \
+HERMES_HOME='${DATA_DIR}' \
+HERMES_BUNDLED_SKILLS='${SRC_DIR}/skills' \
+HERMES_OPTIONAL_SKILLS='${SRC_DIR}/optional-skills' \
+HERMES_BUNDLED_PLUGINS='${SRC_DIR}/plugins' \
+HERMES_BUNDLED_LOCALES='${SRC_DIR}/locales' \
+HERMES_OPTIONAL_MCPS='${SRC_DIR}/optional-mcps' \
+HERMES_WEB_DIST='${WEB_DIST}' \
+HERMES_WRITE_SAFE_ROOT='${ws}' \
+HERMES_MANAGED_BY='trim-hermes-fnos' \
+HERMES_LAZY_INSTALL_TARGET='${LAZY_SITE}' \
+HERMES_TUI_WS_ORPHAN_REAP_GRACE_S='300' \
+TMPDIR='${ws}/tmp' TMP='${ws}/tmp' TEMP='${ws}/tmp' \
+${NODE_ENV}
+${BROWSER_ENV}
+'${PY}' -m ${MODULE} dashboard --host '${BIND_HOST}' --port '${PORT}' --no-open --skip-build"
+
+    ### 顺序很关键：先 source 凭据脚本（在子 shell 里 export），再 exec env ——
+    ### `exec env` 会把这些变量原样继承给 python。
+    local RUNNER="${CMD}"
+    [ -n "${AUTH_ENV}" ] && RUNNER="${AUTH_ENV}; ${CMD}"
+
+    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+        bash -c "${RUNNER}" >> "${LOG_FILE}" 2>&1 &
+    else
+        runuser -u "${TRIM_USERNAME}" -- bash -c "${RUNNER}" >> "${LOG_FILE}" 2>&1 &
+    fi
+    printf "%s" "$!" > "${PID_FILE}"
+
+    # 网关代理：Unix Socket → 127.0.0.1:PORT，剥前缀 + 发 X-Forwarded-Prefix。
+    if [ ! -f "${GATEWAY_PROXY}" ]; then
+        log_msg "启动失败：找不到 ${GATEWAY_PROXY}"
+        echo "缺少 gateway-proxy.py" > "${TRIM_TEMP_LOGFILE}"
+        return 1
+    fi
+    local GW_CMD
+    # HERMES_GATEWAY_DEBUG=1：把每个请求的路径与客户端 X-Forwarded-* 记进日志，
+    # 以及 HTML 改写结果。真机排查资源 404 时这是唯一的现场证据。
+    # 输出量很小（每请求一行），长期开启无妨。
+    GW_CMD="exec env \
+HERMES_APP_ROOT='${APP_DIR}' \
+HERMES_CMD_MAIN='${SELF_PATH}' \
+HERMES_APP_CTL_DIR='${APP_CTL_DIR}' \
+HERMES_GATEWAY_SOCKET='${GATEWAY_SOCKET}' \
+HERMES_GATEWAY_PREFIX='${GATEWAY_PREFIX}' \
+HERMES_UPSTREAM_HOST='127.0.0.1' \
+HERMES_UPSTREAM_PORT='${PORT}' \
+HERMES_GATEWAY_DEBUG='1' \
+'${PY}' '${GATEWAY_PROXY}'"
+    if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then
+        bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
+    else
+        runuser -u "${TRIM_USERNAME}" -- bash -c "${GW_CMD}" >> "${LOG_FILE}" 2>&1 &
+    fi
+
+    # 消息网关（Telegram / QQ / 飞书等）—— 缺陷 5：官方 trim.hermes 会起它，
+    # 本包原先漏了，导致「Gateway Status: Stopped」，消息平台开箱不可用。
+    #
+    # 由本脚本当 supervisor（--external-supervisor 的语义就是"退出后交还给
+    # manager 重启"）：gateway 退出就拉起，这样 dashboard 的「重启网关」才有意义
+    # （见下面 supervisor 循环）。
+    if ! start_gateway_supervisor "${ws}"; then
+        # 不阻断 dashboard 启动，但必须留下明确记录（否则表现为"应用正常、通道离线"）。
+        log_msg "警告：消息网关 supervisor 启动失败 —— 消息平台将不可用，请查看日志"
+    fi
+
+    # 后台补一次 PM 环境（不阻塞、失败不影响应用；见 pm_bootstrap_kick 说明）。
+    # 放在启动就绪判定之前发起，让它与 dashboard/gateway 的启动并行进行。
+    pm_bootstrap_kick || true
+
+    # 就绪：TCP 回环监听 + Unix Socket
+    local i=0
+    while [ "${i}" -lt 90 ]; do
+        if port_listening && [ -S "${GATEWAY_SOCKET}" ]; then
+            log_msg "started, port ${PORT} + socket ${GATEWAY_SOCKET} (PID=$(cat "${PID_FILE}" 2>/dev/null))"
+            return 0
+        fi
+        pid_alive "$(read_pid)" || { log_msg "警告：Hermes 进程提前退出，详见日志"; return 1; }
+        sleep 1
+        i=$((i + 1))
+    done
+    if pid_alive "$(read_pid)" && [ -S "${GATEWAY_SOCKET}" ]; then
+        log_msg "started (slow), socket ready"
+        return 0
+    fi
+    if pid_alive "$(read_pid)"; then
+        log_msg "警告：端口/socket 暂未就绪但进程存活，交由应用中心继续探测"
+        return 0
+    fi
+    log_msg "警告：进程已退出且未就绪，请查看应用日志"
+    return 1
+}
+
+stop_process() {
+    log_msg "Stopping process ..."
+
+    local pid
+    pid="$(read_pid)"
+    if [ -n "${pid}" ]; then
+        if pid_alive "${pid}"; then
+            log_msg "send TERM signal to PID:${pid} ..."
+            kill -TERM "${pid}" 2>/dev/null || true
+            local count=0
+            while pid_alive "${pid}" && [ "${count}" -lt 12 ]; do
+                sleep 1
+                count=$((count + 1))
+            done
+            if pid_alive "${pid}"; then
+                log_msg "send KILL signal to PID:${pid} ..."
+                kill -KILL "${pid}" 2>/dev/null || true
+            fi
+        else
+            log_msg "pid ${pid} 已不存在"
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    # 停止时删掉凭据启动脚本：下次启动重新从 .env 生成，避免残留旧密码。
+    rm -f "${AUTH_ENV_FILE}" 2>/dev/null || true
+
+    # 先停 gateway supervisor：删 want 文件 → 它不再拉起 gateway，循环自然退出。
+    # 必须在清理进程之前做，否则 supervisor 会把我们刚杀掉的 gateway 又拉起来。
+    rm -f "${GATEWAY_WANT_FILE}"
+    rm -f "${GATEWAY_PID_FILE}"
+
+    # 兜底：dashboard 会 spawn 子进程（pty/session reaper），runuser 包装导致
+    # pidfile 记的是 wrapper 的 PID，所以按绝对路径 pattern 兜底清理。
+    if own_pids > /dev/null 2>&1; then
+        log_msg "清理残留进程 (${PATTERN} / ${GATEWAY_PATTERN})"
+        pkill -TERM -f -- "${PATTERN}" 2>/dev/null || true
+        pkill -TERM -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
+        sleep 1
+        pkill -KILL -f -- "${PATTERN}" 2>/dev/null || true
+        pkill -KILL -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
+    fi
+    # supervisor 循环体本身（bash 跑 gateway_supervisor_loop）也按 cmd/main 路径兜底。
+    # kill_supervisors 同时覆盖 exec 形态与历史遗留的 fork 子 shell（缺陷 B）。
+    kill_supervisors
+    sleep 1
+    kill_supervisors   # 二次确保 fork 子 shell 也被清掉
+    rm -f "${GATEWAY_SOCKET}"
+
+    log_msg "process stopped"
+    return 0
+}
+
+status() {
+    local pid
+    pid="$(read_pid)"
+    if [ -n "${pid}" ] && pid_alive "${pid}"; then
+        return 0
+    fi
+    # pidfile 所指进程确实不存在才清理；权限受限（读不到 cmdline）一律留着
+    if [ -n "${pid}" ] && [ ! -d "/proc/${pid}" ]; then
+        rm -f "${PID_FILE}"
+    fi
+    # pidfile 丢了但进程还在（异常重启后常见）——重新认领，避免 stop 失效
+    pid="$(own_pids | head -n 1)"
+    if [ -n "${pid}" ] && pid_alive "${pid}"; then
+        printf "%s" "${pid}" > "${PID_FILE}" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+### 在线更新：调 hermes-update.py（用同一个自带 Python）。
+### 用法：main update {check|apply|status|version}
+do_update() {
+    local script="${APP_DIR}/hermes-update.py"
+    if [ ! -f "${script}" ]; then
+        echo "缺少更新脚本：${script}" >&2
+        return 1
+    fi
+    if [ ! -x "${PY}" ]; then
+        echo "运行时不可用：${PY}" >&2
+        return 1
+    fi
+    HERMES_APP_ROOT="${APP_DIR}" HERMES_DATA_ROOT="${DATA_DIR}" \
+        "${PY}" "${script}" "${1:-status}"
+}
+
+### 单独重启消息网关（供代理的重启端点调用）：
+### 删 want 文件让 supervisor 循环退出，再写回 want 文件 + 杀掉当前 gateway，
+### supervisor 会自动拉起新的。不动 dashboard / 代理。
+### 防重入锁（缺陷 E）：gateway-{restart,start,stop} 全程无锁、restart 耗时可达
+### 15s+，面板连点或前端超时重试会并发进入 → 起出多份 supervisor。flock 串行化。
+### ⚠ 无 flock 时退化为"无锁"而非"直接返回"：否则漏装 util-linux 的机器上整个
+### 操作会变成静默 no-op。每次调用是独立进程，复用同一个 fd 200 没问题。
+acquire_gateway_lock() {
+    command -v flock > /dev/null 2>&1 || return 0
+    mkdir -p "${TRIM_PKGVAR}"
+    exec 200>"${TRIM_PKGVAR}/gateway-restart.lock" || return 0
+    flock -n 200 || return 1
+    return 0
+}
+
+restart_gateway() {
+    acquire_gateway_lock || { log_msg "gateway-restart 已在执行中，忽略本次重复调用"; return 0; }
+
+    local ws
+    ws="$(resolve_workspace)"
+
+    # 停：删 want → 杀 gateway → 等 supervisor 退出。
+    # node_env 不再在这里算：supervisor 循环体自行解析 HERMES_NODE（修缺陷 D）。
+    rm -f "${GATEWAY_WANT_FILE}"
+    local gpid
+    gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "${gpid}" ] && kill -TERM "${gpid}" 2>/dev/null || true
+    pkill -TERM -f -- "${PATTERN} gateway run" 2>/dev/null || true
+    local i=0
+    while [ "${i}" -lt 15 ]; do
+        pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1 || break
+        sleep 1
+        i=$((i + 1))
+    done
+    pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
+
+    # 起：写回 want → 重启 supervisor（start_gateway_supervisor 自带单例清理）
+    start_gateway_supervisor "${ws}" || {
+        log_msg "gateway restart 失败：supervisor 未启动"
+        return 1
+    }
+    # 不再无条件宣告成功：等 gateway 进程真正出现（最多 10s）。
+    # 原先这里直接 return 0，而 supervisor 可能因日志不可写等秒退 →
+    # 面板显示「已重启」但通道实际离线（实机报告 §4.3，最危险的一处）。
+    local n=0
+    while [ "${n}" -lt 10 ]; do
+        if pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
+            log_msg "gateway restart 完成"
+            return 0
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+    log_msg "gateway restart 失败：10s 内未见 gateway 进程"
+    return 1
+}
+
+### 仅启动消息网关（不停 dashboard / 代理）。供代理的 /api/gateway/start 调用。
+start_gateway_only() {
+    acquire_gateway_lock || { log_msg "gateway 操作已在执行中，忽略本次 start"; return 0; }
+    local ws
+    ws="$(resolve_workspace)"
+    if [ -f "${GATEWAY_WANT_FILE}" ] && pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
+        log_msg "gateway 已在运行"
+        return 0
+    fi
+    start_gateway_supervisor "${ws}" || {
+        log_msg "gateway start 失败：supervisor 未启动"
+        return 1
+    }
+    log_msg "gateway start 完成"
+    return 0
+}
+
+### 仅停止消息网关（不停 dashboard / 代理）。供代理的 /api/gateway/stop 调用。
+stop_gateway_only() {
+    acquire_gateway_lock || { log_msg "gateway 操作已在执行中，忽略本次 stop"; return 0; }
+    rm -f "${GATEWAY_WANT_FILE}"
+    local gpid
+    gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "${gpid}" ] && kill -TERM "${gpid}" 2>/dev/null || true
+    pkill -TERM -f -- "${PATTERN} gateway run" 2>/dev/null || true
+    local i=0
+    while [ "${i}" -lt 15 ]; do
+        pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1 || break
+        sleep 1
+        i=$((i + 1))
+    done
+    pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
+    # 显式清 supervisor：want 已删、gateway 已杀，它没有需要优雅清理的东西；
+    # 且它可能正卡在退避 sleep（TERM 的 trap 要等 sleep 结束才跑，最长 30s）→ 用 KILL 立即生效。
+    kill_supervisors KILL
+    rm -f "${GATEWAY_PID_FILE}"
+    log_msg "gateway stop 完成"
+    return 0
+}
+
+case "$1" in
+    start)   start_process ;;
+    stop)    stop_process ;;
+    restart) stop_process; sleep 1; start_process ;;
+    status)  if status; then exit 0; else exit 3; fi ;;
+    update)  shift; do_update "${1:-status}" ;;
+    gateway-restart) restart_gateway ;;
+    gateway-start)   start_gateway_only ;;
+    gateway-stop)    stop_gateway_only ;;
+    # 内部：被 runuser 以应用用户身份拉起的 supervisor 循环体
+    __gateway_supervisor) shift; gateway_supervisor_loop "$@" ;;
+    *)
+        # 平台可能传入我们不认识的子命令。静默 exit 1 会让界面显示
+        # 「执行脚本出错且原因未知」（实机报告 C2 的建议③）——先留痕再失败。
+        log_msg "未知子命令：'${1:-<空>}'（只接受 start/stop/restart/status/update/gateway-*/__gateway_supervisor）"
+        echo "未知子命令：${1:-<空>}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+        exit 1 ;;
+esac

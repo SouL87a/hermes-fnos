@@ -1,0 +1,369 @@
+#!/bin/bash
+# 安装后：补回可执行位（fnpack 会把 app.tgz 里的权限拍平成 0666）、
+# 校验运行时完整性、准备数据目录。
+set -e
+
+### 失败必定留痕（实机教训）：
+### fnOS 的 InstallInit/InstallCallback/UpgradeInit/UpgradeCallback 四个错误码
+### 共用同一句文案「执行脚本出错且原因未知」。脚本若死在 `set -e` 下的裸命令上，
+### 不经过任何 `echo ... > ${TRIM_TEMP_LOGFILE}` 路径，用户就只能看到"原因未知"。
+### 这里用 ERR trap 把行号与失败命令写进 TRIM_TEMP_LOGFILE（应用中心会显示它），
+### 同时追加到数据目录（失败回滚后仍可查）。
+_hermes_err_trap() {
+    local rc=$? line=$1 cmd=$2
+    local msg="[install_callback] 第 ${line} 行失败 (rc=${rc}): ${cmd}"
+    echo "${msg}" > "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+    [ -n "${TRIM_PKGVAR}" ] && echo "$(date -Is) ${msg}" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+}
+trap '_hermes_err_trap ${LINENO} "${BASH_COMMAND}"' ERR
+# 让 trap 的日志目录尽早存在（下面正式创建数据目录时会再次 mkdir，幂等）。
+[ -n "${TRIM_PKGVAR}" ] && mkdir -p "${TRIM_PKGVAR}/log" 2>/dev/null || true
+
+APP="hermes"
+
+# .env 写入助手（与 cmd/main 共用同一套编解码，须与 python-dotenv 一致）
+for _lib in "${TRIM_APPDEST:+${TRIM_APPDEST}/envfile.sh}" "/var/apps/${APP}/target/envfile.sh"             "$(dirname "$(readlink -f "$0")")/../scripts/envfile.sh"; do
+    [ -n "${_lib}" ] && [ -r "${_lib}" ] && { . "${_lib}"; break; }
+done
+if ! declare -F env_kv >/dev/null; then
+    echo "  ⚠ 缺少 envfile.sh，面板密码将以裸值写入（含 # 或首尾空格会失效）" >> "${TRIM_PKGVAR:-/tmp}/log/install.log" 2>/dev/null || true
+    env_kv() { printf '%s=%s' "$1" "$2"; }
+fi
+
+if [ -z "${TRIM_APPDEST}" ]; then
+    if [ -d "/var/apps/${APP}/target" ]; then
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}/target")"
+    else
+        TRIM_APPDEST="$(readlink -f "/var/apps/${APP}")"
+    fi
+fi
+
+RUNTIME="${TRIM_APPDEST}/runtime"
+PY="${RUNTIME}/python/bin/python3"
+
+# fnpack 把文件权限拍平成 0666，这里补回可执行位。
+# 自带 CPython：bin/ 下的可执行文件 + lib/ 下的共享库都要补位。
+if [ -d "${RUNTIME}/python/bin" ]; then
+    find "${RUNTIME}/python/bin" -type f -exec chmod +x {} \; 2>/dev/null || true
+fi
+if [ -d "${RUNTIME}/python/lib" ]; then
+    find "${RUNTIME}/python/lib" -name '*.so' -o -name '*.so.*' 2>/dev/null | while read -r so; do
+        chmod +x "${so}" 2>/dev/null || true
+    done
+fi
+[ -f "${TRIM_APPDEST}/gateway-proxy.py" ] && chmod +x "${TRIM_APPDEST}/gateway-proxy.py" 2>/dev/null || true
+
+mkdir -p "${TRIM_PKGVAR}/log" "${TRIM_PKGVAR}/workspace" "${TRIM_PKGVAR}/state"
+
+### PM 功能基线（enabled-features.json）—— 决定 pm sync 重建依赖环境时带哪些 extra。
+###
+### 为什么必须有：上游 pm 在每次 sync 时把「这个安装携带哪些 extra」写进 venv 的
+### facts.json；基线来自 pm/features.py::read_features()，读的就是这个文件。
+### 文件不存在 → 基线为空 → sync 生成 core-only venv（无 aiohttp 等）→ 网关
+### 一旦重载就切到该 venv，QQ/Telegram/Discord 等平台适配器全部建不出来
+### （实机报告 2026-11-03：重启网关后 qqbot 报 "No adapter available"）。
+###
+### 位置：上游 features_path() = store_root().parent。本安装的 store_root 解析为
+###   <data>/installs/<key>（install-stamp.json 无 runtimeDir → _unstamped_store →
+###   owning_home_root 或 get_default_hermes_root() = $HERMES_HOME = <data>），
+###   所以文件落在 <data>/enabled-features.json。
+### 内容必须与构建时实际装进包内的 extra 一致 —— build.sh 装的是 web + messaging。
+### ⚠ 不能多列：extra 里每个包都必须能解析，否则后续 sync 会因缺包失败。
+### 已存在（用户装过额外 feature）时不覆盖，但要补齐我们构建时带的基础项 ——
+### 旧版本包从未写过该文件，升级上来的用户正是靠这一步拿到基线。
+FEATURES_FILE="${TRIM_PKGVAR}/enabled-features.json"
+FEATURES_BASE='messaging web'
+if [ ! -f "${FEATURES_FILE}" ]; then
+    printf '{\n  "schema": 1,\n  "extras": [\n    "messaging",\n    "web"\n  ]\n}\n' > "${FEATURES_FILE}" 2>/dev/null || true
+    echo "  PM 功能基线：已写入 ${FEATURES_FILE}（web + messaging）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+else
+    # 读取现有 extras 与基础项取并集（保留用户额外装的），用包内解释器做 JSON 操作。
+    _py_merge="${RUNTIME}/python/bin/python3"
+    if [ -x "${_py_merge}" ]; then
+        "${_py_merge}" - "${FEATURES_FILE}" ${FEATURES_BASE} <<'PYEOF' 2>/dev/null || true
+import json, sys
+path, base = sys.argv[1], sys.argv[2:]
+try:
+    data = json.load(open(path, encoding="utf-8-sig"))
+except (OSError, ValueError):
+    data = {}
+extras = data.get("extras") if isinstance(data.get("extras"), list) else []
+merged = sorted({str(e) for e in extras} | set(base))
+if merged != sorted(str(e) for e in extras) or not isinstance(data.get("extras"), list):
+    data["schema"] = 1
+    data["extras"] = merged
+    open(path, "w", encoding="utf-8").write(json.dumps(data, indent=2) + "\n")
+    print("updated")
+PYEOF
+        echo "  PM 功能基线：已合并基础项（$("${_py_merge}" -c "import json,sys;print(','.join(json.load(open(sys.argv[1],encoding='utf-8-sig')).get('extras',[])))" "${FEATURES_FILE}" 2>/dev/null || echo '?')）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+    fi
+fi
+chmod 644 "${FEATURES_FILE}" 2>/dev/null || true
+chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${FEATURES_FILE}" 2>/dev/null || true
+
+### 系统 Python 模式：构建时放了 .use-system-python 标记，这里在 NAS 上建 venv 并装依赖。
+### 打包模式（自带 CPython）跳过此段 —— 依赖已随包分发。
+if [ -f "${RUNTIME}/.use-system-python" ]; then
+    VENV_DIR="${TRIM_PKGVAR}/venv"
+    LOG="${TRIM_PKGVAR}/info.log"
+    echo "系统 Python 模式：创建 venv 并安装依赖（需联网）…" >> "${LOG}"
+
+    ### ⚠ 代理必须【尽早】进入环境：安装期的 uv 下载与 uv pip install 都会发
+    ### 网络请求，而向导填的 wizard_proxy 原先只在末尾写 .env —— 安装时用不上，
+    ### 结果直连境外源龟速（实测 18KB/s，下 20MB 要 18 分钟）。
+    ### 这里立刻：写 .env + export 成环境变量（curl/uv/pip 都认 HTTP(S)_PROXY）。
+    PROXY="${wizard_proxy:-}"
+    case "${PROXY}" in *$'\n'*) PROXY="" ;; esac
+    if [ -n "${PROXY}" ] && printf '%s' "${PROXY}" | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
+        export HTTP_PROXY="${PROXY}" HTTPS_PROXY="${PROXY}" ALL_PROXY="${PROXY}"
+        export http_proxy="${PROXY}" https_proxy="${PROXY}" all_proxy="${PROXY}"
+        export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local"
+        echo "  已启用代理：${PROXY}（供 uv/pip/curl 使用）" >> "${LOG}"
+    else
+        ### 无代理：走国内 PyPI 镜像，避免直连 pypi.org 龟速
+        export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+        export PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+        echo "  未配置代理：使用清华 PyPI 镜像 ${UV_DEFAULT_INDEX}" >> "${LOG}"
+    fi
+    ### 兜底索引。⚠ 有代理时【不能】用国内镜像：实测「清华镜像 + HTTP 代理」
+    ### 会 SSL_ERROR_SYSCALL 失败，而 pypi.org 走代理很快（实测 23MB/s）。
+    if [ -n "${PROXY}" ]; then
+        : "${UV_DEFAULT_INDEX:=https://pypi.org/simple}"
+    else
+        : "${UV_DEFAULT_INDEX:=https://pypi.tuna.tsinghua.edu.cn/simple}"
+    fi
+
+    ### Python 解释器候选（按优先级）：
+    ###   1. 应用中心的 python312（实测 = Python 3.12.4，真名就是 python312）
+    ###   2. 系统 /usr/bin/python3（实测 3.11.2）
+    ###   3. PATH 上的 python3
+    ### 版本必须落在上游 stable 的 >=3.11,<3.14 内。
+    ### ⚠ 不能只看 /usr/bin/python3 —— 它可能是 3.11.2，虽能过版本校验，
+    ###   但用户明明装了 python312 却用不上（第三轮实机报告指出）。
+    SYS_PY=""
+    PY_CANDS="/vol1/@appcenter/python312/bin/python3"
+    for d in /vol*/@appcenter/python3*/bin/python3; do
+        [ -e "${d}" ] && PY_CANDS="${PY_CANDS} ${d}"
+    done
+    PY_CANDS="${PY_CANDS} /var/apps/python312/target/bin/python3"
+    PY_CANDS="${PY_CANDS} /usr/bin/python3 /usr/local/bin/python3"
+    _path_py="$(command -v python3 2>/dev/null)"
+    [ -n "${_path_py}" ] && PY_CANDS="${PY_CANDS} ${_path_py}"
+
+    for cand in ${PY_CANDS}; do
+        [ -n "${cand}" ] && [ -x "${cand}" ] || continue
+        # 版本校验：上游 stable 要求 >=3.11,<3.14
+        if "${cand}" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] < (3,14) else 1)' 2>/dev/null; then
+            SYS_PY="${cand}"
+            break
+        fi
+    done
+    if [ -z "${SYS_PY}" ]; then
+        echo "未找到合适的 Python（需 3.11–3.13）。请在飞牛应用中心安装「Python 3.12」后重试。" > "${TRIM_TEMP_LOGFILE}"
+        exit 1
+    fi
+    echo "  使用 ${SYS_PY} ($("${SYS_PY}" --version 2>&1))" >> "${LOG}"
+
+    ### ⚠ uv 在跑任何子命令前都会先初始化 cache（默认 $HOME/.cache/uv）。
+    ### 本脚本由 appcenter 以应用用户拉起，HOME 继承自 root 服务（/root，不可写），
+    ### 而应用用户自己的 home 在安装期也还没建 → uv venv 第一步就
+    ### "Failed to initialize cache at /root/.cache/uv: Permission denied (os error 13)"
+    ### → 整个安装 10238 失败（用户实机两连复现）。
+    ### 显式指向应用数据目录（属 hermes、可写）；uv venv 与 uv pip install 都吃这两个变量。
+    export HOME="${TRIM_PKGVAR}"
+    export UV_CACHE_DIR="${TRIM_PKGVAR}/.uv-cache"
+    mkdir -p "${UV_CACHE_DIR}"
+
+    ### uv：按顺序找，尽量避开联网下载。
+    ###   1. python312 应用自带（有就最省事）
+    ###   2. PM store 里的（tools/uv-*/uv）
+    ###   3. 包内/数据目录
+    ###   4. 系统 PATH
+    ### 都没有才联网取（走代理/镜像）。
+    UV=""
+    for cand in /vol*/@appcenter/python312/bin/uv /var/apps/python312/target/bin/uv \
+                "${RUNTIME}/bin/uv" "${TRIM_PKGVAR}/bin/uv" \
+                /vol*/@appdata/hermes/tools/uv-*/uv "$(command -v uv 2>/dev/null)"; do
+        [ -n "${cand}" ] && [ -x "${cand}" ] && { UV="${cand}"; break; }
+    done
+    if [ -z "${UV}" ]; then
+        mkdir -p "${TRIM_PKGVAR}/bin"
+        echo "  未找到本地 uv，联网获取…" >> "${LOG}"
+        ### 优先用清华 PyPI 上的 uv wheel（国内快），失败再退回 astral.sh
+        _UV_TMP="$(mktemp -d 2>/dev/null || echo /tmp/uvget.$$)"
+        mkdir -p "${_UV_TMP}"
+        if command -v curl > /dev/null 2>&1; then
+            # 从清华源取 uv wheel 并解出二进制（wheel 就是 zip）
+            ### ⚠ 清华 simple 页面的 href 是【相对路径】（../../packages/...），
+            ### 用 grep 'https://...' 永远抓不到（实测 0 命中）→ 只能退回 astral.sh。
+            ### 改用解释器做 urljoin（此时 SYS_PY 已就绪）。
+            _WHEEL_URL="$("${SYS_PY}" - <<'PYEOF' 2>/dev/null
+import re, urllib.parse, urllib.request
+base = "https://pypi.tuna.tsinghua.edu.cn/simple/uv/"
+try:
+    html = urllib.request.urlopen(base, timeout=30).read().decode("utf-8", "replace")
+except Exception:
+    raise SystemExit(0)
+rels = re.findall(r'href="([^"]*manylinux[^"]*x86_64\.whl[^"]*)"', html)
+if rels:
+    print(urllib.parse.urljoin(base, rels[-1]).split("#")[0])
+PYEOF
+)"
+            if [ -n "${_WHEEL_URL}" ] && curl -fsSL --max-time 180 -o "${_UV_TMP}/uv.whl" "${_WHEEL_URL}" 2>/dev/null; then
+                ( cd "${_UV_TMP}" && unzip -oq uv.whl 2>/dev/null ) || true
+                # wheel 内二进制常见位置：uv/uv（或根目录 uv）
+                for p in "${_UV_TMP}/uv/uv" "${_UV_TMP}/uv"; do
+                    # unzip 不一定恢复执行位；cp 后补 chmod，否则下面 [ -x ] 判定失败
+                    [ -f "${p}" ] && [ ! -d "${p}" ] && { cp "${p}" "${TRIM_PKGVAR}/bin/uv" && chmod 0755 "${TRIM_PKGVAR}/bin/uv"; break; }
+                done
+            fi
+            # 回退：astral.sh（走代理时快）
+            if [ ! -x "${TRIM_PKGVAR}/bin/uv" ]; then
+                curl -fsSL --max-time 180 https://astral.sh/uv/install.sh 2>/dev/null | \
+                    env UV_INSTALL_DIR="${TRIM_PKGVAR}/bin" UV_NO_MODIFY_PATH=1 sh > /dev/null 2>&1 || true
+            fi
+        fi
+        rm -rf "${_UV_TMP}" 2>/dev/null || true
+        [ -x "${TRIM_PKGVAR}/bin/uv" ] && UV="${TRIM_PKGVAR}/bin/uv"
+    fi
+    if [ -z "${UV}" ]; then
+        echo "无法获取 uv（本地没有、联网也失败）。请在 NAS 上配好 HTTP 代理后重试，或手动放置 uv 到 ${TRIM_PKGVAR}/bin/uv。" > "${TRIM_TEMP_LOGFILE}"
+        exit 1
+    fi
+    echo "  使用 uv：${UV}" >> "${LOG}"
+
+    rm -rf "${VENV_DIR}"
+    "${UV}" venv --python "${SYS_PY}" "${VENV_DIR}" >> "${LOG}" 2>&1 \
+        || { { echo "venv 创建失败："; tail -n 20 "${LOG}" 2>/dev/null; } > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+
+    # 依赖清单在构建时抽好，随包分发（runtime/deps.txt）
+    DEPS="${RUNTIME}/deps.txt"
+    if [ -f "${DEPS}" ]; then
+        ### 装依赖：显式带索引（代理缺失时用清华镜像；代理在则直连也快）
+        "${UV}" pip install --python "${VENV_DIR}/bin/python3" \
+            --default-index "${UV_DEFAULT_INDEX}" -r "${DEPS}" \
+            >> "${LOG}" 2>&1 \
+            || { { echo "依赖安装失败："; tail -n 30 "${LOG}" 2>/dev/null; } > "${TRIM_TEMP_LOGFILE}"; exit 1; }
+    else
+        echo "缺少依赖清单（${DEPS}）" > "${TRIM_TEMP_LOGFILE}"; exit 1
+    fi
+fi
+
+# 完整性校验。
+# ⚠ 模式感知：系统 Python 模式的解释器是 NAS 上现建的 venv，包内【没有】
+# runtime/python/ —— 直接判 ${PY} 会 100% 失败（实机报「安装包缺少 Python
+# 运行时（/vol1/@appcenter/hermes/runtime/python/bin/python3）」）。
+if [ -f "${RUNTIME}/.use-system-python" ]; then
+    PY_CHECK="${TRIM_PKGVAR}/venv/bin/python3"
+else
+    PY_CHECK="${PY}"
+fi
+if [ ! -x "${PY_CHECK}" ]; then
+    echo "安装包缺少 Python 运行时（${PY_CHECK}）" > "${TRIM_TEMP_LOGFILE}"
+    exit 1
+fi
+if [ ! -d "${RUNTIME}/hermes/hermes_cli" ]; then
+    echo "安装包缺少 Hermes 源码树（${RUNTIME}/hermes/hermes_cli）" > "${TRIM_TEMP_LOGFILE}"
+    exit 1
+fi
+if [ ! -f "${RUNTIME}/web_dist/index.html" ]; then
+    echo "安装包缺少预构建前端（${RUNTIME}/web_dist/index.html）" > "${TRIM_TEMP_LOGFILE}"
+    exit 1
+fi
+
+### 属主修正：全新安装时数据目录是新建的、条目很少 → 递归没问题；
+### 但「卸载保留数据后重装」或升级路径下该目录可能有 168,510 个条目 / 12 GB，
+### 全量递归要十几秒到一分钟，可能超出平台 callback 的超时（实机报告 C3）。
+### 所以：条目数小（<2000）才递归，否则只修顶层。
+_entries="$(find "${TRIM_PKGVAR}" -maxdepth 1 2>/dev/null | wc -l)"
+if [ "${_entries:-0}" -lt 2000 ]; then
+    chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+else
+    echo "  数据目录条目较多（${_entries}），只修正顶层属主（避免递归超时）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+    chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true
+fi
+
+# 安装向导里填的 HTTP 代理（wizard_proxy）落盘到 $HERMES_HOME/.env。
+# 逻辑与 config_callback 相同；这里只处理「安装时填了值」的情况，
+# 未填则不动（避免覆盖用户已有的 .env 代理配置）。
+if [ -n "${wizard_proxy:-}" ]; then
+    ENV_FILE="${TRIM_PKGVAR}/.env"
+    PROXY="${wizard_proxy}"
+    case "${PROXY}" in *$'\n'*) PROXY="" ;; esac
+    if [ -n "${PROXY}" ] && printf '%s' "${PROXY}" | grep -Eq '^https?://[A-Za-z0-9._~:/?#@!$&'"'"'()*+,;=%-]+$'; then
+        touch "${ENV_FILE}"
+        TMP="${ENV_FILE}.tmp.$$"
+        # 连同上一轮的分节标题一起剔除（升级会重跑本脚本，否则注释越积越多）
+        grep -vE '^[[:space:]]*(export[[:space:]]+)?(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY)=|^#[[:space:]]*──[[:space:]]*HTTP 代理' \
+            "${ENV_FILE}" > "${TMP}" 2>/dev/null || true
+        {
+            echo "# ── HTTP 代理（安装向导写入）──"
+            echo "HTTP_PROXY=${PROXY}"
+            echo "HTTPS_PROXY=${PROXY}"
+            echo "ALL_PROXY=${PROXY}"
+            echo "NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local"
+        } >> "${TMP}"
+        mv "${TMP}" "${ENV_FILE}"
+        chmod 600 "${ENV_FILE}" 2>/dev/null || true
+        chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${ENV_FILE}" 2>/dev/null || true
+    fi
+fi
+
+### 面板登录凭据（安装向导 wizard_auth_user / wizard_auth_password）。
+### 写入 <data>/.env 的三个键，cmd/main 启动 dashboard 时读取并注入：
+###   BASIC_AUTH_USER / BASIC_AUTH_PASSWORD / BASIC_AUTH_SECRET
+### 为什么存明文密码：上游 basic provider 支持 HERMES_DASHBOARD_BASIC_AUTH_PASSWORD，
+### 自行在内存里 scrypt 哈希，不需要我们预生成 hash（也就不用依赖上游内部 API）。
+### 文件权限 600。
+### ⚠ 留空的语义分两种（fnOS 升级会重跑安装向导）：
+###   · 全新安装留空 → 不写凭据，dashboard 仅绑回环（只走飞牛网关）
+###   · 升级时留空   → **保留已有凭据**，绝不执行「清除」
+###   清除只能通过设置页（两项都空）。否则每次升级都会把用户踢回仅网关模式。
+ENV_FILE="${TRIM_PKGVAR}/.env"
+AUTH_USER="${wizard_auth_user:-}"
+AUTH_PASS="${wizard_auth_password:-}"
+# 去掉换行与非法的 shell 特殊字符（键值写进 .env，不能破坏文件结构）
+case "${AUTH_USER}" in *$'\n'*) AUTH_USER="" ;; esac
+case "${AUTH_PASS}" in *$'\n'*) AUTH_PASS="" ;; esac
+# ⚠ 首尾空格必须去掉：上游 _settings() 用 os.environ[...].strip() 取密码，
+#   " abc " 会被当成 "abc" 校验 → 用户按原样输入永远登录失败（实测）。
+#   向导里多半是误粘贴，静默 trim 比报错更实用。
+AUTH_USER="${AUTH_USER#"${AUTH_USER%%[![:space:]]*}"}"; AUTH_USER="${AUTH_USER%"${AUTH_USER##*[![:space:]]}"}"
+AUTH_PASS="${AUTH_PASS#"${AUTH_PASS%%[![:space:]]*}"}"; AUTH_PASS="${AUTH_PASS%"${AUTH_PASS##*[![:space:]]}"}"
+if [ -n "${AUTH_USER}" ] && [ -n "${AUTH_PASS}" ]; then
+    if [ "${#AUTH_PASS}" -lt 8 ]; then
+        echo "  ⚠ 面板密码少于 8 位，已忽略（dashboard 将仅绑回环）" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+    else
+        # secret：会话签名 key。
+        # ⚠ 已有就沿用：升级时若重新生成，所有浏览器会话立刻失效（用户得重新登录）。
+        AUTH_SECRET="$(DATA_DIR="${TRIM_PKGVAR}" env_get BASIC_AUTH_SECRET 2>/dev/null || true)"
+        [ -n "${AUTH_SECRET}" ] || AUTH_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        mkdir -p "${TRIM_PKGVAR}" 2>/dev/null || true
+        touch "${ENV_FILE}"
+        TMP="${ENV_FILE}.tmp.$$"
+        # 连同上一轮的分节标题一起剔除，否则每次升级都会多一行重复注释。
+        grep -vE '^[[:space:]]*(export[[:space:]]+)?(BASIC_AUTH_USER|BASIC_AUTH_PASSWORD|BASIC_AUTH_SECRET)=|^#[[:space:]]*──[[:space:]]*面板登录' \
+            "${ENV_FILE}" > "${TMP}" 2>/dev/null || true
+        {
+            echo "# ── 面板登录（安装向导写入；改动后需重启应用）──"
+            # 值一律走 env_kv（双引号 + 转义）：裸写时 dotenv 会把 " #" 之后当注释、
+            # 并吃掉首尾空白，含这些字符的密码会被静默改掉（实测 pa#ss → pa）。
+            env_kv BASIC_AUTH_USER "${AUTH_USER}"; echo
+            env_kv BASIC_AUTH_PASSWORD "${AUTH_PASS}"; echo
+            env_kv BASIC_AUTH_SECRET "${AUTH_SECRET}"; echo
+        } >> "${TMP}"
+        mv "${TMP}" "${ENV_FILE}"
+        chmod 600 "${ENV_FILE}" 2>/dev/null || true
+        chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${ENV_FILE}" 2>/dev/null || true
+        echo "  面板登录已配置：用户 ${AUTH_USER}（http://<NAS>:${TRIM_SERVICE_PORT:-9119}）" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
+    fi
+elif [ -z "${AUTH_USER}" ] && [ -z "${AUTH_PASS}" ]; then
+    # 留空：不写任何东西。已有凭据（升级场景）原样保留 —— 见上方说明。
+    if grep -qE '^[[:space:]]*(export[[:space:]]+)?BASIC_AUTH_PASSWORD=' "${ENV_FILE}" 2>/dev/null; then
+        echo "  面板登录：本次留空，保留原有凭据不变" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
+    fi
+else
+    echo "  ⚠ 面板登录只填了一项（用户名/密码需同时填写），已忽略" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
+fi
+
+exit 0
