@@ -2,13 +2,37 @@
 
 把 [Nous Research 开源的 Hermes Agent](https://github.com/NousResearch/hermes-agent) 打包成飞牛 fnOS 的**原生第三方应用**（非 Docker）：
 
-- 服务端跑在 NAS 上，浏览器 / 飞牛桌面里直接用 **Hermes 原生 dashboard**——配置、API Key、会话管理、内嵌终端
+- 服务端跑在 NAS 上，浏览器 / 飞牛桌面里直接用 **Hermes Desktop（浏览器版工作区）**——会话、群聊、技能、插件、终端、文件树
 - 数据与工作区保存在 NAS 上，手机 / 平板 / 电脑共用一份
 - **非 Docker**：安装时按官方流程创建独立 Python 环境（不依赖 NAS 上装了什么）
-- 走飞牛**统一网关**（Unix Socket + 飞牛登录态）；可选开启 `http://<NAS>:9119` 局域网直连（共用面板密码）
-- **支持在线更新**：源码带 `.git`，在 dashboard 内或 SSH 里执行 `hermes update` 即可跟随上游
+- 走飞牛**统一网关**（Unix Socket + 飞牛登录态）；可选开启 `http://<NAS>:9120`（Desktop）与 `:9119`（管理面板）局域网直连（共用面板密码）
+- **支持在线更新**：源码带 `.git`，在 Desktop / 面板内或 SSH 里执行 `hermes update` 即可跟随上游
 
 > 本仓库只做 NAS 侧的移植与打包，不修改 Hermes 本身。上游代码：[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)（MIT）。
+
+## 门户为什么从 dashboard 改成了 Desktop
+
+上游从 **v0.22.6** 起新增了 **Webapp**：把原本只有 Electron 客户端的 Desktop 工作区
+（`apps/desktop`）编译成一套能在浏览器里跑的 bundle（`hermes webapp`）。入口代码在
+`hermes_cli/webapp.py` + `gateway/webapp_listener.py`，由 gateway 进程自己监听一个端口
+（默认 `127.0.0.1:9120`），**与 dashboard 是两个独立的界面**：
+
+| | Desktop（`webapp`，9120） | Dashboard（9119） |
+|---|---|---|
+| 定位 | 完整工作区，日常使用 | 管理 / 运维面板 |
+| 内容 | 会话、群聊、技能、插件、产物、定时任务、文件树、终端、Git | 设置、密钥、日志、用量统计、组件健康 |
+| 谁在服务 | gateway 进程 | 独立的 dashboard 进程 |
+
+在此之前，飞牛桌面图标只能打开 dashboard——那是管理面板，不是给人日常用的工作区。
+上游把 Desktop 搬上浏览器之后，**门户指向 Desktop 才是合理默认**：
+
+- 飞牛桌面图标 `/app/hermes` → 统一网关 → `127.0.0.1:9120`（Desktop）
+- dashboard 保留，需要排障/改配置时用 `http://<NAS>:9119` 打开
+- Desktop 不可用时（上游太老 / bundle 缺失 / 9120 被占用）**自动退回 dashboard**，门户不会 502
+
+Desktop 的 bundle 在**构建期预编译**并随包分发（`runtime/webapp_dist`，约 45 MB / 1055 个资源），
+经 `HERMES_WEBAPP_DIST` 指向上游——上游据此**永不重建**。这样装机后从飞牛桌面点进去就能用，
+不需要 NAS 上有 npm 源、也不用等 2 分钟现场构建。
 
 ## 与飞牛应用商店官方包 `trim.hermes` 的关系
 
@@ -27,7 +51,8 @@
 ```
 cmd/main
   └─ gateway-proxy.py        ← 替代官方 Go wrapper：监听 socket、剥前缀、发 X-Forwarded-Prefix、隧道 WS
-        └─ hermes dashboard  ← 原生 dashboard（:19119，仅绑回环），即 UI
+        ├─ Desktop（webapp）← 浏览器版工作区（:9120，仅绑回环），门户默认入口
+        └─ dashboard        ← 管理面板（:9119，仅绑回环），排障用
 ```
 
 **为什么 Python 代理不会有性能问题**：代理层不解析、不转换、不压缩，只做 `recv → send` 字节转发 + 加一个 header。这是纯 IO 等待，瓶颈在 NAS 网络/磁盘而非 CPU；asyncio 单进程处理几千并发连接是常态，而这里只有几个浏览器在连。真正的好处是**可读可改**——Go 二进制里编译死的锁，在 Python 里就是几行代码。
@@ -41,7 +66,7 @@ hermes update --check    # 检查是否有新版本
 hermes update            # 应用更新（git 拉取 + PM 同步依赖）
 ```
 
-也可以在 dashboard 的「系统」页里点检查更新。更新后需重启应用生效。
+也可以在 Desktop / dashboard 的「系统」页里点检查更新。更新后需重启应用生效。
 
 > 更新需要 NAS 能访问 GitHub。国内网络慢时，在应用设置页填 HTTP 代理，
 > 或设置 `HERMES_PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple`。
@@ -119,34 +144,51 @@ Python 版本由上游 `pm/lock.json` 决定（v0.22.5 为 3.14.9），不写死
 
 `python-build-standalone` 的 CPython 静态内嵌较新的 SQLite（实测 3.53.1），过 Hermes 的 WAL-reset 门（安全窗口 `[3.44.6,3.45.0) ∪ [3.50.7,3.51.0) ∪ ≥3.51.3`）。系统 Python 3.11/3.12 链接的 libsqlite3 是 3.40.1，会命中危险区 → `state.db` 降级为 `journal_mode=DELETE`，因此**不使用系统 Python**。
 
-## 访问方式（两条，共用同一套密码）
+## 访问方式
 
-| 方式 | 地址 | 说明 |
+| 方式 | 地址 | 打开的是 |
 |---|---|---|
-| **飞牛桌面图标** | `/app/hermes` | 走飞牛统一网关（iframe），仍需输入面板密码 |
-| **局域网直连** | `http://<NAS地址>:9119` | 直接访问 dashboard，输入同一套用户名/密码 |
+| **飞牛桌面图标** | `/app/hermes` | 统一网关 → **Desktop**（9120） |
+| **Desktop 直连** | `http://<NAS地址>:9120` | Desktop（需在向导/设置里开启） |
+| **管理面板直连** | `http://<NAS地址>:9119` | Dashboard（需在向导/设置里开启） |
 
-两条路径都受**面板密码**保护。密码在**安装向导**里设置（**可选**），之后可在应用**设置**页修改。
+**端口访问开关**：安装向导的「访问方式」步骤、应用设置的「访问方式」页各有两个开关，
+分别控制 Desktop（9120）和 Dashboard（9119）能否从局域网直连。
+
+- **开**（默认）→ 绑 `0.0.0.0`，局域网可用 `http://<NAS>:端口` 直接访问
+- **关** → 只绑 `127.0.0.1`，只有飞牛统一网关能访问，不额外暴露任何端口
+
+> 门户入口（飞牛桌面图标）**始终走 Desktop，与这两个开关无关**——开关只决定"能不能从局域网直接连端口"。
+> 两者都关掉时，本应用只通过飞牛网关访问（飞牛登录态）。
+
+三条路径都受**面板密码**保护。密码在**安装向导**里设置（**可选**），之后可在应用**设置**页修改。
 
 - 安装时留空 → 只允许飞牛桌面访问（更安全，开箱即用）
 - **升级安装时留空不会清除已有密码** —— 清除只能去设置页把两项都清空
 
-**为什么需要密码**：本包需要支持 `http://<NAS>:9119` 直连，dashboard 必须监听局域网地址；Hermes 自 2026-06 安全加固起**强制要求**非回环绑定必须启用登录（`--insecure` 已失效），否则拒绝启动。本包使用上游内置的 basic auth provider。
+**为什么需要密码**：要支持 `http://<NAS>:端口` 直连，监听必须绑局域网地址；Hermes 自 2026-06 安全加固起**强制要求**非回环绑定必须启用登录（`--insecure` 已失效），否则拒绝启动。本包使用上游内置的 basic auth provider。
 
-**未设置密码时**：dashboard 自动退回仅绑 `127.0.0.1`（只有飞牛网关能访问，开箱即用、无需登录）。
+**未设置密码时**：两个界面都只绑 `127.0.0.1`（只有飞牛网关能访问，开箱即用、无需登录）。
+
+**Desktop 与 Dashboard 共用同一套凭据**：`cmd/main` 把 `.env` 里的 `BASIC_AUTH_*` 导出成
+`HERMES_DASHBOARD_BASIC_AUTH_*`，**dashboard 进程和 gateway 进程都会加载**（写进 600 权限的
+脚本再 source，密码不进 `argv`）。所以向导里设的账号密码对两个界面同时生效。
 
 **密码规则**（受上游实现约束，已实测）：
 - 至少 8 位，最长 128 位；可用中文、空格、`#`、`"`、`'`、`\`、`$`、反引号。
 - **首尾空格会被自动去掉** —— 上游读取密码时执行 `strip()`，保留它们只会导致登录失败。
 
-**端口被占用时**：若 `9119` 已被其他应用占用，启动会**自动降级**为仅回环（飞牛网关照常可用），
-并在 `info.log` 写明占用进程；腾出端口后重启即可恢复直连。
+**端口被占用时**：
 
-> ⚠ 直连端口会暴露到局域网：密码请设强一些；不需要直连时可以把密码清空（设置页两项都留空并重启），即退回仅网关模式。
+- `9119` 被占用 → dashboard **自动降级**为仅回环（飞牛网关照常可用），`info.log` 写明占用进程。
+- `9120` 被占用 → **Desktop 自动关闭**，门户退回 dashboard（而不是让 gateway 反复撞端口失败）。
+  `info.log` 会写明占用者；腾出端口后重启即可恢复。也可用环境变量 `HERMES_WEBAPP_PORT` 换端口。
+
+> ⚠ 直连端口会暴露到局域网：密码请设强一些；不需要直连时把对应开关关掉（或清空密码），即退回仅网关模式。
 
 > ⚠ **直连是明文 HTTP**：面板密码在登录时以明文过网，同一局域网内可被嗅探。
 > 仅建议在可信内网使用；如需在不可信网络访问，请走飞牛桌面图标（网关入口），
-> 或在飞牛/路由器防火墙里把 `9119` 限制到指定来源网段。
+> 或在飞牛/路由器防火墙里把 `9120` / `9119` 限制到指定来源网段。
 
 > 说明：`/api/status` 是上游设计为免登录的存活探针（version / 内存 / 平台状态）。
 > 直连启用后它对局域网可读，但不含会话内容；其余业务接口未登录一律 401。
@@ -160,10 +202,18 @@ Python 版本由上游 `pm/lock.json` 决定（v0.22.5 为 3.14.9），不写死
 hermes.sock（Unix Socket，由 gateway-proxy.py 监听）
    │  剥掉 /app/hermes 前缀 + 发 X-Forwarded-Prefix: /app/hermes
    ▼
-127.0.0.1:9119（hermes dashboard，uvicorn 仅绑回环）
+127.0.0.1:9120（Desktop，gateway 进程的 webapp 监听器）
+   └─ 不可用时自动退回 127.0.0.1:9119（dashboard）
 ```
 
-**为什么不改写 HTML**：Hermes 的前端是 React Router SPA，其 API/WS 基址取自 `index.html` 里注入的 `window.__HERMES_BASE_PATH__`，而该值由服务端**依据请求头 `X-Forwarded-Prefix`** 生成（见上游 `hermes_cli/dashboard_auth/prefix.py`）。代理只需带上这个头，服务端会自己改写资产 URL 并注入正确的 base path。比 ZCode 的方案更干净。
+上游端口由 `cmd/main` 的 `gateway_upstream_port` 决定：Desktop 可用（源码带 webapp
+且 bundle 存在）→ 9120；否则 → 9119。
+
+**为什么不改写 HTML**：Desktop 与 dashboard 共用同一个 SPA 挂载点（`mount_spa`），
+其 API/WS 基址取自 `index.html` 里注入的 `window.__HERMES_BASE_PATH__`，该值由服务端
+**依据请求头 `X-Forwarded-Prefix`** 生成。代理只需带上这个头，服务端会自己改写资产 URL
+并注入正确的 base path。另外 Desktop 的 vite 构建用的是 `base: './'`（相对路径），
+天然兼容子路径。
 
 **为什么只绑回环**：Hermes 从 2026-06 的 hermes-0day 加固起，一旦绑非回环地址就**强制要求 auth provider**（`--insecure` 已被忽略）。绑回环则不做 auth 门，把鉴权交给飞牛网关。
 
@@ -193,7 +243,7 @@ HERMES_VERSION=0.2.0 bash packaging/fnOS/scripts/build.sh
 
 ```
 packaging/fnOS/
-├── manifest                  # 应用元信息（platform=x86、网关声明、9119）
+├── manifest                  # 应用元信息（platform=x86、网关声明、service_port=9119）
 ├── cmd/                      # 生命周期脚本（main / install / upgrade / uninstall / config）
 ├── config/                   # privilege（run-as: package）与 resource（共享目录 + bin/hermes）
 ├── ui/config                 # 飞牛桌面入口（iframe → 统一网关）
@@ -260,7 +310,7 @@ workspace/ state/ log/ .env
 
 - arm64 支持（当前 `platform = x86` 单架构；`HERMES_ARCH=aarch64` 可构建，但需真机验证）
 - messaging 网关（Telegram / Discord / Slack 等）——需要额外 extra，验收面更大
-- 模型 / API Key 的向导式配置（当前在 dashboard 内完成）
+- 模型 / API Key 的向导式配置（当前在 Desktop / dashboard 内完成）
 
 ## 许可
 
