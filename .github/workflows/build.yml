@@ -52,10 +52,10 @@ jobs:
           if [ -n "${{ github.event.inputs.hermes_ref }}" ]; then
             REF="${{ github.event.inputs.hermes_ref }}"
           else
-            REF="$(grep -vE '^\s*#|^\s*$' upstream.version | head -n 1 | tr -d '[:space:]' || true)"
+            REF="$(grep -vE '^\s*#|^\s*$' upstream.version | awk 'NR==1' | tr -d '[:space:]' || true)"
           fi
           UP_VER="$(printf '%s' "$REF" | sed -E 's/^v//; s/\+.*$//')"
-          FNOS_VER="$(grep -vE '^\s*#|^\s*$' fnos.version 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+          FNOS_VER="$(grep -vE '^\s*#|^\s*$' fnos.version 2>/dev/null | awk 'NR==1' | tr -d '[:space:]' || true)"
           # fnos.version 只允许是「同一上游版本 + -N 修订」：主体必须等于上游版本。
           # 否则说明上游发了新版而 fnos.version 忘了改 → 忽略它并告警，
           # 避免把新版包错标成旧版本号（那会导致应用中心认为需要降级）。
@@ -175,8 +175,8 @@ jobs:
           [ -n "$PRESETS" ] || { echo "✗ 未解析出构建档位"; exit 1; }
           for P in $PRESETS; do
             case "$P" in
-              A) FPK="$(ls packaging/fnOS/dist/hermes-*online.fpk 2>/dev/null | head -1)" ;;
-              B) FPK="$(ls packaging/fnOS/dist/hermes-*presetB.fpk 2>/dev/null | head -1)" ;;
+              A) FPK="$(ls packaging/fnOS/dist/hermes-*online.fpk 2>/dev/null | awk 'NR==1')" ;;
+              B) FPK="$(ls packaging/fnOS/dist/hermes-*presetB.fpk 2>/dev/null | awk 'NR==1')" ;;
             esac
             [ -n "$FPK" ] && [ -f "$FPK" ] || { echo "✗ 档位 $P 缺少产物"; exit 1; }
             echo "=== 校验档位 $P: $FPK ($(du -h "$FPK" | cut -f1)) ==="
@@ -236,8 +236,8 @@ jobs:
           mkdir -p release
           # 按后缀明确取用，不靠 find 的返回顺序（原先 head -n 1 可能取到 B 版，
           # 导致 161MB 的预置包被当成"默认下载"）。
-          ONLINE="$(find dist -type f -name 'hermes-*-online.fpk' | head -n 1 || true)"
-          PRESETB="$(find dist -type f -name 'hermes-*-presetB.fpk' | head -n 1 || true)"
+          ONLINE="$(find dist -type f -name 'hermes-*-online.fpk' | awk 'NR==1' || true)"
+          PRESETB="$(find dist -type f -name 'hermes-*-presetB.fpk' | awk 'NR==1' || true)"
           echo "online=[${ONLINE}]"
           echo "presetB=[${PRESETB}]"
           [ -n "$ONLINE" ] || [ -n "$PRESETB" ] || { echo "✗ 未找到任何 fpk"; find dist -maxdepth 4; exit 1; }
@@ -283,10 +283,15 @@ jobs:
           FPK="${fpk_path:?}"; BASENAME="$(basename "$FPK")"
           SUM="$(sha256sum "$FPK" | awk '{print $1}')"
           NOTES="$(mktemp)"
-          PREV_TAG="$(git tag --list 'v*' --sort=-v:refname | grep -vx "${TAG}" | head -n 1 || true)"
+          # ⚠ 管道里不能用 `| head`：它读够就退出，上游还在写 → SIGPIPE，
+          #   在 set -o pipefail 下整条命令替换返回非零，set -e 直接终止发布
+          #   （实机 2026-11-06：`sed: couldn't flush stdout: Broken pipe`）。
+          #   改用 awk 读完整个输入再截取，不提前关闭管道。
+          PREV_TAG="$(git tag --list 'v*' --sort=-v:refname | grep -vx "${TAG}" | awk 'NR==1' || true)"
           if [ -n "${PREV_TAG}" ]; then
             # 只取 commit 标题第一行、去掉常规前缀（修 xxx：/CI：等），限量 8 条
-            CHANGES="$(git log --no-merges --pretty=format:'%s' "${PREV_TAG}..HEAD"               | sed -E 's/^[^：:]{1,12}[：:] //' | head -n 8               | sed 's/^/- /')"
+            CHANGES="$(git log --no-merges --pretty=format:'%s' "${PREV_TAG}..HEAD" \
+              | sed -E 's/^[^：:]{1,12}[：:] //' | awk 'NR<=8' | sed 's/^/- /')"
             CHANGE_HEADER="自 \`${PREV_TAG}\` 以来（共 $(git rev-list --count "${PREV_TAG}..HEAD") 个提交，节选）："
           else
             CHANGES="$(git log --no-merges --pretty=format:'- %s (%h)' -n 5)"
