@@ -364,10 +364,18 @@ if [ -f "${SRC}/apps/desktop/scripts/build-webapp.mjs" ]; then
     else
         need node; need npm
         echo "[build] 构建 desktop bundle（npm run build:webapp，约 1-3 分钟）"
-        # 依赖已在上面 web_dist 那步装过（同一个 package.json workspace），
-        # 这里只跑构建。--no-install 让上游跳过它自己的 npm ci。
-        ( cd "${SRC}/apps/desktop" && node scripts/build-webapp.mjs --no-install ) \
-            || { echo "✗ desktop bundle 构建失败"; exit 1; }
+        # ⚠ 不能传 --no-install：上游把依赖装进【私有 workspace】
+        #   (.build/webapp-workspace)，不是源码根的 node_modules —— 上面 web_dist
+        #   那步的 npm ci 对它无效。--no-install 会让 vite 找不到而失败。
+        #   交给它自己 prepare（reuse=true，重复构建会复用）。
+        # 失败时把完整输出留在日志里（CI 只能看到这里，不能靠 tail 猜）
+        _wb_log="${PBS_CACHE}/webapp-build.log"
+        if ! ( cd "${SRC}/apps/desktop" && node scripts/build-webapp.mjs ) 2>&1 | tee "${_wb_log}"; then
+            echo "✗ desktop bundle 构建失败（完整日志见上，末尾 40 行）："
+            tail -40 "${_wb_log}"
+            exit 1
+        fi
+        rm -f "${_wb_log}"
     fi
     [ -f "${SRC}/apps/desktop/dist-webapp/index.html" ] \
         || { echo "✗ desktop bundle 未产出 index.html"; exit 1; }
