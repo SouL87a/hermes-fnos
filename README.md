@@ -209,11 +209,20 @@ hermes.sock（Unix Socket，由 gateway-proxy.py 监听）
 上游端口由 `cmd/main` 的 `gateway_upstream_port` 决定：Desktop 可用（源码带 webapp
 且 bundle 存在）→ 9120；否则 → 9119。
 
-**为什么不改写 HTML**：Desktop 与 dashboard 共用同一个 SPA 挂载点（`mount_spa`），
-其 API/WS 基址取自 `index.html` 里注入的 `window.__HERMES_BASE_PATH__`，该值由服务端
-**依据请求头 `X-Forwarded-Prefix`** 生成。代理只需带上这个头，服务端会自己改写资产 URL
-并注入正确的 base path。另外 Desktop 的 vite 构建用的是 `base: './'`（相对路径），
-天然兼容子路径。
+**为什么不改写 HTML**：两个原因。
+① `mount_spa` 已依据 `X-Forwarded-Prefix` 注入 `window.__HERMES_BASE_PATH__`
+（API/WS 基址），代理只需带上这个头。
+② 更关键：Desktop 的 CSP（`webapp_page_policy.py`）会计算 HTML 内联脚本的
+`sha256-` 并写进 `script-src`。**任何 HTML 改写都会让 hash 失配**，脚本被静默拦掉 →
+白屏，且比 404 更难排查。所以代理绝不碰响应体，只改响应头（放宽 `frame-ancestors`）。
+
+**入口为什么要补尾斜杠**：Desktop 的 vite 用 `base: './'`（相对路径）构建，HTML 里是
+`./assets/xxx.js`。飞牛桌面图标的 URL 是 `/app/hermes`（无尾斜杠），浏览器把它当
+**文件名**，基准目录算成 `/app/` → `./assets/` 解析成 `/app/assets/` → 404 白屏；
+而端口直连（`http://NAS:9120/` 根路径）正常，差异正在这里。代理对入口补一个 302 到
+`/app/hermes/`，基准变成 `/app/hermes/`，`./assets/` → `/app/hermes/assets/` →
+`strip_prefix` 剥成 `/assets/` ✓。dashboard 的入口仍走 `/app/hermes/sessions`
+（绕开它的 RootRedirect 竞态），两者由 `HERMES_UPSTREAM_KIND` 区分。
 
 **为什么只绑回环**：Hermes 从 2026-06 的 hermes-0day 加固起，一旦绑非回环地址就**强制要求 auth provider**（`--insecure` 已被忽略）。绑回环则不做 auth 门，把鉴权交给飞牛网关。
 

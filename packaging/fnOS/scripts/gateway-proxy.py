@@ -93,6 +93,19 @@ def strip_prefix(path: str) -> str:
         return "/"
     if path.startswith(PREFIX + "/"):
         return path[len(PREFIX):] or "/"
+    # ── 兜底：Desktop 用相对路径（base:'./'）构建，入口 URL 无尾斜杠时
+    # 浏览器把基准目录算成 /app/，于是 ./assets/xxx.js 解析成 /app/assets/xxx.js
+    # （而不是 /app/hermes/assets/…）→ 404 白屏。实机 2026-11-06。
+    # 入口已补 302 到 /app/hermes/ 修正基准，但浏览器/中间件的 URL 规范化行为
+    # 未必一致，故这里对【静态资源路径】也接受 /app/assets/ 形式，剥掉 /app。
+    # 只放行已知静态目录，绝不放行 /app/api/ 等业务路径（避免误把外部请求带进来）。
+    parent = PREFIX.rsplit("/", 1)[0] or "/"      # /app/hermes → /app
+    if parent != PREFIX and path.startswith(parent + "/"):
+        rest = path[len(parent):]                  # /assets/xxx.js
+        for d in ("/assets/", "/fonts/", "/fonts-terminal/", "/ds-assets/",
+                  "/emojibase/", "/favicon.ico", "/manifest.webmanifest"):
+            if rest.startswith(d) or rest == d.rstrip("/"):
+                return rest or "/"
     # 网关外路径（理论不应出现）原样透传
     return path or "/"
 
@@ -875,21 +888,38 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         # 触发条件：路径前缀反代 + 入口 URL 正好是前缀本身 ——
         # fnOS 桌面图标的 url 就是 "/app/hermes"，故必现。
         #
-        # 这里在代理层 302 到 <前缀>/sessions（保留 query），从入口就避开该状态。
+        # 这里在代理层 302（保留 query），从入口就避开该状态。
         # 只对带 text/html 的 GET 生效（浏览器导航），不误伤 API/资源请求。
         #
-        # ⚠ 只对 dashboard 做：desktop 的会话就是根路径 '/'，路由表里没有
-        #   /sessions（apps/desktop/src/app/routes.ts: SESSION_ROUTE_PREFIX='/'），
-        #   重定向过去会落到未知路由 → 白屏。
-        if UPSTREAM_KIND == "dashboard" and method == "GET" and PREFIX and path == PREFIX:
+        # ⚠ dashboard 与 desktop 的入口处理【完全不同】。
+        if method == "GET" and PREFIX and path == PREFIX:
             accept = ""
             for k, v in headers:
                 if k.lower() == "accept":
                     accept = v.lower()
                     break
             if "text/html" in accept:
-                loc = f"{PREFIX}/sessions{query}"
-                log(f"entry redirect {path!r} → {loc!r}")
+                if UPSTREAM_KIND == "dashboard":
+                    # dashboard：跳 /sessions 避开 RootRedirect 竞态。
+                    loc = f"{PREFIX}/sessions{query}"
+                    kind = "dashboard"
+                else:
+                    # ── desktop：入口必须补尾斜杠 ──────────────────────
+                    # desktop 的 vite 用 base:'./'（相对路径）构建，HTML 里是
+                    #   <script src="./assets/index-xxx.js">
+                    # 入口 URL /app/hermes 无尾斜杠时，浏览器把它当【文件名】，
+                    # 基准目录算成 /app/ → ./assets/ 解析成 /app/assets/ → 404。
+                    # 实机 2026-11-06：门户白屏，控制台全是
+                    #   GET /app/assets/index-xxx.js 404 (Not Found)
+                    # 而端口直连（根路径 /）正常 —— 正是这个差异。
+                    # 补尾斜杠后基准变成 /app/hermes/，./assets/ →
+                    # /app/hermes/assets/ → strip_prefix 剥成 /assets/ ✓
+                    #
+                    # ⚠ 不能跳 /sessions：desktop 路由表里没有它
+                    #   （SESSION_ROUTE_PREFIX='/'，会话就是根路径）。
+                    loc = f"{PREFIX}/{query}"
+                    kind = "desktop"
+                log(f"entry redirect({kind}) {path!r} → {loc!r}")
                 client_writer.write(
                     f"HTTP/1.1 302 Found\r\nLocation: {loc}\r\n"
                     f"Content-Length: 0\r\nCache-Control: no-store\r\n"
