@@ -900,9 +900,10 @@ ${BROWSER_ENV}
         echo "缺少 gateway-proxy.py" > "${TRIM_TEMP_LOGFILE}"
         return 1
     fi
-    local UP_PORT
+    local UP_PORT UP_KIND
     UP_PORT="$(gateway_upstream_port)"
-    log_msg "统一网关 → 127.0.0.1:${UP_PORT}（$([ "${UP_PORT}" = "${WEBAPP_PORT}" ] && echo desktop || echo dashboard)）"
+    if [ "${UP_PORT}" = "${WEBAPP_PORT}" ]; then UP_KIND="desktop"; else UP_KIND="dashboard"; fi
+    log_msg "统一网关 → 127.0.0.1:${UP_PORT}（${UP_KIND}）"
     local GW_CMD
     # HERMES_GATEWAY_DEBUG=1：把每个请求的路径与客户端 X-Forwarded-* 记进日志，
     # 以及 HTML 改写结果。真机排查资源 404 时这是唯一的现场证据。
@@ -916,6 +917,7 @@ HERMES_GATEWAY_SOCKET='${GATEWAY_SOCKET}' \
 HERMES_GATEWAY_PREFIX='${GATEWAY_PREFIX}' \
 HERMES_UPSTREAM_HOST='127.0.0.1' \
 HERMES_UPSTREAM_PORT='${UP_PORT}' \
+HERMES_UPSTREAM_KIND='${UP_KIND}' \
 HERMES_GATEWAY_DEBUG='1' \
 '${PY}' '${GATEWAY_PROXY}'"
     if [ "$(id -un)" = "${TRIM_USERNAME}" ]; then

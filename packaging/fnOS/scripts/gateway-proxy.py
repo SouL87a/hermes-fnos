@@ -41,6 +41,7 @@ HERMES_GATEWAY_REQUIRE_TRIM=1，强制只有带 X-Trim-* 身份头的网关请�
 import asyncio
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -52,6 +53,11 @@ SOCKET_PATH = os.environ.get("HERMES_GATEWAY_SOCKET", "")
 PREFIX = os.environ.get("HERMES_GATEWAY_PREFIX", "/app/hermes").rstrip("/")
 UP_HOST = os.environ.get("HERMES_UPSTREAM_HOST", "127.0.0.1")
 UP_PORT = int(os.environ.get("HERMES_UPSTREAM_PORT", "9119") or "9119")
+# 上游是 desktop（webapp，9120）还是 dashboard（9119）。两者路由不同：
+#   · dashboard 的会话页在 /sessions，且入口有竞态 bug（见下方入口重定向）
+#   · desktop 的会话就是根路径 '/'，没有 /sessions —— 重定向过去会落到未知路由
+# 由 cmd/main 传入（gateway_upstream_port 决定），默认 dashboard 保持旧行为。
+UPSTREAM_KIND = os.environ.get("HERMES_UPSTREAM_KIND", "dashboard").strip().lower()
 REQUIRE_TRIM = os.environ.get("HERMES_GATEWAY_REQUIRE_TRIM", "0") == "1"
 # 诊断日志开关（真机排查用）：HERMES_GATEWAY_DEBUG=1
 DEBUG = os.environ.get("HERMES_GATEWAY_DEBUG", "0") == "1"
@@ -736,6 +742,44 @@ async def read_head(reader: asyncio.StreamReader):
     return method, target, version, headers
 
 
+### 让飞牛桌面能把 desktop 放进 iframe。
+### 上游 webapp_page_policy.py 对 webapp 的 HTML 写死 `frame-ancestors 'none'`，
+### 而飞牛桌面正是 iframe 内嵌 → 浏览器直接拒载：
+###   "Framing 'https://nas...' violates ... frame-ancestors 'none'"
+### 上游没有配置项能放宽（硬编码），只能在代理层改。
+### 放宽到 'self'：只允许同源页面嵌入（飞牛网关把页面挂在与自身同源的前缀下），
+### 不放任任意站点嵌入，保留了对第三方站点的点击劫持防护。
+_ANCESTORS_NONE = re.compile(r"frame-ancestors\s+'none'", re.IGNORECASE)
+
+
+def relax_frame_ancestors(head: bytes) -> bytes:
+    """把响应头里的 frame-ancestors 'none' 放宽为 'self'；其它字节原样保留。"""
+    try:
+        text = head.decode("latin-1")
+    except Exception:  # noqa: BLE001
+        return head
+    if "frame-ancestors" not in text.lower():
+        return head
+    new = _ANCESTORS_NONE.sub("frame-ancestors 'self'", text)
+    if new == text:
+        return head
+    if DEBUG:
+        log("CSP: frame-ancestors 'none' → 'self'（允许飞牛桌面 iframe 内嵌）")
+    return new.encode("latin-1")
+
+
+async def read_response_head(up_reader: asyncio.StreamReader):
+    """读上游响应头，必要时改写 CSP，返回可回传的头部字节（含结尾空行）。
+
+    None 表示上游没给出完整响应头（连接断了）。
+    """
+    try:
+        head = await up_reader.readuntil(b"\r\n\r\n")
+    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError):
+        return None
+    return relax_frame_ancestors(head)
+
+
 async def pump_body(client: asyncio.StreamReader, up: asyncio.StreamWriter, headers) -> None:
     """按 Content-Length / chunked 把请求体原样转发。"""
     hmap = {k.lower(): v for k, v in headers}
@@ -833,7 +877,11 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         #
         # 这里在代理层 302 到 <前缀>/sessions（保留 query），从入口就避开该状态。
         # 只对带 text/html 的 GET 生效（浏览器导航），不误伤 API/资源请求。
-        if method == "GET" and PREFIX and path == PREFIX:
+        #
+        # ⚠ 只对 dashboard 做：desktop 的会话就是根路径 '/'，路由表里没有
+        #   /sessions（apps/desktop/src/app/routes.ts: SESSION_ROUTE_PREFIX='/'），
+        #   重定向过去会落到未知路由 → 白屏。
+        if UPSTREAM_KIND == "dashboard" and method == "GET" and PREFIX and path == PREFIX:
             accept = ""
             for k, v in headers:
                 if k.lower() == "accept":
@@ -986,12 +1034,26 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
 
         await pump_body(client_reader, up_writer, headers)
 
-        # 响应：原样流式回传（已强制 Connection: close，读到 EOF 即可）。
+        # 响应：读响应头（可能改写 CSP），其余字节原样流式回传。
         #
-        # 这里**不做 HTML 改写**：资源前缀已由构建时的 Vite base 编译进
+        # 这里**不改写 HTML**：资源前缀已由构建时的 Vite base 编译进
         # index.html 与各 chunk（见 scripts/web-build.mjs），代理只需纯转发。
         # 早期版本曾在此处改写 HTML —— 那是错误方向（改不到 JS 内部拼接的
         # 懒加载路径），已移除。
+        #
+        # ⚠ 但响应头必须看一眼：desktop（webapp）的 HTML 带
+        #   `Content-Security-Policy: ...; frame-ancestors 'none'`，飞牛桌面是
+        #   iframe 内嵌，浏览器据此直接拒载（实机 2026-11-06："Framing
+        #   'https://nas.soul87.top:22067/' violates ... frame-ancestors 'none'"）。
+        #   dashboard 没有这个头，所以 -5 能内嵌、-6 换 desktop 后打不开。
+        #   上游把该值写死在 hermes_cli/webapp_page_policy.py，没有配置项，
+        #   只能在代理层放宽。
+        resp_head = await read_response_head(up_reader)
+        if resp_head is None:
+            client_writer.close()
+            return
+        client_writer.write(resp_head)
+        await client_writer.drain()
         while True:
             chunk = await up_reader.read(65536)
             if not chunk:
