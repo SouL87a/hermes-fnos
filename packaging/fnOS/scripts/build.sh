@@ -352,6 +352,32 @@ echo "[build] web_dist ✓ ($(du -sh "${RT}/web_dist" | cut -f1))，已建 /app/
 # 否则会走上游 npm run build（不带 base）→ 前缀丢失 → 白屏。
 cp "${HERE}/web-build.mjs" "${RT}/web-build.mjs"
 
+# ── 4b. desktop（浏览器版工作区）bundle 预构建 ───────────────
+# 为什么在构建期做：装机现场跑 `hermes webapp --build-only` 要 npm 源 + 约 2 分钟，
+# 网络受限/超时就是"装完打不开 desktop"。预置进包后由 HERMES_WEBAPP_DIST 指向它，
+# 上游据此【永不重建】（见 hermes_cli/webapp.py: packaged_webapp_dist）。
+# ⚠ 上游 v0.22.6 才引入 webapp；老版本源码树没有 apps/desktop/scripts/build-webapp.mjs
+#   → 跳过即可（cmd/main 的 webapp_enabled 也会因此判定为不可用）。
+if [ -f "${SRC}/apps/desktop/scripts/build-webapp.mjs" ]; then
+    if [ "${SKIP_WEB}" = "1" ] && [ -f "${SRC}/apps/desktop/dist-webapp/index.html" ]; then
+        echo "[build] --skip-web：复用已有 dist-webapp"
+    else
+        need node; need npm
+        echo "[build] 构建 desktop bundle（npm run build:webapp，约 1-3 分钟）"
+        # 依赖已在上面 web_dist 那步装过（同一个 package.json workspace），
+        # 这里只跑构建。--no-install 让上游跳过它自己的 npm ci。
+        ( cd "${SRC}/apps/desktop" && node scripts/build-webapp.mjs --no-install ) \
+            || { echo "✗ desktop bundle 构建失败"; exit 1; }
+    fi
+    [ -f "${SRC}/apps/desktop/dist-webapp/index.html" ] \
+        || { echo "✗ desktop bundle 未产出 index.html"; exit 1; }
+    mkdir -p "${RT}/webapp_dist"
+    cp -r "${SRC}/apps/desktop/dist-webapp/." "${RT}/webapp_dist/"
+    echo "[build] webapp_dist ✓ ($(du -sh "${RT}/webapp_dist" | cut -f1), $(ls "${RT}/webapp_dist/assets" 2>/dev/null | wc -l) 个资源)"
+else
+    echo "[build] 上游无 webapp（v0.22.6 前）→ 跳过 desktop bundle"
+fi
+
 # ── 5. 桌面入口 + 网关代理（ui 必须在 app/ 内）───────────────
 mkdir -p "${APP_DIR}/ui/images"
 cp "${PKG_DIR}/ui/config" "${APP_DIR}/ui/config"
@@ -517,6 +543,12 @@ export TMPDIR="${WS}/tmp" TMP="${WS}/tmp" TEMP="${WS}/tmp"
 # 这里只滤掉这一行，其余输出（含真实错误）原样透传。
 _err="$(mktemp 2>/dev/null || echo "${DATA_DIR}/.hermes-shim-err.$$")"
 trap 'rm -f "${_err}"' EXIT
+# desktop bundle：只有真存在时才设 HERMES_WEBAPP_DIST —— 设了但目录没有，
+# 上游 prepare_webapp_renderer 会直接抛错（"is set but no Webapp renderer exists"），
+# 而不是优雅降级。没有 bundle 就不设，让上游走它自己的构建路径。
+_WEBAPP_ENV=""
+[ -f "${APP_DIR}/runtime/webapp_dist/index.html" ] \
+    && _WEBAPP_ENV="HERMES_WEBAPP_DIST=${APP_DIR}/runtime/webapp_dist"
 env \
     HOME="${DATA_DIR}" \
     PYTHONPATH="${SRC_DIR}" \
@@ -532,6 +564,7 @@ env \
     HERMES_WRITE_SAFE_ROOT="${WS}" \
     HERMES_MANAGED_BY="trim-hermes-fnos" \
     HERMES_TUI_WS_ORPHAN_REAP_GRACE_S="300" \
+    ${_WEBAPP_ENV:+"${_WEBAPP_ENV}"} \
     "${PY}" -m hermes_cli.main "$@" 2>"${_err}"
 _rc=$?
 grep -v '^⚠ install out of sync' "${_err}" >&2 || true

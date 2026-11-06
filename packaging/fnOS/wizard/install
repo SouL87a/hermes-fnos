@@ -41,6 +41,35 @@
     ]
   },
   {
+    "stepTitle": "访问方式",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "本应用有两个界面：\n  · desktop —— 完整工作区（会话、群聊、技能、插件、终端、文件树），日常使用\n  · dashboard —— 管理面板（设置、密钥、日志、用量统计），排障用\n\n飞牛桌面图标【始终】打开 desktop，不受下面选项影响。\n下面只决定「能不能从局域网直接连端口」：\n  开 = 可用 http://<NAS地址>:9120（desktop）、:9119（dashboard）直连，需要面板密码\n  关 = 只能通过飞牛桌面图标访问，不额外暴露端口，更安全\n\n两者都关闭时，本应用只走飞牛统一网关（飞牛登录态），不监听局域网。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_webapp_port_access",
+        "label": "desktop 端口访问（http://NAS:9120）",
+        "initValue": "on",
+        "options": [
+          { "label": "允许（推荐，手机/平板可直接打开）", "value": "on" },
+          { "label": "禁止（只走飞牛桌面图标）", "value": "off" }
+        ]
+      },
+      {
+        "type": "radio",
+        "field": "wizard_dash_port_access",
+        "label": "dashboard 端口访问（http://NAS:9119）",
+        "initValue": "on",
+        "options": [
+          { "label": "允许（保留升级前的用法）", "value": "on" },
+          { "label": "禁止（管理面板只走飞牛网关）", "value": "off" }
+        ]
+      }
+    ]
+  },
+  {
     "stepTitle": "网络代理（可选）",
     "items": [
       {

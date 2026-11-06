@@ -1,10 +1,10 @@
 appname               = hermes
 version               = 0.1.0
 display_name          = Hermes Agent
-desc                  = Nous Research 开源的自我进化 AI Agent。飞牛原生打包版（非 Docker）：服务端跑在 NAS 上，浏览器 / 飞牛桌面直接用完整控制台——配置、API Key、会话管理、内嵌终端；数据保存在 NAS 上，全设备共用一份。支持飞牛统一网关入口，也可用 http://NAS地址:9119 局域网直连（面板密码鉴权）。安装时从上游获取源码与依赖（需联网，支持代理），之后可用应用内 update 跟随官方更新。
+desc                  = Nous Research 开源的自我进化 AI Agent。飞牛原生打包版（非 Docker）：服务端跑在 NAS 上，飞牛桌面直接打开浏览器版工作区（Desktop）——会话、群聊、技能、插件、终端、文件树；数据保存在 NAS 上，全设备共用一份。默认走飞牛统一网关，也可按需开启 http://NAS地址:9120（Desktop）与 :9119（管理面板）局域网直连。安装时从上游获取源码与依赖（需联网，支持代理），之后可用应用内 update 跟随官方更新。
 platform              = x86
 source                = thirdparty
-developer             = Nous Research
+developer             = Hermes
 developer_url         = https://github.com/NousResearch/hermes-agent
 maintainer            = soul87
 maintainer_url        = https://github.com/SouL87a/hermes-fnos

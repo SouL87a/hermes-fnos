@@ -122,6 +122,27 @@ fi
 mv "${TMP2}.new" "${TMP}"
 rm -f "${TMP2}" "${TMP2}.new" 2>/dev/null || true
 
+### ── 端口访问开关（设置页 wizard_webapp_port_access / wizard_dash_port_access）──
+### 写入 .env：WEBAPP_PORT_ACCESS / DASH_PORT_ACCESS（on/off）。
+### ⚠ 设置页每次保存都会带上全部字段，但若某个字段缺失（老版本页面），
+###   保留原值而不是写默认 —— 否则用户只是改个代理，端口设置就被重置。
+write_port_flag() {
+    local key="$1" val="$2"
+    [ -n "${val}" ] || return 0
+    case "$(printf '%s' "${val}" | tr '[:upper:]' '[:lower:]')" in
+        on|1|true|yes)  val="on" ;;
+        off|0|false|no) val="off" ;;
+        *) echo "⚠ ${key} 取值非法（${val}），已忽略" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true; return 0 ;;
+    esac
+    local t="${TMP}.pf"
+    grep -vE "^[[:space:]]*(export[[:space:]]+)?${key}=" "${TMP}" > "${t}" 2>/dev/null || true
+    printf '%s=%s\n' "${key}" "${val}" >> "${t}"
+    mv "${t}" "${TMP}"
+    echo "${key}=${val}" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
+}
+write_port_flag WEBAPP_PORT_ACCESS "${wizard_webapp_port_access:-}"
+write_port_flag DASH_PORT_ACCESS   "${wizard_dash_port_access:-}"
+
 mv "${TMP}" "${ENV_FILE}"
 chmod 600 "${ENV_FILE}" 2>/dev/null || true
 chown -R "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${TRIM_PKGVAR}" 2>/dev/null || true

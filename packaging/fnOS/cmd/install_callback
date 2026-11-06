@@ -300,4 +300,28 @@ else
     echo "  ⚠ 面板登录只填了一项（用户名/密码需同时填写），已忽略" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true
 fi
 
+### ── 端口访问开关（向导 wizard_webapp_port_access / wizard_dash_port_access）──
+### 写入 .env：WEBAPP_PORT_ACCESS / DASH_PORT_ACCESS（on/off）。
+### 语义见 cmd/main 的 env_flag_on：开=绑 0.0.0.0，关=只绑回环。
+### ⚠ 升级重跑向导时字段可能缺失 → 缺失则【保留原值】，不要写默认值覆盖用户选择。
+write_port_flag() {
+    local key="$1" val="$2"
+    [ -n "${val}" ] || return 0
+    case "$(printf '%s' "${val}" | tr '[:upper:]' '[:lower:]')" in
+        on|1|true|yes)  val="on" ;;
+        off|0|false|no) val="off" ;;
+        *) echo "  ⚠ ${key} 取值非法（${val}），已忽略" >> "${TRIM_PKGVAR}/log/install.log" 2>/dev/null || true; return 0 ;;
+    esac
+    touch "${ENV_FILE}"
+    local t="${ENV_FILE}.tmp.$$"
+    grep -vE "^[[:space:]]*(export[[:space:]]+)?${key}=" "${ENV_FILE}" > "${t}" 2>/dev/null || true
+    printf '%s=%s\n' "${key}" "${val}" >> "${t}"
+    mv "${t}" "${ENV_FILE}"
+    chmod 600 "${ENV_FILE}" 2>/dev/null || true
+    chown "${TRIM_USERNAME}:${TRIM_GROUPNAME}" "${ENV_FILE}" 2>/dev/null || true
+    echo "  ${key}=${val}" >> "${TRIM_PKGVAR}/info.log" 2>/dev/null || true
+}
+write_port_flag WEBAPP_PORT_ACCESS "${wizard_webapp_port_access:-}"
+write_port_flag DASH_PORT_ACCESS   "${wizard_dash_port_access:-}"
+
 exit 0

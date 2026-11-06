@@ -11,8 +11,8 @@
 #   · 抽出来后本地也能对下载的 fpk 复验，不必重跑整个构建。
 #
 # 档位差异（这是本脚本存在的核心价值）：
-#   A 版：不预置运行时 → 体积 <50MB，且【不得】含 python.tar.gz / wheelhouse
-#   B 版：预置 Python + wheelhouse → 体积 <200MB，且【必须】含三者，
+#   A 版：不预置运行时 → 体积 <110MB，且【不得】含 python.tar.gz / wheelhouse
+#   B 版：预置 Python + wheelhouse → 体积 <260MB，且【必须】含三者，
 #         其中 wheelhouse 里的 Pillow 必须是 13.0.0（browser-harness 声明
 #         pillow==12.3.0，靠 uv override 才能上 13；若 pip download 又按
 #         传递依赖解析，就会退回 12.x 或直接失败 —— 实机 2026-11-05 踩过）
@@ -65,6 +65,17 @@ if echo "$A" | grep -qx './hermes-update.py'; then
     echo "✗ app.tgz 仍含 hermes-update.py（已改用上游 hermes update）"; exit 1
 fi
 
+# ── desktop bundle（浏览器版工作区）──────────────────────────
+# 预置了它，装机后无需联网 npm 构建即可从飞牛桌面打开 desktop。
+# 上游 < v0.22.6 没有 webapp 能力，此时允许缺失（cmd/main 会自动退回 dashboard）。
+if echo "$A" | grep -q '^\./runtime/webapp_dist/index\.html$'; then
+    echo "$A" | grep -q '^\./runtime/webapp_dist/assets/' \
+        || { echo "✗ webapp_dist 缺 assets/（bundle 不完整）"; exit 1; }
+    echo "✓ desktop bundle 已预置"
+else
+    echo "⚠ 未预置 desktop bundle（上游可能 < v0.22.6）→ 桌面图标将退回 dashboard"
+fi
+
 # ── 关键配置断言 ──────────────────────────────────────────
 grep -q '^service_port[[:space:]]*=[[:space:]]*9119' "${X}/manifest" \
     || { echo "✗ manifest 缺少 service_port = 9119"; exit 1; }
@@ -73,7 +84,25 @@ grep -q '^checkport[[:space:]]*=[[:space:]]*true' "${X}/manifest" \
 for f in wizard/install wizard/config; do
     grep -q 'wizard_auth_password' "${X}/${f}" \
         || { echo "✗ ${f} 缺少面板密码字段"; exit 1; }
+    # 端口访问开关（desktop / dashboard 各一个）
+    grep -q 'wizard_webapp_port_access' "${X}/${f}" \
+        || { echo "✗ ${f} 缺少 desktop 端口访问开关"; exit 1; }
+    grep -q 'wizard_dash_port_access' "${X}/${f}" \
+        || { echo "✗ ${f} 缺少 dashboard 端口访问开关"; exit 1; }
 done
+# 应用信息：发布者仍是 soul87，其余归 Hermes 官方
+grep -qE '^developer[[:space:]]*=[[:space:]]*Hermes[[:space:]]*$' "${X}/manifest" \
+    || { echo "✗ manifest 的 developer 应为 Hermes（官方）"; exit 1; }
+grep -qE '^maintainer[[:space:]]*=[[:space:]]*soul87' "${X}/manifest" \
+    || { echo "✗ manifest 的 maintainer 应为 soul87"; exit 1; }
+# 统一网关默认指向 desktop：cmd/main 必须用 gateway_upstream_port 决定上游端口，
+# 且 gateway 进程要 source 凭据（否则 desktop 登录必 401）
+grep -q 'gateway_upstream_port' "${X}/cmd/main" \
+    || { echo "✗ cmd/main 缺少 gateway_upstream_port（网关未指向 desktop）"; exit 1; }
+grep -q 'HERMES_WEBAPP_DIST' "${X}/cmd/main" \
+    || { echo "✗ cmd/main 未把 HERMES_WEBAPP_DIST 传给 gateway"; exit 1; }
+grep -q 'AUTH_ENV_FILE' "${X}/cmd/main" \
+    || { echo "✗ cmd/main 缺少凭据文件机制"; exit 1; }
 grep -q 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD' "${X}/cmd/main" \
     || { echo "✗ cmd/main 未注入 basic auth"; exit 1; }
 grep -q 'envfile.sh' "${X}/cmd/main" \
@@ -100,9 +129,11 @@ echo "✓ web_dist 前缀别名存在"
 
 # ── 档位专属断言 ──────────────────────────────────────────
 if [ "${PRESET}" = "A" ]; then
-    # 在线版不预置运行时，体积应远小于 50MB（web_dist ~10MB）
-    if [ "${SIZE}" -gt 52428800 ]; then
-        echo "✗ 在线版体积 $(du -h "${FPK}" | cut -f1) 超过 50MB —— 疑似又把运行时打包进去了"
+    # 在线版不预置运行时；但含两个预构建前端：
+    #   web_dist（dashboard，~10MB）+ webapp_dist（desktop，~37MB）
+    # 故上限放到 110MB。超过说明又把 python/wheelhouse 打包进来了。
+    if [ "${SIZE}" -gt 115343360 ]; then
+        echo "✗ 在线版体积 $(du -h "${FPK}" | cut -f1) 超过 110MB —— 疑似又把运行时打包进去了"
         exit 1
     fi
     # 反向断言：A 版绝不能预置这些（预置了就说明 preset 判断失效）
@@ -114,11 +145,11 @@ if [ "${PRESET}" = "A" ]; then
     if echo "$A" | grep -q '^\./runtime/wheelhouse/'; then
         echo "✗ 在线版不应含 wheelhouse（preset 判断可能失效）"; exit 1
     fi
-    echo "✓ 档位 A：未预置运行时，体积 $(du -h "${FPK}" | cut -f1)（上限 50MB）"
+    echo "✓ 档位 A：未预置运行时，体积 $(du -h "${FPK}" | cut -f1)（上限 110MB）"
 else
     # ── B 版：预置 Python + wheelhouse ──
-    if [ "${SIZE}" -gt 209715200 ]; then
-        echo "✗ 档位B 体积 $(du -h "${FPK}" | cut -f1) 超过 200MB —— wheelhouse/Python 预置异常膨胀"
+    if [ "${SIZE}" -gt 272629760 ]; then
+        echo "✗ 档位B 体积 $(du -h "${FPK}" | cut -f1) 超过 260MB —— wheelhouse/Python 预置异常膨胀"
         exit 1
     fi
     for need in ./runtime/python.tar.gz ./runtime/requirements.lock; do

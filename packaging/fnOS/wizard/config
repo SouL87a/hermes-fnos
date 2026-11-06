@@ -44,6 +44,33 @@
     ]
   },
   {
+    "stepTitle": "访问方式",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "飞牛桌面图标【始终】打开 desktop（完整工作区），不受下面选项影响。\n下面只决定「能不能从局域网直接连端口」：\n  开 = 可用 http://<NAS地址>:9120（desktop）、:9119（dashboard）直连\n  关 = 只能通过飞牛桌面图标访问，不额外暴露端口\n\n改动后需重启本应用生效。若 desktop 端口 9120 被其它应用占用，desktop 会自动关闭、桌面图标退回 dashboard。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_webapp_port_access",
+        "label": "desktop 端口访问（http://NAS:9120）",
+        "options": [
+          { "label": "允许", "value": "on" },
+          { "label": "禁止（只走飞牛桌面图标）", "value": "off" }
+        ]
+      },
+      {
+        "type": "radio",
+        "field": "wizard_dash_port_access",
+        "label": "dashboard 端口访问（http://NAS:9119）",
+        "options": [
+          { "label": "允许", "value": "on" },
+          { "label": "禁止（只走飞牛网关）", "value": "off" }
+        ]
+      }
+    ]
+  },
+  {
     "stepTitle": "面板登录",
     "items": [
       {
