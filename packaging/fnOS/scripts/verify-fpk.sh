@@ -108,8 +108,10 @@ grep -q '^checkport[[:space:]]*=[[:space:]]*true' "${X}/manifest" \
 # 应用信息：发布者仍是 soul87，其余归 Hermes 官方
 grep -qE '^developer[[:space:]]*=[[:space:]]*Hermes[[:space:]]*$' "${X}/manifest" \
     || fail "manifest 的 developer 应为 Hermes（官方）"
-grep -qE '^maintainer[[:space:]]*=[[:space:]]*soul87' "${X}/manifest" \
-    || fail "manifest 的 maintainer 应为 soul87"
+grep -qE '^maintainer[[:space:]]*=[[:space:]]*Hermes[[:space:]]*$' "${X}/manifest" \
+    || fail "manifest 的 maintainer 应为 Hermes（官方；fnOS 把它显示为「开发者」）"
+grep -qE '^distributor[[:space:]]*=[[:space:]]*soul87' "${X}/manifest" \
+    || fail "manifest 的 distributor 应为 soul87（发布者保持不变）"
 
 # ── 向导字段 ──────────────────────────────────────────────
 for f in wizard/install wizard/config; do
