@@ -102,126 +102,112 @@ jobs:
       #   preset=B（预置）~130MB，安装期下载 ~60MB（源码 clone）
       #   tag 构建：A/B 两版都产出，Release 同时挂两个资产
       #   手动触发：用 preset 输入选择（留空=A，B=B）
+      #
+      # ⚠ preset 输入必须真正生效：早先两个 step 无条件都跑，选 B 也会连带跑 A，
+      #   既浪费时间又让 B 的失败淹没在 A 的成功里（无法单独验证 B）。
+      #   现在按预设决定跑哪一档：
+      #     preset=B  → 只跑 B（单独验证 B 用）
+      #     preset=A  → 只跑 A
+      #     留空      → A + B（tag 构建/日常全量）
+      #   产物名统一为 hermes-<ver>-<preset>.fpk，下游校验按预设取。
+      - name: Resolve presets
+        id: presets
+        run: |
+          set -e
+          # 手动触发取输入；push/tag 事件没有 inputs，留空即全量
+          IN="${{ github.event.inputs.preset }}"
+          IN="$(printf '%s' "$IN" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')"
+          case "$IN" in
+            B|A) DO="$IN" ;;
+            "")  DO="A B" ;;
+            *)   echo "::error::未知 preset：$IN（只接受 A 或 B）"; exit 1 ;;
+          esac
+          echo "do=$DO" >> "$GITHUB_OUTPUT"
+          echo "本次构建档位：$DO"
+
+          # 产物路径按档位拼：upload-artifact 的 if-no-files-found 是按整个
+          # path 列表判定的，写死两个 glob 会让单独跑 B 时因 A 缺失而整体失败。
+          ART=""
+          for P in $DO; do
+            if [ "$P" = "A" ]; then
+              ART="${ART}packaging/fnOS/dist/hermes-*online.fpk"$'\n'
+            else
+              ART="${ART}packaging/fnOS/dist/hermes-*presetB.fpk"$'\n'
+            fi
+          done
+          {
+            echo "artifacts<<__EOF__"
+            printf '%s' "$ART"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build fpk (online)
+        if: contains(steps.presets.outputs.do, 'A')
         run: |
           set -e
           bash packaging/fnOS/scripts/build.sh
-          # 重命名为带档位后缀，避免与 B 版冲突
-          FPK="$(ls packaging/fnOS/dist/hermes-*.fpk | head -1)"
+          # 取 build.sh 的原始输出（无档位后缀），排除任何已归档产物
+          FPK=""
+          for f in packaging/fnOS/dist/hermes-*.fpk; do
+            case "$f" in
+              *-online.fpk|*-presetB.fpk) ;;
+              *) FPK="$f" ;;
+            esac
+          done
+          [ -n "$FPK" ] || { echo "✗ 未找到在线版原始产物"; ls -la packaging/fnOS/dist/; exit 1; }
           mv "$FPK" "${FPK%.fpk}-online.fpk"
 
       - name: Build fpk (preset B)
+        if: contains(steps.presets.outputs.do, 'B')
         run: |
           set -e
-          rm -f packaging/fnOS/dist/hermes-*.fpk   # 清掉 A 版产物，避免 ls 匹配错
+          # ⚠ 不能 `rm -f dist/hermes-*.fpk`：A+B 全量构建时那会把上一步刚
+          #   改名好的 -online.fpk 一起删掉（Release 只剩 B）。
+          #   只清【未带档位后缀】的中间产物（build.sh 的原始输出名）。
+          for f in packaging/fnOS/dist/hermes-*.fpk; do
+            case "$f" in
+              *-online.fpk|*-presetB.fpk) ;;   # 已归档，保留
+              *) rm -f "$f" ;;                 # 中间产物，清掉
+            esac
+          done
           bash packaging/fnOS/scripts/build.sh --preset B
-          FPK="$(ls packaging/fnOS/dist/hermes-*.fpk | head -1)"
+          # 取 build.sh 的原始输出（无档位后缀）：此时 dist 里还留着已归档的
+          # A 版，不能简单 `ls -t | head -1`（A 可能比 B 新 → 取错）。
+          FPK=""
+          for f in packaging/fnOS/dist/hermes-*.fpk; do
+            case "$f" in
+              *-online.fpk|*-presetB.fpk) ;;
+              *) FPK="$f" ;;
+            esac
+          done
+          [ -n "$FPK" ] || { echo "✗ 未找到 B 版原始产物"; ls -la packaging/fnOS/dist/; exit 1; }
           mv "$FPK" "${FPK%.fpk}-presetB.fpk"
 
       - name: Verify fpk
         run: |
           set -e
-          # 校验两个档位（都存在）
-          for FPK in packaging/fnOS/dist/hermes-*online.fpk packaging/fnOS/dist/hermes-*presetB.fpk; do
-            [ -f "$FPK" ] || { echo "✗ 缺少 $FPK"; exit 1; }
-          done
-          FPK="$(ls packaging/fnOS/dist/hermes-*online.fpk | head -1)"
-          SIZE=$(stat -c%s "$FPK")
-          echo "fpk: $FPK ($(du -h "$FPK" | cut -f1))"
-          LIST="$(tar -tzf "$FPK")"
-          echo "$LIST" | head -12
-
-          # ── 顶层结构 ──────────────────────────────────────
-          for need in manifest ICON.PNG ICON_256.PNG app.tgz \
-                      cmd/main cmd/install_callback cmd/config_callback cmd/uninstall_callback \
-                      config/privilege config/resource \
-                      wizard/install wizard/config wizard/uninstall; do
-            echo "$LIST" | grep -qx "$need" || { echo "✗ fpk 顶层缺少 $need"; exit 1; }
+          # 按本次构建的档位逐个校验：单独跑 B 时不应要求 A 存在（反之亦然）。
+          PRESETS="${{ steps.presets.outputs.do }}"
+          [ -n "$PRESETS" ] || { echo "✗ 未解析出构建档位"; exit 1; }
+          for P in $PRESETS; do
+            case "$P" in
+              A) FPK="$(ls packaging/fnOS/dist/hermes-*online.fpk 2>/dev/null | head -1)" ;;
+              B) FPK="$(ls packaging/fnOS/dist/hermes-*presetB.fpk 2>/dev/null | head -1)" ;;
+            esac
+            [ -n "$FPK" ] && [ -f "$FPK" ] || { echo "✗ 档位 $P 缺少产物"; exit 1; }
+            echo "=== 校验档位 $P: $FPK ($(du -h "$FPK" | cut -f1)) ==="
+            bash packaging/fnOS/scripts/verify-fpk.sh "$FPK" "$P" \
+              || { echo "✗ 档位 $P 校验失败"; exit 1; }
           done
 
-          X="$(mktemp -d)"
-          tar -xzf "$FPK" -C "$X" app.tgz manifest cmd/main cmd/install_callback \
-                             wizard/install wizard/config
-          A="$(tar -tzf "$X/app.tgz")"
 
-          # ── app.tgz 必须含的安装期组件 ────────────────────
-          for need in ./scripts/install-runtime.sh ./gateway-proxy.py ./envfile.sh \
-                      ./ui/config ./bin/hermes ./runtime/web_dist/index.html \
-                      ./runtime/install-stamp.json ./upstream-ref; do
-            echo "$A" | grep -qx "$need" || { echo "✗ app.tgz 缺少 $need"; exit 1; }
-          done
-
-          # ── app.tgz 不得包含的东西（本版改为安装期获取）────
-          if echo "$A" | grep -qE '^\./runtime/(python|hermes)/'; then
-            echo "✗ app.tgz 仍含 runtime/python 或源码树"; exit 1
-          fi
-          if echo "$A" | grep -qx './runtime/deps.txt'; then
-            echo "✗ app.tgz 仍含 deps.txt"; exit 1
-          fi
-          if echo "$A" | grep -qx './hermes-update.py'; then
-            echo "✗ app.tgz 仍含 hermes-update.py（已改用上游 hermes update）"; exit 1
-          fi
-
-          # ── 体积回归保护：不再预置运行时，应远小于 50MB ──
-          # （前端 web_dist 约 10MB，其余脚本/图标很小）
-          if [ "$SIZE" -gt 52428800 ]; then
-            echo "✗ 在线版 fpk 体积 $(du -h "$FPK" | cut -f1) 超过 50MB —— 疑似又把运行时打包进去了"
-            exit 1
-          fi
-          BP="$(ls packaging/fnOS/dist/hermes-*presetB.fpk 2>/dev/null | head -1)"
-          if [ -n "$BP" ]; then
-            BSIZE=$(stat -c%s "$BP")
-            if [ "$BSIZE" -gt 209715200 ]; then
-              echo "✗ 档位B fpk $(du -h "$BP" | cut -f1) 超过 200MB —— wheelhouse/Python 预置异常膨胀"
-              exit 1
-            fi
-            echo "✓ 档位B 体积 $(du -h "$BP" | cut -f1)（上限 200MB）"
-          fi
-          echo "✓ 体积 $(du -h "$FPK" | cut -f1)（未预置运行时）"
-
-          # ── 关键配置断言 ──────────────────────────────────
-          grep -q '^service_port[[:space:]]*=[[:space:]]*9119' "$X/manifest" \
-            || { echo "✗ manifest 缺少 service_port = 9119"; exit 1; }
-          grep -q '^checkport[[:space:]]*=[[:space:]]*true' "$X/manifest" \
-            || { echo "✗ manifest 缺少 checkport"; exit 1; }
-          for f in wizard/install wizard/config; do
-            grep -q 'wizard_auth_password' "$X/$f" \
-              || { echo "✗ $f 缺少面板密码字段"; exit 1; }
-          done
-          grep -q 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD' "$X/cmd/main" \
-            || { echo "✗ cmd/main 未注入 basic auth"; exit 1; }
-          grep -q 'envfile.sh' "$X/cmd/main" \
-            || { echo "✗ cmd/main 未加载 envfile.sh"; exit 1; }
-          grep -q 'install-runtime.sh' "$X/cmd/install_callback" \
-            || { echo "✗ install_callback 未调用 install-runtime.sh"; exit 1; }
-
-          # ── 关键：补丁必须已删除（防止回退到旧实现）────────
-          for fn in ensure_pm_env_ignored lazy_prune_redundant pm_bootstrap_kick \
-                    migrate_pm_venv_extras ensure_lazy_site_abi; do
-            if grep -q "^${fn}() {" "$X/cmd/main"; then
-              echo "✗ cmd/main 仍含旧补丁 ${fn}"; exit 1
-            fi
-          done
-          grep -q 'pm_venv_python()' "$X/cmd/main" \
-            || { echo "✗ cmd/main 缺少 pm_venv_python"; exit 1; }
-          echo "✓ 补丁已清除，改用 PM 真实 venv"
-
-          # ── web_dist 前缀别名（端口直连白屏修复）──────────
-          LINKS="$(tar -tvzf "$X/app.tgz" | grep 'runtime/web_dist/app/hermes' || true)"
-          echo "$LINKS" | grep -q '^l' \
-            || { echo "✗ web_dist 缺少 app/hermes 软链"; exit 1; }
-          echo "✓ web_dist 前缀别名存在"
-
-          rm -rf "$X"
-          echo "✓ fpk 结构检查通过"
-
-
+      # ⚠ 单独跑 B 时 dist 里只有 presetB 产物，若把两个 glob 都写死，
+      #   upload-artifact 会因 online 那个匹配不到而整体报错（if-no-files-found:
+      #   error 是按整个 path 列表判定的）。故用 presets 步骤算好的路径列表。
       - uses: actions/upload-artifact@v4
         with:
           name: hermes-${{ steps.ver.outputs.version }}-fpk
-          path: |
-            packaging/fnOS/dist/hermes-*online.fpk
-            packaging/fnOS/dist/hermes-*presetB.fpk
+          path: ${{ steps.presets.outputs.artifacts }}
           retention-days: 30
           if-no-files-found: error
 
@@ -316,11 +302,18 @@ jobs:
 
           ${CHANGES}
           EOF
+          # 上传本次实际构建的全部档位（单独跑 B 时不该去传不存在的 A，反之亦然）
+          ASSETS=("$FPK")
+          BFPK="$(find dist -type f -name 'hermes-*presetB.fpk' | head -n 1 || true)"
+          if [ -n "$BFPK" ] && [ "$BFPK" != "$FPK" ]; then
+            cp -f "$BFPK" "release/$(basename "$BFPK")"
+            ASSETS+=("release/$(basename "$BFPK")")
+          fi
+          echo "上传资产：${ASSETS[*]}"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$FPK" --clobber
-          gh release upload "$TAG" "$(ls packaging/fnOS/dist/hermes-*presetB.fpk 2>/dev/null | head -1)" --clobber 2>/dev/null || true
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
             gh release edit "$TAG" --notes-file "$NOTES"
           else
-            gh release create "$TAG" "$FPK" --title "Hermes ${VERSION}" --notes-file "$NOTES"
+            gh release create "$TAG" "${ASSETS[@]}" --title "Hermes ${VERSION}" --notes-file "$NOTES"
           fi
           echo "✓ Release $TAG 已发布"

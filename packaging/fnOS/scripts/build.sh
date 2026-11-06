@@ -253,17 +253,21 @@ print(d['packages']['python']['version'])" "${SRC}/pm/lock.json" 2>/dev/null || 
     #   只给 manylinux2014 会漏掉它们 → 报 "No matching distribution"（实机 2026-11-05
     #   的 cbor2：PyPI 有 cp314+manylinux_2_28 wheel，但平台参数不含该标签族 → 失败）。
     #   一次报错就是失败（pip download 不会跳过单个包），所以宁可多列。
-    # ⚠ Pillow override：browser-harness 声明 pillow==12.3.0（精确 pin），
-    #   而核心要求 13.0.0 → pip 严格解析直接冲突。uv 能装是因为 uv.lock 的
-    #   manifest overrides 声明了 13.0.0；pip 不认那个语义 → 用 constraints
-    #   把 Pillow 钉到 13.0.0（constraints 只约束版本、不参与解析起点，
-    #   恰好实现"override"效果）。旧方案的 uv-overrides.txt 同源。
-    OVR="${PBS_CACHE}/pip-constraints.txt"
-    printf '%s' "Pillow==13.0.0" > "${OVR}"
+    # ⚠ 必须 --no-deps：requirements.lock 是 `uv export --frozen` 的产物，
+    #   本身就是 uv.lock 解析完的【完整扁平依赖图】（逐包精确 pin），不需要
+    #   也不应该再由 pip 重新解析。pip 一旦解析传递依赖就会撞上
+    #   browser-harness 0.1.13 元数据里精确 pin 的 pillow==12.3.0，与清单中
+    #   override 后的 13.0.0 直接冲突 → ResolutionImpossible（实机 2026-11-05）。
+    #   uv 能把它们放一起靠的是 `[tool.uv] override-dependencies`，pip 没有
+    #   等价语义：--constraint 只会【收窄】版本，无法覆盖依赖自己的 pin，
+    #   反而制造死锁（pm/environment.py 安装期也是靠 `uv pip install
+    #   --overrides` 把 lock 里的 overrides 加回来，见 pm/pip_check.py）。
+    #   --no-deps 让 pip 退化成"按清单逐条下 wheel"，冲突不复存在，
+    #   且产物与 uv.lock 一致（清单本来就从它导出）。
     PIP_ARGS=(download
         -r "${RT}/requirements.lock"
         -d "${RT}/wheelhouse"
-        --constraint "${OVR}"
+        --no-deps
         --only-binary :all:
         --python-version 3.14
         --platform manylinux2014_x86_64
