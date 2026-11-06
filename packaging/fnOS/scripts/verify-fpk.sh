@@ -16,6 +16,10 @@
 #         其中 wheelhouse 里的 Pillow 必须是 13.0.0（browser-harness 声明
 #         pillow==12.3.0，靠 uv override 才能上 13；若 pip download 又按
 #         传递依赖解析，就会退回 12.x 或直接失败 —— 实机 2026-11-05 踩过）
+#
+# ⚠ 断言一律用 `grep ... <<<"$VAR"`（here-string），不要 `echo "$VAR" | grep`。
+#   后者在 grep -q 命中后提前退出，echo 收到 SIGPIPE，在 set -o pipefail 下
+#   被当成失败 → 断言误报"缺少 xxx"（CI 2026-11-06 实测，$A 变大后必现）。
 
 set -euo pipefail
 
@@ -33,12 +37,30 @@ SIZE=$(stat -c%s "${FPK}")
 echo "── 档位 ${PRESET}：${FPK} ($(du -h "${FPK}" | cut -f1)) ──"
 LIST="$(tar -tzf "${FPK}")"
 
+### 断言收集器：失败不立即退出，先记下来继续跑完，最后统一汇总。
+### 为什么：CI 一次只能看到【第一条】失败，改一版跑一次，来回好几轮。
+### 全跑完再报，一次就能看全。
+FAILS=()
+fail() { FAILS+=("$*"); echo "✗ $*"; }
+ok()   { echo "✓ $*"; }
+finish() {
+    if [ "${#FAILS[@]}" -gt 0 ]; then
+        echo
+        echo "✗ 档位 ${PRESET} 校验失败，共 ${#FAILS[@]} 项："
+        local i=1 f
+        for f in "${FAILS[@]}"; do echo "   $i) $f"; i=$((i + 1)); done
+        exit 1
+    fi
+    echo "✓ 档位 ${PRESET} 校验通过"
+    exit 0
+}
+
 # ── 顶层结构 ──────────────────────────────────────────────
 for need in manifest ICON.PNG ICON_256.PNG app.tgz \
             cmd/main cmd/install_callback cmd/config_callback cmd/uninstall_callback \
             config/privilege config/resource \
             wizard/install wizard/config wizard/uninstall; do
-    echo "$LIST" | grep -qx "$need" || { echo "✗ fpk 顶层缺少 $need"; exit 1; }
+    grep -qx -- "$need" <<<"${LIST}" || fail "fpk 顶层缺少 ${need}"
 done
 
 X="$(mktemp -d)"
@@ -51,81 +73,89 @@ A="$(tar -tzf "${X}/app.tgz")"
 for need in ./scripts/install-runtime.sh ./gateway-proxy.py ./envfile.sh \
             ./ui/config ./bin/hermes ./runtime/web_dist/index.html \
             ./runtime/install-stamp.json ./upstream-ref; do
-    echo "$A" | grep -qx "$need" || { echo "✗ app.tgz 缺少 $need"; exit 1; }
+    grep -qx -- "$need" <<<"${A}" || fail "app.tgz 缺少 ${need}"
 done
 
 # ── app.tgz 不得包含的东西（两档都必须在安装期获取）──────
-if echo "$A" | grep -qE '^\./runtime/(python|hermes)/'; then
-    echo "✗ app.tgz 仍含 runtime/python 或源码树"; exit 1
+if grep -qE '^\./runtime/(python|hermes)/' <<<"${A}"; then
+    fail "app.tgz 仍含 runtime/python 或源码树"
 fi
-if echo "$A" | grep -qx './runtime/deps.txt'; then
-    echo "✗ app.tgz 仍含 deps.txt"; exit 1
+if grep -qx -- './runtime/deps.txt' <<<"${A}"; then
+    fail "app.tgz 仍含 deps.txt"
 fi
-if echo "$A" | grep -qx './hermes-update.py'; then
-    echo "✗ app.tgz 仍含 hermes-update.py（已改用上游 hermes update）"; exit 1
+if grep -qx -- './hermes-update.py' <<<"${A}"; then
+    fail "app.tgz 仍含 hermes-update.py（已改用上游 hermes update）"
 fi
 
 # ── desktop bundle（浏览器版工作区）──────────────────────────
 # 预置了它，装机后无需联网 npm 构建即可从飞牛桌面打开 desktop。
 # 上游 < v0.22.6 没有 webapp 能力，此时允许缺失（cmd/main 会自动退回 dashboard）。
-if echo "$A" | grep -q '^\./runtime/webapp_dist/index\.html$'; then
-    echo "$A" | grep -q '^\./runtime/webapp_dist/assets/' \
-        || { echo "✗ webapp_dist 缺 assets/（bundle 不完整）"; exit 1; }
-    echo "✓ desktop bundle 已预置"
+# ⚠ 必须预置：本包的门户默认指向 desktop，没有 bundle 就等于退回 dashboard，
+#   与"默认进 desktop"的需求不符。上游 v0.22.7 已带 webapp，构建期必须产出它。
+if grep -q '^\./runtime/webapp_dist/index\.html$' <<<"${A}"; then
+    grep -q '^\./runtime/webapp_dist/assets/' <<<"${A}" \
+        || fail "webapp_dist 缺 assets/（bundle 不完整）"
+    ok "desktop bundle 已预置"
 else
-    echo "⚠ 未预置 desktop bundle（上游可能 < v0.22.6）→ 桌面图标将退回 dashboard"
+    fail "未预置 desktop bundle（runtime/webapp_dist/index.html）—— 门户将退回 dashboard"
 fi
 
-# ── 关键配置断言 ──────────────────────────────────────────
+# ── manifest 关键字段 ─────────────────────────────────────
 grep -q '^service_port[[:space:]]*=[[:space:]]*9119' "${X}/manifest" \
-    || { echo "✗ manifest 缺少 service_port = 9119"; exit 1; }
+    || fail "manifest 缺少 service_port = 9119"
 grep -q '^checkport[[:space:]]*=[[:space:]]*true' "${X}/manifest" \
-    || { echo "✗ manifest 缺少 checkport"; exit 1; }
-for f in wizard/install wizard/config; do
-    grep -q 'wizard_auth_password' "${X}/${f}" \
-        || { echo "✗ ${f} 缺少面板密码字段"; exit 1; }
-    # 端口访问开关（desktop / dashboard 各一个）
-    grep -q 'wizard_webapp_port_access' "${X}/${f}" \
-        || { echo "✗ ${f} 缺少 desktop 端口访问开关"; exit 1; }
-    grep -q 'wizard_dash_port_access' "${X}/${f}" \
-        || { echo "✗ ${f} 缺少 dashboard 端口访问开关"; exit 1; }
-done
+    || fail "manifest 缺少 checkport"
 # 应用信息：发布者仍是 soul87，其余归 Hermes 官方
 grep -qE '^developer[[:space:]]*=[[:space:]]*Hermes[[:space:]]*$' "${X}/manifest" \
-    || { echo "✗ manifest 的 developer 应为 Hermes（官方）"; exit 1; }
+    || fail "manifest 的 developer 应为 Hermes（官方）"
 grep -qE '^maintainer[[:space:]]*=[[:space:]]*soul87' "${X}/manifest" \
-    || { echo "✗ manifest 的 maintainer 应为 soul87"; exit 1; }
-# 统一网关默认指向 desktop：cmd/main 必须用 gateway_upstream_port 决定上游端口，
-# 且 gateway 进程要 source 凭据（否则 desktop 登录必 401）
+    || fail "manifest 的 maintainer 应为 soul87"
+
+# ── 向导字段 ──────────────────────────────────────────────
+for f in wizard/install wizard/config; do
+    grep -q 'wizard_auth_password' "${X}/${f}" \
+        || fail "${f} 缺少面板密码字段"
+    grep -q 'wizard_webapp_port_access' "${X}/${f}" \
+        || fail "${f} 缺少 desktop 端口访问开关"
+    grep -q 'wizard_dash_port_access' "${X}/${f}" \
+        || fail "${f} 缺少 dashboard 端口访问开关"
+done
+
+# ── cmd/main 关键机制 ─────────────────────────────────────
+# 统一网关默认指向 desktop：上游端口由 gateway_upstream_port 决定
 grep -q 'gateway_upstream_port' "${X}/cmd/main" \
-    || { echo "✗ cmd/main 缺少 gateway_upstream_port（网关未指向 desktop）"; exit 1; }
+    || fail "cmd/main 缺少 gateway_upstream_port（网关未指向 desktop）"
+# desktop bundle 经 HERMES_WEBAPP_DIST 指向上游（上游据此永不重建）
 grep -q 'HERMES_WEBAPP_DIST' "${X}/cmd/main" \
-    || { echo "✗ cmd/main 未把 HERMES_WEBAPP_DIST 传给 gateway"; exit 1; }
+    || fail "cmd/main 未把 HERMES_WEBAPP_DIST 传给 gateway"
+# 凭据文件：gateway 也要 source，否则 desktop 登录必 401
 grep -q 'AUTH_ENV_FILE' "${X}/cmd/main" \
-    || { echo "✗ cmd/main 缺少凭据文件机制"; exit 1; }
+    || fail "cmd/main 缺少凭据文件机制"
 grep -q 'HERMES_DASHBOARD_BASIC_AUTH_PASSWORD' "${X}/cmd/main" \
-    || { echo "✗ cmd/main 未注入 basic auth"; exit 1; }
+    || fail "cmd/main 未注入 basic auth"
 grep -q 'envfile.sh' "${X}/cmd/main" \
-    || { echo "✗ cmd/main 未加载 envfile.sh"; exit 1; }
+    || fail "cmd/main 未加载 envfile.sh"
 grep -q 'install-runtime.sh' "${X}/cmd/install_callback" \
-    || { echo "✗ install_callback 未调用 install-runtime.sh"; exit 1; }
+    || fail "install_callback 未调用 install-runtime.sh"
 
 # ── 关键：补丁必须已删除（防止回退到旧实现）──────────────
 for fn in ensure_pm_env_ignored lazy_prune_redundant pm_bootstrap_kick \
           migrate_pm_venv_extras ensure_lazy_site_abi; do
     if grep -q "^${fn}() {" "${X}/cmd/main"; then
-        echo "✗ cmd/main 仍含旧补丁 ${fn}"; exit 1
+        fail "cmd/main 仍含旧补丁 ${fn}"
     fi
 done
 grep -q 'pm_venv_python()' "${X}/cmd/main" \
-    || { echo "✗ cmd/main 缺少 pm_venv_python"; exit 1; }
-echo "✓ 补丁已清除，改用 PM 真实 venv"
+    || fail "cmd/main 缺少 pm_venv_python"
+ok "补丁已清除，改用 PM 真实 venv"
 
 # ── web_dist 前缀别名（端口直连白屏修复）──────────────────
 LINKS="$(tar -tvzf "${X}/app.tgz" | grep 'runtime/web_dist/app/hermes' || true)"
-echo "$LINKS" | grep -q '^l' \
-    || { echo "✗ web_dist 缺少 app/hermes 软链"; exit 1; }
-echo "✓ web_dist 前缀别名存在"
+if grep -q '^l' <<<"${LINKS}"; then
+    ok "web_dist 前缀别名存在"
+else
+    fail "web_dist 缺少 app/hermes 软链"
+fi
 
 # ── 档位专属断言 ──────────────────────────────────────────
 if [ "${PRESET}" = "A" ]; then
@@ -133,58 +163,54 @@ if [ "${PRESET}" = "A" ]; then
     #   web_dist（dashboard，~10MB）+ webapp_dist（desktop，~37MB）
     # 故上限放到 110MB。超过说明又把 python/wheelhouse 打包进来了。
     if [ "${SIZE}" -gt 115343360 ]; then
-        echo "✗ 在线版体积 $(du -h "${FPK}" | cut -f1) 超过 110MB —— 疑似又把运行时打包进去了"
-        exit 1
+        fail "在线版体积 $(du -h "${FPK}" | cut -f1) 超过 110MB —— 疑似又把运行时打包进去了"
     fi
     # 反向断言：A 版绝不能预置这些（预置了就说明 preset 判断失效）
     for f in ./runtime/python.tar.gz ./runtime/requirements.lock; do
-        if echo "$A" | grep -qx "$f"; then
-            echo "✗ 在线版不应含 ${f}（preset 判断可能失效）"; exit 1
+        if grep -qx -- "$f" <<<"${A}"; then
+            fail "在线版不应含 ${f}（preset 判断可能失效）"
         fi
     done
-    if echo "$A" | grep -q '^\./runtime/wheelhouse/'; then
-        echo "✗ 在线版不应含 wheelhouse（preset 判断可能失效）"; exit 1
+    if grep -q '^\./runtime/wheelhouse/' <<<"${A}"; then
+        fail "在线版不应含 wheelhouse（preset 判断可能失效）"
     fi
-    echo "✓ 档位 A：未预置运行时，体积 $(du -h "${FPK}" | cut -f1)（上限 110MB）"
+    ok "档位 A：未预置运行时，体积 $(du -h "${FPK}" | cut -f1)（上限 110MB）"
 else
     # ── B 版：预置 Python + wheelhouse ──
     if [ "${SIZE}" -gt 272629760 ]; then
-        echo "✗ 档位B 体积 $(du -h "${FPK}" | cut -f1) 超过 260MB —— wheelhouse/Python 预置异常膨胀"
-        exit 1
+        fail "档位B 体积 $(du -h "${FPK}" | cut -f1) 超过 260MB —— wheelhouse/Python 预置异常膨胀"
     fi
     for need in ./runtime/python.tar.gz ./runtime/requirements.lock; do
-        echo "$A" | grep -qx "$need" || { echo "✗ 档位B 缺少 ${need}"; exit 1; }
+        grep -qx -- "$need" <<<"${A}" || fail "档位B 缺少 ${need}"
     done
-    echo "$A" | grep -q '^\./runtime/wheelhouse/' \
-        || { echo "✗ 档位B 缺少 runtime/wheelhouse/"; exit 1; }
+    if ! grep -q '^\./runtime/wheelhouse/' <<<"${A}"; then
+        fail "档位B 缺少 runtime/wheelhouse/"
+    fi
 
     # 真正解出 wheelhouse 看内容 —— 这是 Pillow 冲突修复的回归守卫。
-    tar -xzf "${X}/app.tgz" -C "${X}" ./runtime/wheelhouse ./runtime/requirements.lock 2>/dev/null \
-        || { echo "✗ 解包 wheelhouse 失败"; exit 1; }
-    WH="${X}/runtime/wheelhouse"
-    NW=$(ls "${WH}" | wc -l)
-    [ "${NW}" -gt 0 ] || { echo "✗ wheelhouse 为空"; exit 1; }
-
-    # Pillow 必须是 13.0.0：browser-harness 0.1.13 元数据精确 pin 12.3.0，
-    # 能共存全靠 uv override。若 pip 又按传递依赖解析 → 冲突或退回 12.x。
-    if ls "${WH}" | grep -qiE '^pillow-12\.'; then
-        echo "✗ wheelhouse 含 Pillow 12.x —— override 失效（应只有 13.0.0）"
-        ls "${WH}" | grep -i '^pillow-' | sed 's/^/    /'
-        exit 1
+    if tar -xzf "${X}/app.tgz" -C "${X}" ./runtime/wheelhouse ./runtime/requirements.lock 2>/dev/null; then
+        WH="${X}/runtime/wheelhouse"
+        NW=$(ls "${WH}" 2>/dev/null | wc -l)
+        if [ "${NW}" -eq 0 ]; then
+            fail "wheelhouse 为空"
+        else
+            # Pillow 必须是 13.0.0：browser-harness 0.1.13 元数据精确 pin 12.3.0，
+            # 能共存全靠 uv override。若 pip 又按传递依赖解析 → 冲突或退回 12.x。
+            if ls "${WH}" | grep -qiE '^pillow-12\.'; then
+                fail "wheelhouse 含 Pillow 12.x —— override 失效（应只有 13.0.0）"
+            fi
+            ls "${WH}" | grep -qiE '^pillow-13\.0\.0-' \
+                || fail "wheelhouse 缺 Pillow 13.0.0"
+            # 抽样：关键 wheel 不得缺失（漏了会在装机期才炸）
+            for pat in 'browser_harness' 'cbor2' 'websockets'; do
+                ls "${WH}" | grep -qi "^${pat}-" || fail "wheelhouse 缺 ${pat}"
+            done
+            ok "Pillow 13.0.0 已入 wheelhouse（override 生效，未退回 12.x）"
+            ok "档位B：wheelhouse ${NW} 个 wheel，$(du -sh "${WH}" | cut -f1)"
+        fi
+    else
+        fail "解包 wheelhouse 失败"
     fi
-    ls "${WH}" | grep -qiE '^pillow-13\.0\.0-' \
-        || { echo "✗ wheelhouse 缺 Pillow 13.0.0"; ls "${WH}" | grep -i '^pillow-' | sed 's/^/    /'; exit 1; }
-    echo "✓ Pillow 13.0.0 已入 wheelhouse（override 生效，未退回 12.x）"
-
-    # requirements.lock 里也必须是 13.0.0
-    grep -qiE '^pillow==13\.0\.0' "${X}/runtime/requirements.lock" \
-        || { echo "✗ requirements.lock 未钉 Pillow==13.0.0"; grep -i '^pillow' "${X}/runtime/requirements.lock" | sed 's/^/    /'; exit 1; }
-
-    # 抽样：关键 wheel 不得缺失（漏了会在装机期才炸）
-    for pat in 'browser_harness' 'cbor2' 'websockets'; do
-        ls "${WH}" | grep -qi "^${pat}-" || { echo "✗ wheelhouse 缺 ${pat}"; exit 1; }
-    done
-    echo "✓ 档位B：wheelhouse ${NW} 个 wheel，$(du -sh "${WH}" | cut -f1)，体积 $(du -h "${FPK}" | cut -f1)（上限 200MB）"
 fi
 
-echo "✓ 档位 ${PRESET} 校验通过"
+finish
