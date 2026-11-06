@@ -125,22 +125,6 @@ jobs:
           echo "do=$DO" >> "$GITHUB_OUTPUT"
           echo "本次构建档位：$DO"
 
-          # 产物路径按档位拼：upload-artifact 的 if-no-files-found 是按整个
-          # path 列表判定的，写死两个 glob 会让单独跑 B 时因 A 缺失而整体失败。
-          ART=""
-          for P in $DO; do
-            if [ "$P" = "A" ]; then
-              ART="${ART}packaging/fnOS/dist/hermes-*online.fpk"$'\n'
-            else
-              ART="${ART}packaging/fnOS/dist/hermes-*presetB.fpk"$'\n'
-            fi
-          done
-          {
-            echo "artifacts<<__EOF__"
-            printf '%s' "$ART"
-            echo "__EOF__"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Build fpk (online)
         if: contains(steps.presets.outputs.do, 'A')
         run: |
@@ -201,13 +185,24 @@ jobs:
           done
 
 
-      # ⚠ 单独跑 B 时 dist 里只有 presetB 产物，若把两个 glob 都写死，
-      #   upload-artifact 会因 online 那个匹配不到而整体报错（if-no-files-found:
-      #   error 是按整个 path 列表判定的）。故用 presets 步骤算好的路径列表。
-      - uses: actions/upload-artifact@v4
+      # 每个档位单独一个 artifact：共用一个名字时两档会挤进同一个 zip，
+      # 下载后还得先解压再靠文件名区分（实机 2026-11-06 反馈"看着像被覆盖了"）。
+      # 分开后 Actions 页面直接两条记录，各自独立下载。
+      - name: Upload artifact (online)
+        if: contains(steps.presets.outputs.do, 'A')
+        uses: actions/upload-artifact@v4
         with:
-          name: hermes-${{ steps.ver.outputs.version }}-fpk
-          path: ${{ steps.presets.outputs.artifacts }}
+          name: hermes-${{ steps.ver.outputs.version }}-online
+          path: packaging/fnOS/dist/hermes-*online.fpk
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload artifact (preset B)
+        if: contains(steps.presets.outputs.do, 'B')
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-${{ steps.ver.outputs.version }}-presetB
+          path: packaging/fnOS/dist/hermes-*presetB.fpk
           retention-days: 30
           if-no-files-found: error
 
@@ -225,21 +220,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download fpk artifact
+      # 两个档位是各自独立的 artifact（online / presetB），分别下载到不同目录，
+      # 避免同名冲突，也避免下面再靠 find 猜哪个是哪个。
+      - name: Download fpk artifacts
         uses: actions/download-artifact@v4
         with:
-          name: hermes-${{ needs.fpk.outputs.version }}-fpk
+          pattern: hermes-${{ needs.fpk.outputs.version }}-*
           path: dist
+          merge-multiple: true
 
       - name: Locate .fpk (unpack if needed)
         run: |
           set -euo pipefail
           find dist -type f -name '*.zip' | while read -r z; do unzip -o "$z" -d "$(dirname "$z")"; done
-          FPK="$(find dist -type f -name 'hermes-*.fpk' | head -n 1)"
-          [ -n "$FPK" ] || { echo "✗ 未找到 hermes-*.fpk"; find dist -maxdepth 4; exit 1; }
           mkdir -p release
-          cp -f "$FPK" "release/$(basename "$FPK")"
-          echo "fpk_path=release/$(basename "$FPK")" >> "$GITHUB_ENV"
+          # 按后缀明确取用，不靠 find 的返回顺序（原先 head -n 1 可能取到 B 版，
+          # 导致 161MB 的预置包被当成"默认下载"）。
+          ONLINE="$(find dist -type f -name 'hermes-*-online.fpk' | head -n 1 || true)"
+          PRESETB="$(find dist -type f -name 'hermes-*-presetB.fpk' | head -n 1 || true)"
+          echo "online=[${ONLINE}]"
+          echo "presetB=[${PRESETB}]"
+          [ -n "$ONLINE" ] || [ -n "$PRESETB" ] || { echo "✗ 未找到任何 fpk"; find dist -maxdepth 4; exit 1; }
+
+          # 主资产优先在线版（体积小、通用）；只有 B 时退回 B。
+          MAIN="${ONLINE:-$PRESETB}"
+          cp -f "$MAIN" "release/$(basename "$MAIN")"
+          echo "fpk_path=release/$(basename "$MAIN")" >> "$GITHUB_ENV"
+          if [ -n "$PRESETB" ] && [ "$PRESETB" != "$MAIN" ]; then
+            cp -f "$PRESETB" "release/$(basename "$PRESETB")"
+            echo "presetb_path=release/$(basename "$PRESETB")" >> "$GITHUB_ENV"
+          else
+            echo "presetb_path=" >> "$GITHUB_ENV"
+          fi
 
       - name: Create or update Release
         env:
@@ -304,10 +316,8 @@ jobs:
           EOF
           # 上传本次实际构建的全部档位（单独跑 B 时不该去传不存在的 A，反之亦然）
           ASSETS=("$FPK")
-          BFPK="$(find dist -type f -name 'hermes-*presetB.fpk' | head -n 1 || true)"
-          if [ -n "$BFPK" ] && [ "$BFPK" != "$FPK" ]; then
-            cp -f "$BFPK" "release/$(basename "$BFPK")"
-            ASSETS+=("release/$(basename "$BFPK")")
+          if [ -n "${presetb_path:-}" ] && [ "${presetb_path}" != "$FPK" ]; then
+            ASSETS+=("${presetb_path}")
           fi
           echo "上传资产：${ASSETS[*]}"
           if gh release view "$TAG" >/dev/null 2>&1; then
