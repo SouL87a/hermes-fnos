@@ -443,7 +443,31 @@ fi
 
 # 新布局：源码在数据目录（git clone 自带 .git，支持 hermes update）
 SRC_DIR="${DATA_DIR}/src"
-WEB_DIST="${APP_DIR}/runtime/web_dist"
+# 前端：优先用与当前代码树同源的那份（hermes update 会重建到源码树里）。
+# 判据与 cmd/main 的 resolve_web_dist 保持一致：构建时间晚于源码 checkout。
+resolve_web_dist() {
+    local pkg="${APP_DIR}/runtime/web_dist"
+    local src="${SRC_DIR}/hermes_cli/web_dist"
+    if [ -f "${src}/index.html" ] && [ -d "${src}/assets" ] &&
+       [ -f "${SRC_DIR}/hermes_cli/main.py" ] &&
+       [ "${src}/index.html" -nt "${SRC_DIR}/hermes_cli/main.py" ]; then
+        printf '%s' "${src}"
+    else
+        printf '%s' "${pkg}"
+    fi
+}
+resolve_webapp_dist() {
+    local pkg="${APP_DIR}/runtime/webapp_dist"
+    local src="${SRC_DIR}/apps/desktop/dist-webapp"
+    local ref="${SRC_DIR}/apps/desktop/package.json"
+    if [ -f "${src}/index.html" ] && [ -d "${src}/assets" ] && [ -f "${ref}" ] &&
+       [ "${src}/index.html" -nt "${ref}" ]; then
+        printf '%s' "${src}"
+    else
+        printf '%s' "${pkg}"
+    fi
+}
+WEB_DIST="$(resolve_web_dist)"
 
 # 工作区：与 cmd/main 的 resolve_workspace() 同逻辑
 WS=""
@@ -555,8 +579,9 @@ trap 'rm -f "${_err}"' EXIT
 # 上游 prepare_webapp_renderer 会直接抛错（"is set but no Webapp renderer exists"），
 # 而不是优雅降级。没有 bundle 就不设，让上游走它自己的构建路径。
 _WEBAPP_ENV=""
-[ -f "${APP_DIR}/runtime/webapp_dist/index.html" ] \
-    && _WEBAPP_ENV="HERMES_WEBAPP_DIST=${APP_DIR}/runtime/webapp_dist"
+_WD="$(resolve_webapp_dist)"
+[ -f "${_WD}/index.html" ] \
+    && _WEBAPP_ENV="HERMES_WEBAPP_DIST=${_WD}"
 env \
     HOME="${DATA_DIR}" \
     PYTHONPATH="${SRC_DIR}" \

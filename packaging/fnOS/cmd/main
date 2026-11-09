@@ -68,6 +68,9 @@ APP_CTL_DIR="$(cd "$(dirname "${SELF_PATH}")" && pwd)"
 ### 解释器：PM venv 里的 python（安装期由 install-runtime.sh 建好）。
 ### 这里只在【函数定义阶段】留空；真正启动前会调 pm_venv_python 重新解析。
 PY=""
+### 前端根目录：由 resolve_web_dist 在启动时决定（见函数定义）。
+### 打包预构建在 <app>/runtime/web_dist；`hermes update` 会把它重建到
+### <data>/src/hermes_cli/web_dist —— 固定用打包那份 = 在线更新后「新后端 + 旧前端」。
 WEB_DIST="${APP_DIR}/runtime/web_dist"
 GATEWAY_SOCKET="${APP_DIR}/hermes.sock"
 GATEWAY_PROXY="${APP_DIR}/gateway-proxy.py"
@@ -141,17 +144,51 @@ pm_env_install_blocking() {
 }
 
 
-### 进程识别：绝对路径匹配，不误伤其他 python。
-### ⚠ 系统 Python 模式下 dashboard 的 argv[0] 是 ${TRIM_PKGVAR}/venv/bin/python3，
-### 【不含】${APP_DIR}/runtime（实测该进程 cmdline 只有 venv 解释器 + 参数）。
-### 沿用旧 pattern 会让 pid_alive()/status() 恒判「未运行」：应用中心显示已停止 /
-### 启动失败，而 start 会重复拉起（端口冲突），stop 的兜底 pkill 也失效。
-### 改用「解释器 + 模块」前缀，两种运行时模式都精确命中。
-PATTERN="${PY} -m ${MODULE}"
+### 进程识别：按「解释器属于本应用 + 模块名」判定，不绑定某个解释器路径。
+###
+### ⚠ 为什么不能用 `pgrep -f "${PY} -m hermes_cli.main"`（旧实现）：
+###   `hermes update` 重启进程时用的是【它自己的】解释器与启动器：
+###     <data>/tools/python-3.14.9+…/bin/python3 -I -c "… sys.argv=['<data>/src/hermes_cli/main.py','dashboard',…]; runpy.run_module('hermes_cli.main' …)"
+###   cmdline 里既没有 PM venv 的解释器路径，也没有 `-m hermes_cli.main`
+###   （是 `-c` + runpy）→ 旧 PATTERN 命中 0 个进程（实机 2026-11-09 实测）。
+###   后果：status 靠 gateway-proxy 侥幸判活；stop 只杀 proxy，dashboard/gateway
+###   变孤儿占着 9119 → 下次 fpk 升级 start 撞端口 → 面板「启动失败」。
+###
+### 判据改用 /proc/<pid>/exe：解释器必须落在本应用的
+###   · <data>/installs/*/…/venv/bin/python3   （PM 建的 venv，cmd/main 启动）
+###   · <data>/tools/python-*/bin/python3      （hermes update 装的运行时）
+### 再用 cmdline 命中 hermes_cli/main 的任一形态（`-m hermes_cli.main` 或
+### `hermes_cli/main.py`）。用 exe 过滤同时解决了「pgrep -f 命中执行命令的
+### shell 自身」这个老问题——bash 的 exe 不在上述目录里。
 GATEWAY_PATTERN="${APP_DIR}/gateway-proxy.py"
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+### 本应用的 Hermes 进程 PID。$1 = any|dashboard|gateway（默认 any）。
+hermes_pids() {
+    local role="${1:-any}" d pid exe cmd
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        [ -r "/proc/${pid}/cmdline" ] || continue
+        exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null)" || continue
+        case "${exe}" in
+            "${DATA_DIR}/installs/"*/bin/python3) ;;
+            "${DATA_DIR}/tools/python-"*/bin/python3) ;;
+            *) continue ;;
+        esac
+        cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)"
+        case "${cmd}" in
+            *hermes_cli/main.py*|*hermes_cli.main*) ;;
+            *) continue ;;
+        esac
+        case "${role}" in
+            dashboard) case "${cmd}" in *dashboard*) ;; *) continue ;; esac ;;
+            gateway)   case "${cmd}" in *gateway*run*) ;; *) continue ;; esac ;;
+        esac
+        printf '%s\n' "${pid}"
+    done
 }
 
 ### 进程存活判定以 /proc 为准。
@@ -165,14 +202,18 @@ pid_alive() {
     [ "${state}" = "Z" ] && return 1
     cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)"
     [ -z "${cmd}" ] && return 0
-    case "${cmd}" in *"${PATTERN}"*|*"${GATEWAY_PATTERN}"*) return 0 ;; esac
+    case "${cmd}" in *"${GATEWAY_PATTERN}"*) return 0 ;; esac
+    # ⚠ 不用 `hermes_pids any | grep -q`：pipefail 下 grep 无匹配即返回 1，
+    #   若再被 set -e 捕获会误杀脚本。先取快照再判断，退出码可控。
+    local _hp
+    _hp="$(hermes_pids any 2>/dev/null || true)"
+    case $'\n'"${_hp}"$'\n' in *$'\n'"${pid}"$'\n'*) return 0 ;; esac
     return 1
 }
 
-### 只认本应用自己的进程（绝对路径匹配）。
-### pgrep/pkill 的 pattern 前必须加 --，否则会被 procps 当成选项。
+### 只认本应用自己的进程：Hermes 进程（含 update 拉起的）+ 网关代理。
 own_pids() {
-    pgrep -f -- "${PATTERN}" 2>/dev/null
+    hermes_pids any
     pgrep -f -- "${GATEWAY_PATTERN}" 2>/dev/null
 }
 
@@ -205,6 +246,41 @@ else
     log_msg "警告：缺少 envfile.sh —— 面板密码含 # 或首尾空格时可能失效"
 fi
 
+### ── 前端产物定位（dashboard 的 web_dist / desktop 的 webapp_dist）─────────
+### 背景：`hermes update` 会把代码 checkout 到 <data>/src，并【在源码树里】
+###   重建前端（<data>/src/hermes_cli/web_dist、<data>/src/apps/desktop/dist-webapp）。
+###   而打包预构建的那份在 <app>/runtime/。若固定用打包那份，在线更新后就会出现
+###   「新后端 + 旧前端」（实机 2026-11-09：0.23.0 后端配 0.22.7 前端）。
+###
+### 判据：构建时间晚于源码 checkout 时间 —— `git checkout` 会把源码 mtime 刷成
+###   切换时刻，所以「web_dist/index.html 比 hermes_cli/main.py 新」说明这份前端
+###   确实是在当前代码树上构建的。比单纯比 mtime 更可靠，也比读版本号稳（上游
+###   不保证 web_dist 带版本标记）。
+resolve_web_dist() {
+    local pkg="${APP_DIR}/runtime/web_dist"
+    local src="${SRC_DIR}/hermes_cli/web_dist"
+    if [ -f "${src}/index.html" ] && [ -d "${src}/assets" ] &&
+       [ -f "${SRC_DIR}/hermes_cli/main.py" ] &&
+       [ "${src}/index.html" -nt "${SRC_DIR}/hermes_cli/main.py" ]; then
+        printf '%s' "${src}"
+    else
+        printf '%s' "${pkg}"
+    fi
+}
+
+resolve_webapp_dist() {
+    local pkg="${APP_DIR}/runtime/webapp_dist"
+    local src="${SRC_DIR}/apps/desktop/dist-webapp"
+    # 参照物用 apps/desktop/package.json（该目录里最稳定的源码文件）
+    local ref="${SRC_DIR}/apps/desktop/package.json"
+    if [ -f "${src}/index.html" ] && [ -d "${src}/assets" ] && [ -f "${ref}" ] &&
+       [ "${src}/index.html" -nt "${ref}" ]; then
+        printf '%s' "${src}"
+    else
+        printf '%s' "${pkg}"
+    fi
+}
+
 ### ── 端口访问开关（.env 里两个键，安装向导 / 应用设置写入）──────────────
 ###   WEBAPP_PORT_ACCESS  desktop（浏览器版工作区，默认 9120）能否 http://NAS:9120 直连
 ###   DASH_PORT_ACCESS    dashboard（管理面板，9119）能否 http://NAS:9119 直连
@@ -230,7 +306,8 @@ env_flag_on() {
 webapp_enabled() {
     [ "${WEBAPP_DISABLED:-0}" = "1" ] && return 1
     [ -f "${SRC_DIR}/hermes_cli/webapp.py" ] || return 1
-    [ -f "${APP_DIR}/runtime/webapp_dist/index.html" ] || return 1
+    # 用 resolve_webapp_dist：跟随在线更新重建的那份，不写死打包路径
+    [ -f "$(resolve_webapp_dist)/index.html" ] || return 1
     return 0
 }
 
@@ -527,7 +604,6 @@ gateway_supervisor_loop() {
         log_msg "supervisor: 拿不到 PM venv 解释器，退出"
         return 1
     fi
-    PATTERN="${PY} -m ${MODULE}"
 
     ### node 环境不靠参数传递：runuser 分支只传了 ws，参数化会在那条路径上丢失。
     ### 循环体自行用 node_env() 解析（HERMES_NODE + PATH，见其说明）。
@@ -546,9 +622,15 @@ gateway_supervisor_loop() {
 
     # 只在 bundle 真存在时才设 HERMES_WEBAPP_DIST：设了但目录没有，上游会抛
     # "is set but no Webapp renderer exists" 而不是优雅降级。
-    local _WEBAPP_DIST_ENV=""
-    if [ -f "${APP_DIR}/runtime/webapp_dist/index.html" ]; then
-        _WEBAPP_DIST_ENV="HERMES_WEBAPP_DIST='${APP_DIR}/runtime/webapp_dist'"
+    # 用 resolve_webapp_dist：在线更新重建的那份优先（与 dashboard 的 D1 同构）。
+    local _WEBAPP_DIST_ENV="" _wd
+    _wd="$(resolve_webapp_dist)"
+    if [ -f "${_wd}/index.html" ]; then
+        _WEBAPP_DIST_ENV="HERMES_WEBAPP_DIST='${_wd}'"
+        # 上游会用 .hermes-stale 标记拒绝服务「hermes update 没能重建」的 bundle。
+        # 若我们选中的是源码树那份且带了标记，说明它确实不可用；选中打包那份时
+        # 标记不该存在（打包产物不参与 update 重建），顺手清掉避免永久 503。
+        [ -f "${_wd}/.hermes-stale" ] && rm -f "${_wd}/.hermes-stale" 2>/dev/null || true
     fi
     local GW_CMD
     GW_CMD="cd '${SRC_DIR}' && exec env \
@@ -738,20 +820,28 @@ start_process() {
         echo "无法定位 PM 虚拟环境（见 ${DATA_DIR}/log/install-runtime.log）" > "${TRIM_TEMP_LOGFILE}"
         return 1
     fi
-    PATTERN="${PY} -m ${MODULE}"
 
     if [ ! -d "${SRC_DIR}/hermes_cli" ]; then
         log_msg "启动失败：找不到源码树 ${SRC_DIR}/hermes_cli"
         echo "应用文件缺失：${SRC_DIR}" > "${TRIM_TEMP_LOGFILE}"
         return 1
     fi
+    # 选前端：在线更新重建的那份优先（与当前代码树同源），否则回退打包预构建。
+    WEB_DIST="$(resolve_web_dist)"
+    log_msg "WEB_DIST=${WEB_DIST}（$([ "${WEB_DIST#"${APP_DIR}"}" = "${WEB_DIST}" ] && echo '源码树构建' || echo '打包预构建')）"
     if [ ! -f "${WEB_DIST}/index.html" ]; then
         log_msg "启动失败：缺少预构建前端 ${WEB_DIST}/index.html"
         echo "应用缺少预构建前端（web_dist）" > "${TRIM_TEMP_LOGFILE}"
         return 1
     fi
     # 端口直连需要：产物里的 /app/hermes/assets/… 能落到真实文件（见函数注释）。
+    # ⚠ 源码树那份是 base='/' 构建（靠 X-Forwarded-Prefix 改写），不需要前缀软链；
+    #   打包那份把 /app/hermes 编译进了产物，需要。两者都建一次无害（幂等）。
     ensure_web_prefix_alias "${WEB_DIST}"
+
+    # 可观测性：代码版本 vs 包版本。在线更新后两者会不一致（源码在 <data>/src，
+    # 包在 <app>），这行是排查「新后端配旧前端」类问题的第一现场证据。
+    log_msg "代码版本: $(git -C "${SRC_DIR}" describe --tags --always 2>/dev/null || echo unknown) / 包版本: $(sed -n 's/.*"baseVersion": *"\([^"]*\)".*/\1/p' "${APP_DIR}/runtime/install-stamp.json" 2>/dev/null || echo unknown)"
 
     # desktop 的 config.yaml（webapp: 段）。必须在 gateway 起来【之前】写好：
     # 上游只在 gateway 启动时读一次，改完必须重启才生效。
@@ -962,11 +1052,9 @@ HERMES_GATEWAY_DEBUG='1' \
 
 stop_process() {
     log_msg "Stopping process ..."
-    # ⚠ PATTERN 在脚本顶部由（空的）PY 拼成，必须在这里重新解析，
-    #   否则 pkill 的 pattern 变成 " -m hermes_cli.main"（前导空格），
-    #   匹配不到真实进程 → 停不干净。
-    local _py; _py="$(pm_venv_python)"
-    [ -n "${_py}" ] && PATTERN="${_py} -m ${MODULE}"
+    # 进程识别用 hermes_pids（按 /proc/<pid>/exe + cmdline 过滤），
+    # 不依赖解释器路径——hermes update 拉起的进程用 <data>/tools/python-*，
+    # 与 PM venv 不是同一个解释器（实机 2026-11-09）。
 
     ### TERM 后的等待秒数。
     ### ⚠ 不能太短：gateway 收到 TERM 后要做优雅 drain（断开平台适配器、
@@ -1011,27 +1099,27 @@ stop_process() {
     ### gateway 收 TERM 的途径有二：supervisor 的 trap、兜底 pkill。
     ### 这里统一：现在就对 gateway 发 TERM（幂等），然后等它退出（受 stop_timeout 约束），
     ### 确认退出（或超时 KILL）之后才动 supervisor。
-    if pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
+    if [ -n "$(hermes_pids gateway)" ]; then
         log_msg "send TERM to gateway (drain, up to ${stop_timeout}s) ..."
-        pkill -TERM -f -- "${PATTERN} gateway run" 2>/dev/null || true
+        hermes_pids gateway | xargs -r kill -TERM 2>/dev/null || true
         local gcount=0
-        while pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1 && [ "${gcount}" -lt "${stop_timeout}" ]; do
+        while [ -n "$(hermes_pids gateway)" ] && [ "${gcount}" -lt "${stop_timeout}" ]; do
             sleep 1
             gcount=$((gcount + 1))
         done
-        if pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
+        if [ -n "$(hermes_pids gateway)" ]; then
             log_msg "gateway ${stop_timeout}s 未退出（drain 未完成），send KILL"
-            pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
+            hermes_pids gateway | xargs -r kill -KILL 2>/dev/null || true
         else
             log_msg "gateway 已优雅退出（${gcount}s）"
         fi
     fi
 
     # 兜底：dashboard 会 spawn 子进程（pty/session reaper），runuser 包装导致
-    # pidfile 记的是 wrapper 的 PID，所以按绝对路径 pattern 兜底清理。
+    # pidfile 记的是 wrapper 的 PID，所以按 exe+cmdline 兜底清理。
     if own_pids > /dev/null 2>&1; then
-        log_msg "清理残留进程 (${PATTERN} / ${GATEWAY_PATTERN})"
-        pkill -TERM -f -- "${PATTERN}" 2>/dev/null || true
+        log_msg "清理残留进程 (hermes_pids / ${GATEWAY_PATTERN})"
+        hermes_pids any | xargs -r kill -TERM 2>/dev/null || true
         pkill -TERM -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
         # 给兜底命中的进程同样的 drain 时间（它们可能刚收到 TERM）
         local wait_left="${stop_timeout}"
@@ -1039,7 +1127,7 @@ stop_process() {
             sleep 1
             wait_left=$((wait_left - 1))
         done
-        pkill -KILL -f -- "${PATTERN}" 2>/dev/null || true
+        hermes_pids any | xargs -r kill -KILL 2>/dev/null || true
         pkill -KILL -f -- "${GATEWAY_PATTERN}" 2>/dev/null || true
     fi
     # supervisor 循环体本身（bash 跑 gateway_supervisor_loop）也按 cmd/main 路径兜底。
@@ -1057,9 +1145,7 @@ stop_process() {
 }
 
 status() {
-    # 同 stop_process：PATTERN 需要真实 PY 才能匹配进程。
-    local _py; _py="$(pm_venv_python)"
-    [ -n "${_py}" ] && PATTERN="${_py} -m ${MODULE}"
+    # 进程识别已改用 hermes_pids（按 /proc/<pid>/exe 过滤），无需 PATTERN。
     local pid
     pid="$(read_pid)"
     if [ -n "${pid}" ] && pid_alive "${pid}"; then
@@ -1126,14 +1212,14 @@ restart_gateway() {
     local gpid
     gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
     [ -n "${gpid}" ] && kill -TERM "${gpid}" 2>/dev/null || true
-    pkill -TERM -f -- "${PATTERN} gateway run" 2>/dev/null || true
+    hermes_pids gateway | xargs -r kill -TERM 2>/dev/null || true
     local i=0
     while [ "${i}" -lt 15 ]; do
-        pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1 || break
+        [ -n "$(hermes_pids gateway)" ] || break
         sleep 1
         i=$((i + 1))
     done
-    pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
+    hermes_pids gateway | xargs -r kill -KILL 2>/dev/null || true
 
     # 起：写回 want → 重启 supervisor（start_gateway_supervisor 自带单例清理）
     start_gateway_supervisor "${ws}" || {
@@ -1145,7 +1231,7 @@ restart_gateway() {
     # 面板显示「已重启」但通道实际离线（实机报告 §4.3，最危险的一处）。
     local n=0
     while [ "${n}" -lt 10 ]; do
-        if pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
+        if [ -n "$(hermes_pids gateway)" ]; then
             log_msg "gateway restart 完成"
             return 0
         fi
@@ -1161,7 +1247,7 @@ start_gateway_only() {
     acquire_gateway_lock || { log_msg "gateway 操作已在执行中，忽略本次 start"; return 0; }
     local ws
     ws="$(resolve_workspace)"
-    if [ -f "${GATEWAY_WANT_FILE}" ] && pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1; then
+    if [ -f "${GATEWAY_WANT_FILE}" ] && [ -n "$(hermes_pids gateway)" ]; then
         log_msg "gateway 已在运行"
         return 0
     fi
@@ -1180,14 +1266,14 @@ stop_gateway_only() {
     local gpid
     gpid="$(head -n 1 "${GATEWAY_PID_FILE}" 2>/dev/null | tr -d '[:space:]')"
     [ -n "${gpid}" ] && kill -TERM "${gpid}" 2>/dev/null || true
-    pkill -TERM -f -- "${PATTERN} gateway run" 2>/dev/null || true
+    hermes_pids gateway | xargs -r kill -TERM 2>/dev/null || true
     local i=0
     while [ "${i}" -lt 15 ]; do
-        pgrep -f -- "${PATTERN} gateway run" > /dev/null 2>&1 || break
+        [ -n "$(hermes_pids gateway)" ] || break
         sleep 1
         i=$((i + 1))
     done
-    pkill -KILL -f -- "${PATTERN} gateway run" 2>/dev/null || true
+    hermes_pids gateway | xargs -r kill -KILL 2>/dev/null || true
     # 显式清 supervisor：want 已删、gateway 已杀，它没有需要优雅清理的东西；
     # 且它可能正卡在退避 sleep（TERM 的 trap 要等 sleep 结束才跑，最长 30s）→ 用 KILL 立即生效。
     kill_supervisors KILL
