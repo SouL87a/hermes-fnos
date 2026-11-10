@@ -155,8 +155,9 @@ pm_env_install_blocking() {
 ###   变孤儿占着 9119 → 下次 fpk 升级 start 撞端口 → 面板「启动失败」。
 ###
 ### 判据改用 /proc/<pid>/exe：解释器必须落在本应用的
-###   · <data>/installs/*/…/venv/bin/python3   （PM 建的 venv，cmd/main 启动）
-###   · <data>/tools/python-*/bin/python3      （hermes update 装的运行时）
+###   · <data>/installs/*/…/venv/bin/python3*  （PM 建的 venv，cmd/main 启动）
+###   · <data>/tools/python-*/bin/python3*     （hermes update 装的运行时）
+###   ⚠ 末尾的 * 不能省：readlink -f 解析后是 python3.14（带次版本号）。
 ### 再用 cmdline 命中 hermes_cli/main 的任一形态（`-m hermes_cli.main` 或
 ### `hermes_cli/main.py`）。用 exe 过滤同时解决了「pgrep -f 命中执行命令的
 ### shell 自身」这个老问题——bash 的 exe 不在上述目录里。
@@ -173,9 +174,15 @@ hermes_pids() {
         pid="${d#/proc/}"
         [ -r "/proc/${pid}/cmdline" ] || continue
         exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null)" || continue
+        ### ⚠ 必须用 `python3*` 而不是 `python3`：
+        ###   /proc/<pid>/exe 是 readlink -f 【解析后】的路径，venv 与
+        ###   tools/python-* 的 bin/python3 都指向 bin/python3.14（带次版本号）。
+        ###   精确匹配 python3 → hermes_pids 恒返回空 → pid_alive 在就绪轮询里
+        ###   恒假 → 每次 start 都先打「进程提前退出」并 return 1，平台把一次
+        ###   成功启动记成失败（实机 2026-11-09 22:01，应用其实 15s 后就绪）。
         case "${exe}" in
-            "${DATA_DIR}/installs/"*/bin/python3) ;;
-            "${DATA_DIR}/tools/python-"*/bin/python3) ;;
+            "${DATA_DIR}/installs/"*/bin/python3*) ;;
+            "${DATA_DIR}/tools/python-"*/bin/python3*) ;;
             *) continue ;;
         esac
         cmd="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)"
