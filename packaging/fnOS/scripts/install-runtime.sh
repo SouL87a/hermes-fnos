@@ -236,10 +236,23 @@ install_source() {
             fi
             # ⚠ 源码换了 → 依赖图可能变了 → 现有 venv 不能再算「就绪」。
             #   删掉当前 key 的 facts.json，让 pm_env_ok 返回假 → 走 pm install 重装。
+            #
+            # ⚠⚠ 但【不能直接删】：pm install 在后面独立的步骤里，一旦失败（实机
+            #   2026-11-13：0.23.0→0.23.1 时 pnpm 工具装不上），facts.json 已经没了
+            #   → cmd/main 的 pm_env_ready() 恒假 → 启动时自动重跑 install-runtime →
+            #   再次失败 → 应用彻底起不来；而平台已把包体回滚成旧版，形成「包旧 +
+            #   源码新 + 无运行期记录」的半升级状态。
+            #   改为【备份】：pm install 成功后新 facts 自然覆盖；失败则恢复备份，
+            #   让应用至少还能用旧环境启动。
             local nk
             nk="$( (command -v python3 >/dev/null 2>&1 && python3 -c \
                 "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:16])" "${SRC}") 2>/dev/null || true)"
-            [ -n "${nk}" ] && rm -f "${DATA_DIR}/installs/${nk}/facts.json" 2>/dev/null || true
+            if [ -n "${nk}" ] && [ -f "${DATA_DIR}/installs/${nk}/facts.json" ]; then
+                FACTS_BAK="${DATA_DIR}/installs/${nk}/facts.json.pre-upgrade-$(date +%s)"
+                cp -p "${DATA_DIR}/installs/${nk}/facts.json" "${FACTS_BAK}" 2>/dev/null || FACTS_BAK=""
+                [ -n "${FACTS_BAK}" ] && log "已备份运行期记录 → ${FACTS_BAK}"
+                rm -f "${DATA_DIR}/installs/${nk}/facts.json" 2>/dev/null || true
+            fi
             return 0
         fi
         # checkout 失败必须中止（fail loud）：静默沿用旧源码 = 用户以为升级了
@@ -424,11 +437,63 @@ PY
         envs+=("UV_FIND_LINKS=${APP_DIR}/runtime/wheelhouse")
         log "预置 wheelhouse: ${APP_DIR}/runtime/wheelhouse ($(ls "${APP_DIR}/runtime/wheelhouse" | wc -l) 个)"
     fi
-    (
+
+    ### 工具闭包预装（带重试）。
+    ### ⚠ 为什么单独先装：`pm install` 的第一步就是发布 lock 里声明的全部工具，
+    ###   然后 activate() 检查它们是否在 PATH 上。上游新版本若新增了必需工具
+    ###   （v0.23.1 新增 pnpm 12.15.0，约 25MB），这一步要现下载；一次性失败就
+    ###   整包回滚，代价很大（实机 2026-11-13：pnpm 没装上 → pm install 非 0 →
+    ###   install_callback 失败 → 平台回滚，且 facts.json 已删 → 应用起不来）。
+    ### 先单独跑一次 `--tools-only` 并重试，把网络抖动挡在这里。
+    ### ⚠ 该选项【不接受】names（实测报 "it does not take names"），只能无参调用。
+    local _try
+    # 本次 pm 输出的单独副本：失败时只回显【这一次】的内容，不掺历史
+    local _pm_out="${DATA_DIR}/log/pm-install-last.log"
+    : > "${_pm_out}" 2>/dev/null || _pm_out="/dev/null"
+    for _try in 1 2 3; do
+        # ⚠ 用 tee -a 而不是 >>：让 pm 的工具阶段输出同时进日志【和】回调 stdout，
+        #   否则应用中心那条「执行脚本出错」后面什么线索都没有（实机 2026-11-13：
+        #   日志里既没有 ✓ pnpm 也没有 ✗ pnpm，无法定位）。
+        if (
+            cd "${SRC}" || exit 1
+            env "${envs[@]}" "${BOOT_PY}" -m pm.cli install --tools-only
+        ) 2>&1 | tee -a "${LOG}" "${_pm_out}" > /dev/null; then
+            log "✓ 工具闭包已就绪（第 ${_try} 次）"
+            break
+        fi
+        # 失败时立刻回显本次工具阶段的输出（这是报告 §6 缺失的关键线索）
+        log "⚠ 工具闭包第 ${_try} 次失败，末尾 20 行："
+        tail -20 "${_pm_out}" 2>/dev/null | while IFS= read -r _l; do log "  ${_l}"; done
+        : > "${_pm_out}" 2>/dev/null || true
+        if [ "${_try}" -lt 3 ]; then
+            log "⚠ 工具闭包安装第 ${_try} 次失败，5s 后重试…"
+            sleep 5
+        else
+            log "⚠ 工具闭包安装 3 次均失败 —— 继续走 pm install（它会再试一次），"
+            log "  若仍失败请看 ${LOG} 里的工具阶段输出"
+        fi
+    done
+    if ! (
         cd "${SRC}" || exit 1
         env "${envs[@]}" "${BOOT_PY}" -m pm.cli "${args[@]}"
-    ) >> "${LOG}" 2>&1 || die "pm install 失败，详见 ${LOG}"
+    ) 2>&1 | tee -a "${LOG}" "${_pm_out}" > /dev/null; then
+        # 失败：把【本次】pm 输出的末尾回显到安装日志（应用中心只显示这一层），
+        # 再恢复运行期记录，让应用还能用旧环境启动 —— 否则「起不来 + 半升级」。
+        # ⚠ 用单独的 _pm_out 而不是 tail 整个 LOG：后者会取到上一次的旧内容。
+        log "✗ pm install 失败，本次输出末尾 40 行："
+        tail -40 "${_pm_out}" 2>/dev/null | while IFS= read -r _l; do log "  ${_l}"; done
+        if [ -n "${FACTS_BAK:-}" ] && [ -f "${FACTS_BAK}" ]; then
+            local _nk
+            _nk="$(basename "$(dirname "${FACTS_BAK}")")"
+            if mv -f "${FACTS_BAK}" "${DATA_DIR}/installs/${_nk}/facts.json" 2>/dev/null; then
+                log "已恢复旧运行期记录（应用仍可用旧环境启动）"
+            fi
+        fi
+        die "pm install 失败，详见 ${LOG}"
+    fi
     log "✓ 依赖环境已就绪"
+    # 成功后备份已无用（新 facts 已就位），清掉避免堆积
+    [ -n "${FACTS_BAK:-}" ] && rm -f "${FACTS_BAK}" 2>/dev/null || true
 
     ### 回收旧 generation：每次 sync 会新建 ~440MB 的环境目录，旧的不自动删
     ### （实机 2026-11-05：3 代共存 1.3G）。上游 `pm gc` 会清理
