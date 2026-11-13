@@ -304,11 +304,16 @@ fi
 ###
 ### ⚠ pnpm 用 npm 全局安装即可 —— npm 本身可用，只是上游拒绝用【npm 装依赖】。
 install_web_deps() {
-    # NPM_REG 由调用方提供（镜像参数）；set -u 下兜底成空数组
-    local -a _reg=("${NPM_REG[@]:-}")
+    # NPM_REG 由调用方提供（镜像参数）。
+    # ⚠ 不能用 "${NPM_REG[@]:-}"：空数组时它会展开成一个【空字符串参数】，
+    #   传给 npm 就成了 `npm install -g pnpm@1 "" ...` → npm 把空串当子命令，
+    #   报一堆用法帮助并失败（CI 实测）。用下面的写法才是"零个参数"。
+    local -a _reg=()
+    [ "${#NPM_REG[@]}" -gt 0 ] && _reg=("${NPM_REG[@]}")
     local lock="${SRC}/pm/lock.json"
     local pin=""
-    if [ -f "${lock}" ] && [ -n "${STAMP_PY}" ] && [ -x "${STAMP_PY}" ]; then
+    # ⚠ STAMP_PY 是命令名（python3）不是绝对路径，不能用 [ -x ] 判断
+    if [ -f "${lock}" ] && [ -n "${STAMP_PY}" ]; then
         pin="$("${STAMP_PY}" -c "
 import json,sys
 try:
@@ -342,8 +347,8 @@ except Exception:
         # 先落日志再判退出码：CI 上失败时这是唯一诊断来源。
         _pnpm_log="${PBS_CACHE}/pnpm-install.log"
         set +e
-        ( cd "${SRC}" && pnpm install --frozen-lockfile --trust-lockfile \
-            ${HERMES_NPM_REGISTRY:+--registry "${HERMES_NPM_REGISTRY}"} ) > "${_pnpm_log}" 2>&1
+        ( cd "${SRC}" && pnpm install --frozen-lockfile --trust-lockfile "${_reg[@]}" ) \
+            > "${_pnpm_log}" 2>&1
         local rc=$?
         set -e
         if [ "${rc}" = "0" ]; then
