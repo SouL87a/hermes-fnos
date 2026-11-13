@@ -328,24 +328,32 @@ except Exception:
         fi
         if [ -z "${have}" ] || { [ -n "${pin}" ] && [ "${have}" != "${pin}" ]; }; then
             echo "[build]   pnpm 不可用或版本不符（有=${have:-无}，需=${pin:-任意}）→ 用 npm 全局安装"
-            npm install -g "pnpm@${pin:-latest}" --no-audit --no-fund "${_reg[@]}" >> /dev/null 2>&1 \
-                || { echo "✗ pnpm 安装失败"; return 1; }
+            # ⚠ 不吞输出：CI 上装失败时这是唯一的诊断来源
+            if ! npm install -g "pnpm@${pin:-latest}" --no-audit --no-fund "${_reg[@]}" 2>&1 | tail -20; then
+                echo "✗ pnpm 安装失败（见上方 npm 输出）"
+                return 1
+            fi
             have="$(pnpm --version 2>/dev/null || true)"
             echo "[build]   pnpm 就绪：${have:-?}"
         fi
-        # --ignore-scripts 避开会挂死的 postinstall（与 npm 时代同理）
-        # ⚠ pnpm 用 --frozen-lockfile 对应 npm ci；--trust-lockfile 跳过校验
-        if ( cd "${SRC}" && pnpm install --frozen-lockfile --trust-lockfile --ignore-scripts \
-                ${HERMES_NPM_REGISTRY:+--registry "${HERMES_NPM_REGISTRY}"} ) >> /dev/null 2>&1; then
+        # ⚠ 不传 --ignore-scripts：pnpm 的 workspace 依赖可能靠 install script
+        #   产出原生模块；上游的 preinstall 只是版本校验（此时已满足）。
+        #   ⚠ pnpm 用 --frozen-lockfile 对应 npm ci。
+        # 先落日志再判退出码：CI 上失败时这是唯一诊断来源。
+        _pnpm_log="${PBS_CACHE}/pnpm-install.log"
+        set +e
+        ( cd "${SRC}" && pnpm install --frozen-lockfile --trust-lockfile \
+            ${HERMES_NPM_REGISTRY:+--registry "${HERMES_NPM_REGISTRY}"} ) > "${_pnpm_log}" 2>&1
+        local rc=$?
+        set -e
+        if [ "${rc}" = "0" ]; then
             echo "[build]   pnpm install ✓"
+            rm -f "${_pnpm_log}"
             return 0
         fi
-        echo "[build]   ⚠ pnpm install 失败，尝试不带 --frozen-lockfile"
-        if ( cd "${SRC}" && pnpm install --ignore-scripts \
-                ${HERMES_NPM_REGISTRY:+--registry "${HERMES_NPM_REGISTRY}"} ); then
-            return 0
-        fi
-        echo "✗ pnpm 装依赖失败"
+        echo "[build]   ⚠ pnpm install 失败（rc=${rc}），末尾 40 行："
+        tail -40 "${_pnpm_log}" 2>/dev/null || true
+        rm -f "${_pnpm_log}"
         return 1
     fi
 
