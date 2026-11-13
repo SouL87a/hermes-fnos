@@ -294,6 +294,70 @@ print(d['packages']['python']['version'])" "${SRC}/pm/lock.json" 2>/dev/null || 
     echo "[build]   wheelhouse ✓ ($(ls "${RT}/wheelhouse" | wc -l) 个, $(du -sh "${RT}/wheelhouse" | cut -f1))"
 fi
 
+### 安装前端依赖。上游 v0.23.1 起从 npm 换成 **pnpm**，且 package.json 的
+### preinstall 会硬校验 pnpm 版本、明确拒绝 npm：
+###   "npm is refused here: run pnpm install --frozen-lockfile at the repository root"
+### 而 package-lock.json 已删除，只剩 pnpm-lock.yaml。
+###
+### 做法：按 <src>/pm/lock.json 里 pin 的 pnpm 版本（packages.pnpm.version）
+### 确保 PATH 上有匹配的 pnpm；装不到才回退 npm（兼容 v0.23.0 及更早）。
+###
+### ⚠ pnpm 用 npm 全局安装即可 —— npm 本身可用，只是上游拒绝用【npm 装依赖】。
+install_web_deps() {
+    # NPM_REG 由调用方提供（镜像参数）；set -u 下兜底成空数组
+    local -a _reg=("${NPM_REG[@]:-}")
+    local lock="${SRC}/pm/lock.json"
+    local pin=""
+    if [ -f "${lock}" ] && [ -n "${STAMP_PY}" ] && [ -x "${STAMP_PY}" ]; then
+        pin="$("${STAMP_PY}" -c "
+import json,sys
+try:
+    print(json.load(open(sys.argv[1],encoding='utf-8'))['packages']['pnpm']['version'])
+except Exception:
+    print('')
+" "${lock}" 2>/dev/null || true)"
+    fi
+
+    # 用 pnpm 的前提：有 pnpm-lock.yaml
+    if [ -f "${SRC}/pnpm-lock.yaml" ]; then
+        echo "[build] 装前端依赖（pnpm ${pin:-}，上游 v0.23.1+ 用 pnpm）"
+        # 确保 PATH 上有匹配版本的 pnpm
+        local have=""
+        if command -v pnpm > /dev/null 2>&1; then
+            have="$(pnpm --version 2>/dev/null || true)"
+        fi
+        if [ -z "${have}" ] || { [ -n "${pin}" ] && [ "${have}" != "${pin}" ]; }; then
+            echo "[build]   pnpm 不可用或版本不符（有=${have:-无}，需=${pin:-任意}）→ 用 npm 全局安装"
+            npm install -g "pnpm@${pin:-latest}" --no-audit --no-fund "${_reg[@]}" >> /dev/null 2>&1 \
+                || { echo "✗ pnpm 安装失败"; return 1; }
+            have="$(pnpm --version 2>/dev/null || true)"
+            echo "[build]   pnpm 就绪：${have:-?}"
+        fi
+        # --ignore-scripts 避开会挂死的 postinstall（与 npm 时代同理）
+        # ⚠ pnpm 用 --frozen-lockfile 对应 npm ci；--trust-lockfile 跳过校验
+        if ( cd "${SRC}" && pnpm install --frozen-lockfile --trust-lockfile --ignore-scripts \
+                ${HERMES_NPM_REGISTRY:+--registry "${HERMES_NPM_REGISTRY}"} ) >> /dev/null 2>&1; then
+            echo "[build]   pnpm install ✓"
+            return 0
+        fi
+        echo "[build]   ⚠ pnpm install 失败，尝试不带 --frozen-lockfile"
+        if ( cd "${SRC}" && pnpm install --ignore-scripts \
+                ${HERMES_NPM_REGISTRY:+--registry "${HERMES_NPM_REGISTRY}"} ); then
+            return 0
+        fi
+        echo "✗ pnpm 装依赖失败"
+        return 1
+    fi
+
+    # 回退：v0.23.0 及更早用 npm + package-lock.json
+    echo "[build] 装前端依赖（npm ci --ignore-scripts，避开会挂死的 postinstall）"
+    ( cd "${SRC}" && npm ci --no-audit --no-fund --ignore-scripts "${_reg[@]}" ) \
+      || { echo "  npm ci 失败，回退 npm install"; \
+           ( cd "${SRC}" && npm install --no-audit --no-fund --ignore-scripts "${_reg[@]}" ) \
+           || return 1; }
+    return 0
+}
+
 # ── 4. 前端预构建（web_dist）────────────────────────────────
 # 实测踩到的坑：
 #  a) 依赖必须 `npm ci --ignore-scripts`：某些包的 postinstall（如
@@ -312,10 +376,7 @@ else
     # 国内可设 HERMES_NPM_REGISTRY 走镜像加速（如 https://registry.npmmirror.com）
     NPM_REG=()
     [ -n "${HERMES_NPM_REGISTRY:-}" ] && NPM_REG=(--registry "${HERMES_NPM_REGISTRY}")
-    echo "[build] 装前端依赖（npm ci --ignore-scripts，避开会挂死的 postinstall）"
-    ( cd "${SRC}" && npm ci --no-audit --no-fund --ignore-scripts "${NPM_REG[@]}" ) \
-      || { echo "  npm ci 失败，回退 npm install"; \
-           ( cd "${SRC}" && npm install --no-audit --no-fund --ignore-scripts "${NPM_REG[@]}" ); }
+    install_web_deps
 
     if [ "${HERMES_WEB_TYPECHECK:-0}" = "1" ]; then
         echo "[build] 前端构建（上游完整入口，含 TypeScript 类型检查，较慢）"
@@ -362,12 +423,14 @@ if [ -f "${SRC}/apps/desktop/scripts/build-webapp.mjs" ]; then
     if [ "${SKIP_WEB}" = "1" ] && [ -f "${SRC}/apps/desktop/dist-webapp/index.html" ]; then
         echo "[build] --skip-web：复用已有 dist-webapp"
     else
-        need node; need npm
+        need node
         echo "[build] 构建 desktop bundle（npm run build:webapp，约 1-3 分钟）"
         # ⚠ 不能传 --no-install：上游把依赖装进【私有 workspace】
         #   (.build/webapp-workspace)，不是源码根的 node_modules —— 上面 web_dist
-        #   那步的 npm ci 对它无效。--no-install 会让 vite 找不到而失败。
+        #   那步装的依赖对它无效。--no-install 会让 vite 找不到而失败。
         #   交给它自己 prepare（reuse=true，重复构建会复用）。
+        # ⚠ 它内部走 prepareNodeDependencies → pnpm（v0.23.1+）。pnpm 已由
+        #   install_web_deps 装好并放在 PATH 上，这里无需再装。
         # 失败时把完整输出留在日志里（CI 只能看到这里，不能靠 tail 猜）
         _wb_log="${PBS_CACHE}/webapp-build.log"
         if ! ( cd "${SRC}/apps/desktop" && node scripts/build-webapp.mjs ) 2>&1 | tee "${_wb_log}"; then

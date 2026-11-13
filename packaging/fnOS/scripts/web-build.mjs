@@ -22,7 +22,9 @@ if (!existsSync(path.join(root, "package.json"))) {
   throw new Error(`不是 web 工作区：${root}`)
 }
 
-// 从 web 工作区解析 vite（npm workspaces 会提升到根 node_modules，两种都试）
+// 从 web 工作区解析 vite。
+// 工作区管理器提升到根 node_modules，两种都试：
+//   · npm workspaces / pnpm（pnpm 的 node_modules 是符号链接到 .pnpm，同样可解析）
 function resolveVite() {
   for (const base of [root, source]) {
     try {
@@ -30,7 +32,7 @@ function resolveVite() {
       return req.resolve("vite")
     } catch { /* 继续试下一个 */ }
   }
-  throw new Error("找不到 vite（请先 npm install --workspace web）")
+  throw new Error("找不到 vite（请先装前端依赖：pnpm install --frozen-lockfile，旧版用 npm ci）")
 }
 
 // public 目录：stable 下 web/public 已有 favicon/fonts，直接用它
